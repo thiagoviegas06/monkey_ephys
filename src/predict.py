@@ -19,6 +19,7 @@ class InferenceWindowDataset(Dataset):
     def __init__(
         self,
         sbp_norm: np.ndarray,
+        obs_mask_full: np.ndarray,
         kinematics: np.ndarray,
         trial_ids: np.ndarray,
         window_size: int,
@@ -27,6 +28,7 @@ class InferenceWindowDataset(Dataset):
             raise ValueError("window_size must be odd")
 
         self.sbp_norm = sbp_norm
+        self.obs_mask_full = obs_mask_full
         self.kinematics = kinematics
         self.trial_ids = trial_ids
         self.window_size = window_size
@@ -65,10 +67,12 @@ class InferenceWindowDataset(Dataset):
         start = center - self.half
         end = center + self.half + 1
         x_sbp = self.sbp_norm[start:end]
+        obs_mask = self.obs_mask_full[start:end]
         x_kin = self.kinematics[start:end]
         return {
             "center": center,
             "x_sbp": torch.from_numpy(x_sbp.astype(np.float32)),
+            "obs_mask": torch.from_numpy(obs_mask.astype(np.float32)),
             "x_kin": torch.from_numpy(x_kin.astype(np.float32)),
         }
 
@@ -104,12 +108,17 @@ def _predict_session_matrix(
     device: torch.device,
 ) -> np.ndarray:
     sbp_norm = apply_norm(sbp_masked, mean, std)
+    # Match train-time masking semantics: masked input channels are zero in normalized space.
+    sbp_norm = sbp_norm.copy()
+    sbp_norm[mask] = 0.0
+    obs_mask_full = (~mask).astype(np.float32)
 
     # Baseline fallback at bins where full window inference is unavailable.
     pred_norm = np.broadcast_to(np.zeros((1, 96), dtype=np.float32), sbp_masked.shape).copy()
 
     ds = InferenceWindowDataset(
         sbp_norm=sbp_norm,
+        obs_mask_full=obs_mask_full,
         kinematics=kin,
         trial_ids=trial_ids,
         window_size=window_size,
@@ -126,8 +135,9 @@ def _predict_session_matrix(
     for batch in loader:
         x_sbp = batch["x_sbp"].to(device)
         x_kin = batch["x_kin"].to(device)
+        obs_mask = batch["obs_mask"].to(device)
         centers = batch["center"].cpu().numpy().astype(np.int64)
-        y_hat = model(x_sbp, x_kin).cpu().numpy().astype(np.float32)
+        y_hat = model(x_sbp, x_kin, obs_mask).cpu().numpy().astype(np.float32)
         pred_norm[centers] = y_hat
 
     pred = apply_denorm(pred_norm, mean, std)

@@ -121,12 +121,19 @@ class SBPWindowDataset(Dataset):
         x_kin = session.kinematics[start:end].copy()
         y = session.sbp_norm[center].copy()
 
-        mask = self._sample_channel_mask(idx)
-        x_sbp[:, mask.astype(bool)] = 0.0
+        mask = self._sample_channel_mask(idx)                 # (96,) 1=masked
+        mask_bool = mask.astype(bool)
+
+        # zero-out masked channels in the input
+        x_sbp[:, mask_bool] = 0.0
+
+        # observed-indicator feature: (T,96) where 1=observed, 0=masked
+        obs_mask = (1.0 - mask)[None, :].repeat(x_sbp.shape[0], axis=0).astype(np.float32)
 
         return {
             "x_sbp": torch.from_numpy(x_sbp),
             "x_kin": torch.from_numpy(x_kin),
+            "obs_mask": torch.from_numpy(obs_mask),
             "y": torch.from_numpy(y),
             "mask": torch.from_numpy(mask),
             "session_id": session.session_id,

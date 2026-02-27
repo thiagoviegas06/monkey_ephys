@@ -99,7 +99,7 @@ def train(args: argparse.Namespace) -> None:
     )
 
     model = TemporalCNNBaseline(
-        input_dim=100,
+        input_dim=196,
         hidden_dim=args.hidden_dim,
         output_dim=96,
         num_layers=args.num_layers,
@@ -129,11 +129,12 @@ def train(args: argparse.Namespace) -> None:
         for batch in train_loader:
             x_sbp = batch["x_sbp"].to(device)
             x_kin = batch["x_kin"].to(device)
+            obs_mask = batch["obs_mask"].to(device)
             y = batch["y"].to(device)
             mask = batch["mask"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            y_hat = model(x_sbp, x_kin)
+            y_hat = model(x_sbp, x_kin, obs_mask)
             loss = masked_mse_loss(y_hat, y, mask)
             loss.backward()
             optimizer.step()
@@ -160,7 +161,7 @@ def train(args: argparse.Namespace) -> None:
                 {
                     "model_state_dict": model.state_dict(),
                     "model_kwargs": {
-                        "input_dim": 100,
+                        "input_dim": 196,
                         "hidden_dim": args.hidden_dim,
                         "output_dim": 96,
                         "num_layers": args.num_layers,

@@ -7,7 +7,7 @@ import torch.nn as nn
 class TemporalCNNBaseline(nn.Module):
     def __init__(
         self,
-        input_dim: int = 100,
+        input_dim: int = 196,   # 96 SBP + 4 kin + 96 obs_mask
         hidden_dim: int = 128,
         output_dim: int = 96,
         num_layers: int = 4,
@@ -29,11 +29,14 @@ class TemporalCNNBaseline(nn.Module):
         self.encoder = nn.Sequential(*blocks)
         self.head = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, x_sbp: torch.Tensor, x_kin: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([x_sbp, x_kin], dim=-1)
-        x = x.transpose(1, 2)
-        x = self.encoder(x)
+    def forward(self, x_sbp: torch.Tensor, x_kin: torch.Tensor, obs_mask: torch.Tensor) -> torch.Tensor:
+        # x_sbp:   (B, T, 96)
+        # x_kin:   (B, T, 4)
+        # obs_mask:(B, T, 96) 1=observed, 0=masked
+        x = torch.cat([x_sbp, x_kin, obs_mask], dim=-1)  # (B, T, 196)
+        x = x.transpose(1, 2)                            # (B, 196, T)
+        x = self.encoder(x)                              # (B, hidden_dim, T)
 
         center_idx = x.shape[-1] // 2
-        x_center = x[:, :, center_idx]
-        return self.head(x_center)
+        x_center = x[:, :, center_idx]                   # (B, hidden_dim)
+        return self.head(x_center)                       # (B, 96)

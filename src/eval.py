@@ -28,10 +28,11 @@ def evaluate_model(
     for batch in dataloader:
         x_sbp = batch["x_sbp"].to(device)
         x_kin = batch["x_kin"].to(device)
+        obs_mask = batch["obs_mask"].to(device)
         y = batch["y"].to(device)
         mask = batch["mask"].to(device)
 
-        y_hat = model(x_sbp, x_kin)
+        y_hat = model(x_sbp, x_kin, obs_mask)
         loss = masked_mse_loss(y_hat, y, mask)
         nmse = nmse_masked(y_hat, y, mask)
 
@@ -52,7 +53,10 @@ def run_eval(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     device = resolve_device(args.device)
 
-    ckpt = torch.load(args.checkpoint_path, map_location=device)
+    try:
+        ckpt = torch.load(args.checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(args.checkpoint_path, map_location=device)
     model = TemporalCNNBaseline(**ckpt["model_kwargs"])
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
