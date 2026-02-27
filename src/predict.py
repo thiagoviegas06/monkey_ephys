@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,7 @@ class InferenceWindowDataset(Dataset):
         kinematics: np.ndarray,
         trial_ids: np.ndarray,
         window_size: int,
+        skip_negative_trials: bool = False,
     ) -> None:
         if window_size % 2 == 0:
             raise ValueError("window_size must be odd")
@@ -33,6 +35,7 @@ class InferenceWindowDataset(Dataset):
         self.trial_ids = trial_ids
         self.window_size = window_size
         self.half = window_size // 2
+        self.skip_negative_trials = skip_negative_trials
         self.centers = self._valid_centers()
 
     def _valid_centers(self) -> np.ndarray:
@@ -48,7 +51,7 @@ class InferenceWindowDataset(Dataset):
         centers = []
         for s, e in zip(starts, ends):
             tid = trial_ids[s]
-            if tid < 0:
+            if self.skip_negative_trials and tid < 0:
                 continue
             lo = s + self.half
             hi = e - self.half
@@ -77,7 +80,42 @@ class InferenceWindowDataset(Dataset):
         }
 
 
-def _load_model(checkpoint_path: str, device: torch.device) -> Tuple[torch.nn.Module, Dict]:
+def _sha256_file(path: str | Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _state_dict_fingerprint(state_dict: Dict[str, torch.Tensor]) -> str:
+    h = hashlib.sha256()
+    for key in sorted(state_dict.keys()):
+        tensor = state_dict[key].detach().cpu().contiguous()
+        h.update(key.encode("utf-8"))
+        h.update(str(tensor.dtype).encode("utf-8"))
+        h.update(str(tuple(tensor.shape)).encode("utf-8"))
+        h.update(tensor.numpy().tobytes())
+    return h.hexdigest()
+
+
+def _print_checkpoint_info(label: str, checkpoint_path: str | Path, state_dict: Dict[str, torch.Tensor]) -> None:
+    path = Path(checkpoint_path)
+    file_hash = _sha256_file(path)
+    mtime = path.stat().st_mtime
+    model_hash = _state_dict_fingerprint(state_dict)
+    print(
+        f"[{label}] checkpoint={path} | sha256={file_hash} | mtime={mtime:.0f} | "
+        f"state_dict_fp={model_hash}"
+    )
+
+
+def _load_model(
+    checkpoint_path: str,
+    device: torch.device,
+    debug: bool = True,
+    label: str = "MODEL",
+) -> Tuple[torch.nn.Module, Dict]:
     # PyTorch 2.6 changed torch.load default to weights_only=True.
     # Our checkpoint stores numpy arrays (e.g., train_global_mean/std), so we need full unpickling.
     try:
@@ -86,6 +124,8 @@ def _load_model(checkpoint_path: str, device: torch.device) -> Tuple[torch.nn.Mo
         # Backward compatibility with older torch versions that do not expose weights_only.
         ckpt = torch.load(checkpoint_path, map_location=device)
     model_kwargs = ckpt["model_kwargs"]
+    if debug:
+        _print_checkpoint_info(label=label, checkpoint_path=checkpoint_path, state_dict=ckpt["model_state_dict"])
     model = TemporalCNNBaseline(**model_kwargs)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
@@ -106,7 +146,11 @@ def _predict_session_matrix(
     batch_size: int,
     num_workers: int,
     device: torch.device,
-) -> np.ndarray:
+    skip_negative_trials: bool = False,
+    debug: bool = True,
+    label: str = "MODEL",
+    session_id: str = "",
+) -> Tuple[np.ndarray, Dict[str, Any]]:
     sbp_norm = apply_norm(sbp_masked, mean, std)
     # Match train-time masking semantics: masked input channels are zero in normalized space.
     sbp_norm = sbp_norm.copy()
@@ -123,7 +167,15 @@ def _predict_session_matrix(
         kinematics=kin,
         trial_ids=trial_ids,
         window_size=window_size,
+        skip_negative_trials=skip_negative_trials,
     )
+    if debug:
+        print(f"[{label}] session={session_id} windows={len(ds)} skip_negative_trials={skip_negative_trials}")
+    if len(ds) == 0:
+        raise RuntimeError(
+            f"[{label}] session={session_id} has zero inference windows. "
+            "Check trial boundaries/window_size/negative-trial filtering."
+        )
 
     loader = DataLoader(
         ds,
@@ -133,12 +185,21 @@ def _predict_session_matrix(
         pin_memory=torch.cuda.is_available(),
     )
 
-    for batch in loader:
+    first_batch_y_hat = None
+    for batch_idx, batch in enumerate(loader):
         x_sbp = batch["x_sbp"].to(device)
         x_kin = batch["x_kin"].to(device)
         obs_mask = batch["obs_mask"].to(device)
         centers = batch["center"].cpu().numpy().astype(np.int64)
         y_hat = model(x_sbp, x_kin, obs_mask).cpu().numpy().astype(np.float32)  # (B,96,T)
+        if batch_idx == 0:
+            first_batch_y_hat = y_hat.copy()
+            if debug:
+                print(
+                    f"[{label}] session={session_id} first_batch_y_hat "
+                    f"mean={y_hat.mean():.6f} std={y_hat.std():.6f} "
+                    f"min={y_hat.min():.6f} max={y_hat.max():.6f}"
+                )
 
         half = window_size // 2
         for i, c in enumerate(centers):
@@ -159,7 +220,35 @@ def _predict_session_matrix(
     # Keep observed entries unchanged; only masked entries are reconstructed.
     out = sbp_masked.copy()
     out[mask] = pred[mask]
-    return out
+    valid_fraction = float(valid.mean())
+    masked_valid_fraction = float((valid & mask).mean())
+
+    if debug:
+        print(
+            f"[{label}] session={session_id} valid_fraction={valid_fraction:.6f} "
+            f"masked_valid_fraction={masked_valid_fraction:.6f}"
+        )
+        masked_values = out[mask]
+        if masked_values.size > 0:
+            print(
+                f"[{label}] session={session_id} out[mask] "
+                f"mean={masked_values.mean():.6f} std={masked_values.std():.6f} "
+                f"min={masked_values.min():.6f} max={masked_values.max():.6f}"
+            )
+        else:
+            print(f"[{label}] session={session_id} out[mask] has no masked entries.")
+
+    if masked_valid_fraction == 0.0:
+        print(
+            f"[{label}] WARNING: session={session_id} masked_valid_fraction is 0.0. "
+            "Masked bins received no model predictions; fallback dominates."
+        )
+
+    return out, {
+        "first_batch_y_hat": first_batch_y_hat,
+        "valid_fraction": valid_fraction,
+        "masked_valid_fraction": masked_valid_fraction,
+    }
 
 
 def build_submission(
@@ -206,7 +295,27 @@ def build_submission(
 
 def predict(args: argparse.Namespace) -> None:
     device = resolve_device(args.device)
-    model, ckpt = _load_model(args.checkpoint_path, device=device)
+    ab_mode = bool(args.checkpoint_a and args.checkpoint_b)
+    if (args.checkpoint_a is None) ^ (args.checkpoint_b is None):
+        raise ValueError("Provide both --checkpoint-a and --checkpoint-b for A/B mode, or neither.")
+
+    if ab_mode:
+        model_a, ckpt_a = _load_model(args.checkpoint_a, device=device, debug=args.debug, label="A")
+        model_b, ckpt_b = _load_model(args.checkpoint_b, device=device, debug=args.debug, label="B")
+        fallback_mean_a = ckpt_a.get("train_global_mean")
+        fallback_std_a = ckpt_a.get("train_global_std")
+        fallback_mean_b = ckpt_b.get("train_global_mean")
+        fallback_std_b = ckpt_b.get("train_global_std")
+        if fallback_mean_a is None or fallback_std_a is None:
+            raise ValueError("Checkpoint A missing train_global_mean/std; retrain or patch checkpoint.")
+        if fallback_mean_b is None or fallback_std_b is None:
+            raise ValueError("Checkpoint B missing train_global_mean/std; retrain or patch checkpoint.")
+    else:
+        model, ckpt = _load_model(args.checkpoint_path, device=device, debug=args.debug, label="MODEL")
+        fallback_mean = ckpt.get("train_global_mean")
+        fallback_std = ckpt.get("train_global_std")
+        if fallback_mean is None or fallback_std is None:
+            raise ValueError("Checkpoint missing train_global_mean/std; retrain or patch checkpoint.")
 
     metadata = load_metadata(Path(args.data_dir) / args.metadata_file)
     if "split" not in metadata.columns:
@@ -225,47 +334,154 @@ def predict(args: argparse.Namespace) -> None:
         infer_mask_from_zero=args.infer_mask_from_zero,
     )
 
-    fallback_mean = ckpt.get("train_global_mean")
-    fallback_std = ckpt.get("train_global_std")
-    if fallback_mean is None or fallback_std is None:
-        raise ValueError("Checkpoint missing train_global_mean/std; retrain or patch checkpoint.")
+    if ab_mode:
+        predictions_by_session_a: Dict[str, np.ndarray] = {}
+        predictions_by_session_b: Dict[str, np.ndarray] = {}
+    else:
+        predictions_by_session: Dict[str, np.ndarray] = {}
 
-    predictions_by_session: Dict[str, np.ndarray] = {}
+    compare_ids = set(test_ids[: max(0, args.compare_sessions)])
 
     for session in test_sessions:
         assert session.mask is not None
-        mean, std, observed_counts = compute_test_session_stats(
-            sbp_masked=session.sbp,
-            mask=session.mask,
-            fallback_mean=fallback_mean,
-            fallback_std=fallback_std,
-        )
+        if args.debug:
+            uniq = np.unique(session.trial_ids)
+            uniq_head = uniq[:10].tolist()
+            print(
+                f"[session={session.session_id}] trial_ids min={int(uniq.min())} max={int(uniq.max())} "
+                f"n_unique={len(uniq)} first={uniq_head}"
+            )
 
-        pred_matrix = _predict_session_matrix(
-            model=model,
-            sbp_masked=session.sbp,
-            kin=session.kinematics,
-            trial_ids=session.trial_ids,
-            mask=session.mask,
-            mean=mean,
-            std=std,
-            window_size=args.window_size,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            device=device,
-        )
+        if ab_mode:
+            mean_a, std_a, observed_counts_a = compute_test_session_stats(
+                sbp_masked=session.sbp,
+                mask=session.mask,
+                fallback_mean=fallback_mean_a,
+                fallback_std=fallback_std_a,
+            )
+            mean_b, std_b, observed_counts_b = compute_test_session_stats(
+                sbp_masked=session.sbp,
+                mask=session.mask,
+                fallback_mean=fallback_mean_b,
+                fallback_std=fallback_std_b,
+            )
 
-        predictions_by_session[session.session_id] = pred_matrix
-        print(
-            f"Predicted session {session.session_id} | "
-            f"masked_entries={int(session.mask.sum())} | "
-            f"channels_with_low_obs={(observed_counts < 16).sum()}"
-        )
+            pred_matrix_a, debug_a = _predict_session_matrix(
+                model=model_a,
+                sbp_masked=session.sbp,
+                kin=session.kinematics,
+                trial_ids=session.trial_ids,
+                mask=session.mask,
+                mean=mean_a,
+                std=std_a,
+                window_size=args.window_size,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                device=device,
+                skip_negative_trials=args.skip_negative_trials,
+                debug=args.debug,
+                label="A",
+                session_id=session.session_id,
+            )
+            pred_matrix_b, debug_b = _predict_session_matrix(
+                model=model_b,
+                sbp_masked=session.sbp,
+                kin=session.kinematics,
+                trial_ids=session.trial_ids,
+                mask=session.mask,
+                mean=mean_b,
+                std=std_b,
+                window_size=args.window_size,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                device=device,
+                skip_negative_trials=args.skip_negative_trials,
+                debug=args.debug,
+                label="B",
+                session_id=session.session_id,
+            )
+
+            predictions_by_session_a[session.session_id] = pred_matrix_a
+            predictions_by_session_b[session.session_id] = pred_matrix_b
+            print(
+                f"Predicted session {session.session_id} | "
+                f"masked_entries={int(session.mask.sum())} | "
+                f"low_obs_channels_A={(observed_counts_a < 16).sum()} | "
+                f"low_obs_channels_B={(observed_counts_b < 16).sum()}"
+            )
+
+            if session.session_id in compare_ids:
+                first_a = debug_a["first_batch_y_hat"]
+                first_b = debug_b["first_batch_y_hat"]
+                if first_a is not None and first_b is not None:
+                    yhat_diff = float(np.max(np.abs(first_a - first_b)))
+                    print(f"[A/B] session={session.session_id} first_batch_y_hat max_abs_diff={yhat_diff:.9f}")
+                    if yhat_diff == 0.0:
+                        print(
+                            f"[A/B] WARNING: session={session.session_id} first-batch model outputs are identical."
+                        )
+
+                out_diff = float(np.max(np.abs(pred_matrix_a - pred_matrix_b)))
+                print(f"[A/B] session={session.session_id} reconstructed_out max_abs_diff={out_diff:.9f}")
+                if out_diff == 0.0:
+                    print(
+                        f"[A/B] WARNING: session={session.session_id} final outputs are identical. "
+                        "Models may be identical or inference may be bypassing outputs."
+                    )
+        else:
+            mean, std, observed_counts = compute_test_session_stats(
+                sbp_masked=session.sbp,
+                mask=session.mask,
+                fallback_mean=fallback_mean,
+                fallback_std=fallback_std,
+            )
+
+            pred_matrix, _debug_info = _predict_session_matrix(
+                model=model,
+                sbp_masked=session.sbp,
+                kin=session.kinematics,
+                trial_ids=session.trial_ids,
+                mask=session.mask,
+                mean=mean,
+                std=std,
+                window_size=args.window_size,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                device=device,
+                skip_negative_trials=args.skip_negative_trials,
+                debug=args.debug,
+                label="MODEL",
+                session_id=session.session_id,
+            )
+
+            predictions_by_session[session.session_id] = pred_matrix
+            print(
+                f"Predicted session {session.session_id} | "
+                f"masked_entries={int(session.mask.sum())} | "
+                f"channels_with_low_obs={(observed_counts < 16).sum()}"
+            )
 
     sample_path = Path(args.data_dir) / args.sample_submission_file
-    output_path = Path(args.output_file)
-    build_submission(predictions_by_session, sample_submission_path=sample_path, output_path=output_path)
-    print(f"Wrote submission: {output_path}")
+    if ab_mode:
+        output_a = Path(args.output_a)
+        output_b = Path(args.output_b)
+        build_submission(predictions_by_session_a, sample_submission_path=sample_path, output_path=output_a)
+        build_submission(predictions_by_session_b, sample_submission_path=sample_path, output_path=output_b)
+        print(f"Wrote submission A: {output_a}")
+        print(f"Wrote submission B: {output_b}")
+    else:
+        output_path = Path(args.output_file)
+        build_submission(predictions_by_session, sample_submission_path=sample_path, output_path=output_path)
+        print(f"Wrote submission: {output_path}")
+
+
+def _str2bool(value: str) -> bool:
+    value = value.strip().lower()
+    if value in {"1", "true", "t", "yes", "y"}:
+        return True
+    if value in {"0", "false", "f", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -273,12 +489,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=str, default="kaggle_data")
     parser.add_argument("--metadata-file", type=str, default="metadata.csv")
     parser.add_argument("--checkpoint-path", type=str, default="checkpoints/best.pt")
+    parser.add_argument("--checkpoint-a", type=str, default=None)
+    parser.add_argument("--checkpoint-b", type=str, default=None)
     parser.add_argument("--window-size", type=int, default=201)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--sample-submission-file", type=str, default="sample_submission.csv")
     parser.add_argument("--output-file", type=str, default="submission.csv")
+    parser.add_argument("--output-a", type=str, default="submission_a.csv")
+    parser.add_argument("--output-b", type=str, default="submission_b.csv")
+    parser.add_argument("--compare-sessions", type=int, default=2)
     parser.add_argument("--infer-mask-from-zero", action="store_true")
+    parser.add_argument("--skip-negative-trials", action="store_true")
+    parser.add_argument("--debug", type=_str2bool, default=True)
     parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
 
