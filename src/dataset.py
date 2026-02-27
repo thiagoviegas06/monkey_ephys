@@ -117,9 +117,9 @@ class SBPWindowDataset(Dataset):
         start = center - self.half_window
         end = center + self.half_window + 1
 
-        x_sbp = session.sbp_norm[start:end].copy()
-        x_kin = session.kinematics[start:end].copy()
-        y = session.sbp_norm[center].copy()
+        x_kin = session.kinematics[start:end].astype(np.float32, copy=True)
+        x_sbp = session.sbp_norm[start:end].astype(np.float32, copy=True)
+        y_seq = session.sbp_norm[start:end].astype(np.float32, copy=True)
 
         mask = self._sample_channel_mask(idx)                 # (96,) 1=masked
         mask_bool = mask.astype(bool)
@@ -134,7 +134,7 @@ class SBPWindowDataset(Dataset):
             "x_sbp": torch.from_numpy(x_sbp),
             "x_kin": torch.from_numpy(x_kin),
             "obs_mask": torch.from_numpy(obs_mask),
-            "y": torch.from_numpy(y),
+            "y_seq": torch.from_numpy(y_seq),
             "mask": torch.from_numpy(mask),
             "session_id": session.session_id,
         }

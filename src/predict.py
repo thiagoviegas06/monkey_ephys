@@ -113,8 +113,9 @@ def _predict_session_matrix(
     sbp_norm[mask] = 0.0
     obs_mask_full = (~mask).astype(np.float32)
 
-    # Baseline fallback at bins where full window inference is unavailable.
-    pred_norm = np.broadcast_to(np.zeros((1, 96), dtype=np.float32), sbp_masked.shape).copy()
+    # Accumulate overlapping window predictions and average.
+    pred_sum = np.zeros_like(sbp_norm, dtype=np.float32)
+    pred_count = np.zeros_like(sbp_norm, dtype=np.float32)
 
     ds = InferenceWindowDataset(
         sbp_norm=sbp_norm,
@@ -137,8 +138,21 @@ def _predict_session_matrix(
         x_kin = batch["x_kin"].to(device)
         obs_mask = batch["obs_mask"].to(device)
         centers = batch["center"].cpu().numpy().astype(np.int64)
-        y_hat = model(x_sbp, x_kin, obs_mask).cpu().numpy().astype(np.float32)
-        pred_norm[centers] = y_hat
+        y_hat = model(x_sbp, x_kin, obs_mask).cpu().numpy().astype(np.float32)  # (B,96,T)
+
+        half = window_size // 2
+        for i, c in enumerate(centers):
+            start = int(c - half)
+            end = int(c + half + 1)
+            pred_bt = y_hat[i].T  # (T,96)
+            pred_sum[start:end] += pred_bt
+            pred_count[start:end] += 1.0
+
+    valid = pred_count > 0
+    pred_norm = np.zeros_like(pred_sum, dtype=np.float32)
+    pred_norm[valid] = pred_sum[valid] / pred_count[valid]
+    # Fallback where no full-window prediction is available.
+    pred_norm[~valid] = sbp_norm[~valid]
 
     pred = apply_denorm(pred_norm, mean, std)
 

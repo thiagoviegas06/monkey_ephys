@@ -29,7 +29,7 @@ def evaluate_model(
         x_sbp = batch["x_sbp"].to(device)
         x_kin = batch["x_kin"].to(device)
         obs_mask = batch["obs_mask"].to(device)
-        y = batch["y"].to(device)
+        y = batch["y_seq"].to(device).transpose(1, 2)
         mask = batch["mask"].to(device)
 
         y_hat = model(x_sbp, x_kin, obs_mask)
@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-channels", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--val-fraction", type=float, default=0.15)
+    parser.add_argument("--val-fraction", type=float, default=0.30)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
