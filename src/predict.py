@@ -74,7 +74,13 @@ class InferenceWindowDataset(Dataset):
 
 
 def _load_model(checkpoint_path: str, device: torch.device) -> Tuple[torch.nn.Module, Dict]:
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    # PyTorch 2.6 changed torch.load default to weights_only=True.
+    # Our checkpoint stores numpy arrays (e.g., train_global_mean/std), so we need full unpickling.
+    try:
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        # Backward compatibility with older torch versions that do not expose weights_only.
+        ckpt = torch.load(checkpoint_path, map_location=device)
     model_kwargs = ckpt["model_kwargs"]
     model = TemporalCNNBaseline(**model_kwargs)
     model.load_state_dict(ckpt["model_state_dict"])
