@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Dict
+
+import torch
+from torch.utils.data import DataLoader
+
+from src.dataset import SBPWindowDataset
+from src.io import load_metadata, load_sessions
+from src.losses import masked_mse_loss, nmse_masked
+from src.model import TemporalCNNBaseline
+from src.utils import resolve_device, seed_everything, split_train_val_sessions
+
+
+@torch.no_grad()
+def evaluate_model(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+) -> Dict[str, float]:
+    model.eval()
+    loss_sum = 0.0
+    nmse_sum = 0.0
+    n_batches = 0
+
+    for batch in dataloader:
+        x_sbp = batch["x_sbp"].to(device)
+        x_kin = batch["x_kin"].to(device)
+        y = batch["y"].to(device)
+        mask = batch["mask"].to(device)
+
+        y_hat = model(x_sbp, x_kin)
+        loss = masked_mse_loss(y_hat, y, mask)
+        nmse = nmse_masked(y_hat, y, mask)
+
+        loss_sum += float(loss.item())
+        nmse_sum += float(nmse.item())
+        n_batches += 1
+
+    if n_batches == 0:
+        return {"loss": float("nan"), "nmse": float("nan")}
+
+    return {
+        "loss": loss_sum / n_batches,
+        "nmse": nmse_sum / n_batches,
+    }
+
+
+def run_eval(args: argparse.Namespace) -> None:
+    seed_everything(args.seed)
+    device = resolve_device(args.device)
+
+    ckpt = torch.load(args.checkpoint_path, map_location=device)
+    model = TemporalCNNBaseline(**ckpt["model_kwargs"])
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.to(device)
+
+    metadata = load_metadata(Path(args.data_dir) / args.metadata_file)
+    _, val_ids = split_train_val_sessions(metadata, val_fraction=args.val_fraction, seed=args.seed)
+
+    val_sessions = load_sessions(args.data_dir, val_ids, split="train")
+    val_ds = SBPWindowDataset(
+        sessions=val_sessions,
+        window_size=args.window_size,
+        split="val",
+        seed=args.seed,
+        mask_channels=args.mask_channels,
+        deterministic_masks=True,
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    metrics = evaluate_model(model, val_loader, device=device)
+    print(
+        f"Eval on {len(val_ids)} val sessions | "
+        f"loss={metrics['loss']:.6f} | nmse={metrics['nmse']:.6f}"
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate checkpoint on validation split.")
+    parser.add_argument("--data-dir", type=str, default="kaggle_data")
+    parser.add_argument("--metadata-file", type=str, default="metadata.csv")
+    parser.add_argument("--checkpoint-path", type=str, default="checkpoints/best.pt")
+    parser.add_argument("--window-size", type=int, default=201)
+    parser.add_argument("--mask-channels", type=int, default=30)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--val-fraction", type=float, default=0.15)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="auto")
+    args = parser.parse_args()
+
+    if args.window_size % 2 == 0:
+        raise ValueError("--window-size must be odd")
+    return args
+
+
+if __name__ == "__main__":
+    run_eval(parse_args())
