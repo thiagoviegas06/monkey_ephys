@@ -172,9 +172,21 @@ def _predict_session_matrix(
     if debug:
         print(f"[{label}] session={session_id} windows={len(ds)} skip_negative_trials={skip_negative_trials}")
     if len(ds) == 0:
+        boundaries = np.where(np.diff(trial_ids) != 0)[0] + 1
+        starts = np.concatenate([[0], boundaries])
+        ends = np.concatenate([boundaries, [len(trial_ids)]])
+        lengths = []
+        for s, e in zip(starts, ends):
+            tid = int(trial_ids[s])
+            if skip_negative_trials and tid < 0:
+                continue
+            lengths.append(int(e - s))
+        max_len = max(lengths) if lengths else 0
         raise RuntimeError(
             f"[{label}] session={session_id} has zero inference windows. "
-            "Check trial boundaries/window_size/negative-trial filtering."
+            f"window_size={window_size}, max_trial_len={max_len}, "
+            f"skip_negative_trials={skip_negative_trials}. "
+            "Use a smaller odd --window-size, disable --skip-negative-trials, or inspect trial_ids."
         )
 
     loader = DataLoader(
@@ -310,12 +322,36 @@ def predict(args: argparse.Namespace) -> None:
             raise ValueError("Checkpoint A missing train_global_mean/std; retrain or patch checkpoint.")
         if fallback_mean_b is None or fallback_std_b is None:
             raise ValueError("Checkpoint B missing train_global_mean/std; retrain or patch checkpoint.")
+        if args.window_size is None:
+            ws_a = ckpt_a.get("window_size")
+            ws_b = ckpt_b.get("window_size")
+            if ws_a is None or ws_b is None:
+                raise ValueError(
+                    "Missing window_size in one/both checkpoints. Please pass --window-size explicitly."
+                )
+            if int(ws_a) != int(ws_b):
+                raise ValueError(
+                    f"Checkpoint window_size mismatch: A={ws_a}, B={ws_b}. "
+                    "Pass --window-size explicitly for A/B comparison."
+                )
+            infer_window_size = int(ws_a)
+        else:
+            infer_window_size = int(args.window_size)
     else:
         model, ckpt = _load_model(args.checkpoint_path, device=device, debug=args.debug, label="MODEL")
         fallback_mean = ckpt.get("train_global_mean")
         fallback_std = ckpt.get("train_global_std")
         if fallback_mean is None or fallback_std is None:
             raise ValueError("Checkpoint missing train_global_mean/std; retrain or patch checkpoint.")
+        if args.window_size is None:
+            infer_window_size = int(ckpt.get("window_size", 201))
+        else:
+            infer_window_size = int(args.window_size)
+
+    if infer_window_size % 2 == 0:
+        raise ValueError(f"Inference window_size must be odd, got {infer_window_size}")
+    if args.debug:
+        print(f"[predict] using window_size={infer_window_size}")
 
     metadata = load_metadata(Path(args.data_dir) / args.metadata_file)
     if "split" not in metadata.columns:
@@ -374,7 +410,7 @@ def predict(args: argparse.Namespace) -> None:
                 mask=session.mask,
                 mean=mean_a,
                 std=std_a,
-                window_size=args.window_size,
+                window_size=infer_window_size,
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
                 device=device,
@@ -391,7 +427,7 @@ def predict(args: argparse.Namespace) -> None:
                 mask=session.mask,
                 mean=mean_b,
                 std=std_b,
-                window_size=args.window_size,
+                window_size=infer_window_size,
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
                 device=device,
@@ -444,7 +480,7 @@ def predict(args: argparse.Namespace) -> None:
                 mask=session.mask,
                 mean=mean,
                 std=std,
-                window_size=args.window_size,
+                window_size=infer_window_size,
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
                 device=device,
@@ -491,7 +527,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-path", type=str, default="checkpoints/best.pt")
     parser.add_argument("--checkpoint-a", type=str, default=None)
     parser.add_argument("--checkpoint-b", type=str, default=None)
-    parser.add_argument("--window-size", type=int, default=201)
+    parser.add_argument("--window-size", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--sample-submission-file", type=str, default="sample_submission.csv")
@@ -505,7 +541,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
 
-    if args.window_size % 2 == 0:
+    if args.window_size is not None and args.window_size % 2 == 0:
         raise ValueError("--window-size must be odd")
     return args
 
