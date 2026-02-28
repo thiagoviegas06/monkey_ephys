@@ -1,2 +1,4 @@
 /kaggle_data
 submission.csv
+/src/__pycache__
+*.csv

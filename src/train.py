@@ -136,6 +136,9 @@ def train(args: argparse.Namespace) -> None:
 
             optimizer.zero_grad(set_to_none=True)
             y_hat = model(x_sbp, x_kin, obs_mask)
+            if epoch == 1 and n_batches == 0:
+                print("x_sbp", x_sbp.shape, "x_kin", x_kin.shape, "obs_mask", obs_mask.shape)
+                print("y", y.shape, "y_hat", y_hat.shape, "mask", mask.shape)
             loss = masked_mse_loss(y_hat, y, mask)
             loss.backward()
             optimizer.step()
