@@ -1,4 +1,19 @@
 # Neuroinformatics Project 2 (Phase 1) PyTorch Baseline
+# Prediction Usage Examples
+
+### Single-model prediction
+
+```bash
+python src/predict.py --checkpoint-path checkpoints/best.pt --output-file submission.csv
+```
+
+### A/B model comparison
+
+```bash
+python src/predict.py --checkpoint-path checkpoints/modelA.pt --checkpoint-path-2 checkpoints/modelB.pt --output-file submission.csv --compare-output ab_comparison.csv
+```
+
+Replace paths as needed. The A/B command requires the modified script supporting two models and comparison output.
 
 This repository contains a baseline for masked SBP reconstruction using a temporal 1D CNN.
 

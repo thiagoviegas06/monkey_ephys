@@ -60,6 +60,7 @@ def _build_loaders(
         seed=seed,
         mask_channels=mask_channels,
         deterministic_masks=True,
+        max_centers_per_session=200,
     )
 
     train_loader = DataLoader(

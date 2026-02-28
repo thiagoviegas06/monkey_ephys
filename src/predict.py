@@ -36,13 +36,11 @@ class InferenceWindowDataset(Dataset):
         self.window_size = window_size
         self.half = window_size // 2
         self.skip_negative_trials = skip_negative_trials
-        self.centers = self._valid_centers()
 
-    def _valid_centers(self) -> np.ndarray:
-        trial_ids = self.trial_ids
+        # Precompute trial boundaries for O(1) access in __getitem__
         n_bins = len(trial_ids)
-        if n_bins == 0:
-            return np.empty((0,), dtype=np.int64)
+        self.trial_start = np.empty((n_bins,), dtype=np.int64)
+        self.trial_end = np.empty((n_bins,), dtype=np.int64)
 
         boundaries = np.where(np.diff(trial_ids) != 0)[0] + 1
         starts = np.concatenate([[0], boundaries])
@@ -50,36 +48,65 @@ class InferenceWindowDataset(Dataset):
 
         centers = []
         for s, e in zip(starts, ends):
-            tid = trial_ids[s]
+            tid = int(trial_ids[s])
+            self.trial_start[s:e] = s
+            self.trial_end[s:e] = e
+
             if self.skip_negative_trials and tid < 0:
                 continue
-            lo = s + self.half
-            hi = e - self.half
-            if lo < hi:
-                centers.append(np.arange(lo, hi, dtype=np.int64))
+            if e > s:
+                centers.append(np.arange(s, e, dtype=np.int64))
 
-        if not centers:
-            return np.empty((0,), dtype=np.int64)
-        return np.concatenate(centers)
+        self.centers = np.concatenate(centers) if centers else np.empty((0,), dtype=np.int64)
 
     def __len__(self) -> int:
-        return len(self.centers)
+        return int(len(self.centers))
 
     def __getitem__(self, idx: int):
         center = int(self.centers[idx])
-        start = center - self.half
-        end = center + self.half + 1
-        x_sbp = self.sbp_norm[start:end]
-        obs_mask = self.obs_mask_full[start:end]
-        x_kin = self.kinematics[start:end]
+
+        ts = int(self.trial_start[center])
+        te = int(self.trial_end[center])
+
+        rel_c = center - ts
+        seg_len = te - ts
+
+        start_rel = rel_c - self.half
+        end_rel = rel_c + self.half + 1
+
+        pad_left = max(0, -start_rel)
+        pad_right = max(0, end_rel - seg_len)
+
+        a = max(0, start_rel)
+        b = min(seg_len, end_rel)
+
+        x_sbp_seg = self.sbp_norm[ts:te][a:b]
+        obs_seg = self.obs_mask_full[ts:te][a:b]
+        x_kin_seg = self.kinematics[ts:te][a:b]
+
+        # Guard: edge padding requires at least 1 element
+        if x_sbp_seg.shape[0] == 0:
+            x_sbp_seg = self.sbp_norm[center:center+1]
+            obs_seg = self.obs_mask_full[center:center+1]
+            x_kin_seg = self.kinematics[center:center+1]
+            pad_left = self.half
+            pad_right = self.half
+
+        x_sbp = np.pad(x_sbp_seg, ((pad_left, pad_right), (0, 0)), mode="edge")
+        obs_mask = np.pad(obs_seg, ((pad_left, pad_right), (0, 0)), mode="edge")
+        x_kin = np.pad(x_kin_seg, ((pad_left, pad_right), (0, 0)), mode="edge")
+
+        # Guard: ensure exact length
+        if x_sbp.shape[0] != self.window_size:
+            raise RuntimeError(f"Bad window length: got {x_sbp.shape[0]} expected {self.window_size}")
+
         return {
             "center": center,
             "x_sbp": torch.from_numpy(x_sbp.astype(np.float32)),
             "obs_mask": torch.from_numpy(obs_mask.astype(np.float32)),
             "x_kin": torch.from_numpy(x_kin.astype(np.float32)),
         }
-
-
+    
 def _sha256_file(path: str | Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -163,26 +190,35 @@ def _predict_session_matrix(
     label: str = "MODEL",
     session_id: str = "",
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    sbp_norm = apply_norm(sbp_masked, mean, std)
-    # Match train-time masking semantics: masked input channels are zero in normalized space.
-    sbp_norm = sbp_norm.copy()
-    sbp_norm[mask] = 0.0
-    obs_mask_full = (~mask).astype(np.float32)
+    """
+    Predict a full (T,96) matrix for a test session, reconstructing only masked entries.
 
-    # Accumulate overlapping window predictions and average.
+    Assumes:
+      sbp_masked: (T,96) with masked entries set to 0 (or missing)
+      mask:       (T,96) boolean-ish where True indicates masked entries
+      trial_ids:  (T,) int trial id per time bin
+      kin:        (T,4)
+    """
+    # --- normalize and prepare masks ---
+    sbp_norm = apply_norm(sbp_masked, mean, std).copy()
+
+    mask_bool = mask.astype(bool)  # (T,96)
+    sbp_norm[mask_bool] = 0.0
+
+    # 1 = observed, 0 = masked, shape (T,96)
+    obs_mask_full = (~mask_bool).astype(np.float32)
+
+    # --- accumulate overlapping window predictions and average ---
     pred_sum = np.zeros_like(sbp_norm, dtype=np.float32)
     pred_count = np.zeros_like(sbp_norm, dtype=np.float32)
 
+    # Optional: keep your dynamic window-size adjustment, but make it always feasible.
+    # NOTE: This does NOT solve edge coverage; the real solution is padding in the Dataset.
     max_len = _max_trial_len(trial_ids, skip_negative_trials)
     ws = int(window_size)
-
-    if max_len < ws:
-        ws = max_len if (max_len % 2 == 1) else max_len - 1
-        ws = max(ws, 31)  # minimum odd window
-        if debug:
-            print(f"[{label}] session={session_id} reducing window_size {window_size} -> {ws} (max_trial_len={max_len})")
-
     window_size = ws
+    if window_size % 2 == 0:
+        window_size -= 1
 
     ds = InferenceWindowDataset(
         sbp_norm=sbp_norm,
@@ -192,24 +228,16 @@ def _predict_session_matrix(
         window_size=window_size,
         skip_negative_trials=skip_negative_trials,
     )
+
     if debug:
         print(f"[{label}] session={session_id} windows={len(ds)} skip_negative_trials={skip_negative_trials}")
+
+    # If you still hit this, your InferenceWindowDataset is too strict.
     if len(ds) == 0:
-        boundaries = np.where(np.diff(trial_ids) != 0)[0] + 1
-        starts = np.concatenate([[0], boundaries])
-        ends = np.concatenate([boundaries, [len(trial_ids)]])
-        lengths = []
-        for s, e in zip(starts, ends):
-            tid = int(trial_ids[s])
-            if skip_negative_trials and tid < 0:
-                continue
-            lengths.append(int(e - s))
-        max_len = max(lengths) if lengths else 0
         raise RuntimeError(
             f"[{label}] session={session_id} has zero inference windows. "
-            f"window_size={window_size}, max_trial_len={max_len}, "
-            f"skip_negative_trials={skip_negative_trials}. "
-            "Use a smaller odd --window-size, disable --skip-negative-trials, or inspect trial_ids."
+            f"window_size={window_size}, max_trial_len={max_len}, skip_negative_trials={skip_negative_trials}. "
+            "Fix InferenceWindowDataset to allow padded windows (recommended) or reduce --window-size."
         )
 
     loader = DataLoader(
@@ -221,12 +249,16 @@ def _predict_session_matrix(
     )
 
     first_batch_y_hat = None
+    half = window_size // 2
+
     for batch_idx, batch in enumerate(loader):
-        x_sbp = batch["x_sbp"].to(device)
-        x_kin = batch["x_kin"].to(device)
-        obs_mask = batch["obs_mask"].to(device)
+        x_sbp = batch["x_sbp"].to(device)       # (B,T,96)
+        x_kin = batch["x_kin"].to(device)       # (B,T,4)
+        obs_mask = batch["obs_mask"].to(device) # (B,T,96)
         centers = batch["center"].cpu().numpy().astype(np.int64)
+
         y_hat = model(x_sbp, x_kin, obs_mask).cpu().numpy().astype(np.float32)  # (B,96,T)
+
         if batch_idx == 0:
             first_batch_y_hat = y_hat.copy()
             if debug:
@@ -236,42 +268,68 @@ def _predict_session_matrix(
                     f"min={y_hat.min():.6f} max={y_hat.max():.6f}"
                 )
 
-        half = window_size // 2
+        # accumulate predictions per window
         for i, c in enumerate(centers):
             start = int(c - half)
             end = int(c + half + 1)
+
+            # If your Dataset pads windows (recommended), start/end may exceed bounds.
+            # Clamp safely for robustness.
+            ws_start = 0
+            ws_end = window_size
+            if start < 0:
+                ws_start = -start
+                start = 0
+            if end > pred_sum.shape[0]:
+                ws_end = window_size - (end - pred_sum.shape[0])
+                end = pred_sum.shape[0]
+
+            if start >= end or ws_start >= ws_end:
+                continue
+
             pred_bt = y_hat[i].T  # (T,96)
-            pred_sum[start:end] += pred_bt
+            pred_sum[start:end] += pred_bt[ws_start:ws_end]
             pred_count[start:end] += 1.0
+
+    if debug:
+        print(f"[{label}] session={session_id} pred_count min/max: {pred_count.min()} {pred_count.max()}")
 
     valid = pred_count > 0
     pred_norm = np.zeros_like(pred_sum, dtype=np.float32)
     pred_norm[valid] = pred_sum[valid] / pred_count[valid]
-    # Fallback where no full-window prediction is available.
+
+    # fallback for bins never covered by any window
     pred_norm[~valid] = sbp_norm[~valid]
 
     pred = apply_denorm(pred_norm, mean, std)
 
     # Keep observed entries unchanged; only masked entries are reconstructed.
     out = sbp_masked.copy()
-    out[mask] = pred[mask]
+    out[mask_bool] = pred[mask_bool]
+
     valid_fraction = float(valid.mean())
-    masked_valid_fraction = float((valid & mask).mean())
+    masked_valid_fraction = float((valid & mask_bool).mean())
 
     if debug:
         print(
             f"[{label}] session={session_id} valid_fraction={valid_fraction:.6f} "
             f"masked_valid_fraction={masked_valid_fraction:.6f}"
         )
-        masked_values = out[mask]
+        masked_values = out[mask_bool]
         if masked_values.size > 0:
             print(
-                f"[{label}] session={session_id} out[mask] "
+                f"[{label}] session={session_id} out[mask_bool] "
                 f"mean={masked_values.mean():.6f} std={masked_values.std():.6f} "
                 f"min={masked_values.min():.6f} max={masked_values.max():.6f}"
             )
         else:
-            print(f"[{label}] session={session_id} out[mask] has no masked entries.")
+            print(f"[{label}] session={session_id} out[mask_bool] has no masked entries.")
+
+        if mask_bool.any():
+            covered_masked_fraction = float((pred_count[mask_bool] > 0).mean())
+            print(
+                f"[{label}] session={session_id} covered_masked_fraction={covered_masked_fraction:.6f}"
+            )
 
     if masked_valid_fraction == 0.0:
         print(
