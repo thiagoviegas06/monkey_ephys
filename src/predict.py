@@ -133,6 +133,18 @@ def _load_model(
     return model, ckpt
 
 
+def _max_trial_len(trial_ids: np.ndarray, skip_negative_trials: bool) -> int:
+    boundaries = np.where(np.diff(trial_ids) != 0)[0] + 1
+    starts = np.concatenate([[0], boundaries])
+    ends = np.concatenate([boundaries, [len(trial_ids)]])
+    lengths = []
+    for s, e in zip(starts, ends):
+        tid = int(trial_ids[s])
+        if skip_negative_trials and tid < 0:
+            continue
+        lengths.append(int(e - s))
+    return max(lengths) if lengths else 0
+
 @torch.no_grad()
 def _predict_session_matrix(
     model: torch.nn.Module,
@@ -160,6 +172,17 @@ def _predict_session_matrix(
     # Accumulate overlapping window predictions and average.
     pred_sum = np.zeros_like(sbp_norm, dtype=np.float32)
     pred_count = np.zeros_like(sbp_norm, dtype=np.float32)
+
+    max_len = _max_trial_len(trial_ids, skip_negative_trials)
+    ws = int(window_size)
+
+    if max_len < ws:
+        ws = max_len if (max_len % 2 == 1) else max_len - 1
+        ws = max(ws, 31)  # minimum odd window
+        if debug:
+            print(f"[{label}] session={session_id} reducing window_size {window_size} -> {ws} (max_trial_len={max_len})")
+
+    window_size = ws
 
     ds = InferenceWindowDataset(
         sbp_norm=sbp_norm,
