@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from src.dataset import SBPWindowDataset
 from src.io import load_metadata, load_sessions
 from src.losses import masked_mse_loss, nmse_masked
-from src.model import TemporalCNNBaseline
+from src.model import build_model
 from src.utils import resolve_device, seed_everything, split_train_val_sessions
 
 
@@ -57,7 +57,8 @@ def run_eval(args: argparse.Namespace) -> None:
         ckpt = torch.load(args.checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(args.checkpoint_path, map_location=device)
-    model = TemporalCNNBaseline(**ckpt["model_kwargs"])
+    model_name = ckpt.get("model_name", "cnn")
+    model = build_model(model_name, **ckpt["model_kwargs"])
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
 
@@ -71,6 +72,8 @@ def run_eval(args: argparse.Namespace) -> None:
         split="val",
         seed=args.seed,
         mask_channels=args.mask_channels,
+        mask_channels_min=args.mask_channels,
+        mask_channels_max=args.mask_channels,
         deterministic_masks=True,
     )
 

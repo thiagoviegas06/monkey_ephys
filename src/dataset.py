@@ -54,6 +54,8 @@ class SBPWindowDataset(Dataset):
         split: str = "train",
         seed: int = 42,
         mask_channels: int = 30,
+        mask_channels_min: int | None = None,
+        mask_channels_max: int | None = None,
         deterministic_masks: bool = False,
         max_centers_per_session: int | None = None,
     ) -> None:
@@ -64,8 +66,21 @@ class SBPWindowDataset(Dataset):
         self.half_window = window_size // 2
         self.split = split
         self.seed = seed
-        self.mask_channels = mask_channels
         self.deterministic_masks = deterministic_masks
+        self.mask_channels = int(mask_channels)
+        self.mask_channels_min = int(mask_channels if mask_channels_min is None else mask_channels_min)
+        self.mask_channels_max = int(mask_channels if mask_channels_max is None else mask_channels_max)
+
+        if not (1 <= self.mask_channels_min <= 96):
+            raise ValueError(f"mask_channels_min must be in [1,96], got {self.mask_channels_min}")
+        if not (1 <= self.mask_channels_max <= 96):
+            raise ValueError(f"mask_channels_max must be in [1,96], got {self.mask_channels_max}")
+        if self.mask_channels_min > self.mask_channels_max:
+            raise ValueError(
+                f"mask_channels_min must be <= mask_channels_max, got {self.mask_channels_min} > {self.mask_channels_max}"
+            )
+        if not (1 <= self.mask_channels <= 96):
+            raise ValueError(f"mask_channels must be in [1,96], got {self.mask_channels}")
 
         rng = np.random.default_rng(seed)
 
@@ -102,10 +117,12 @@ class SBPWindowDataset(Dataset):
     def _sample_channel_mask(self, idx: int) -> np.ndarray:
         if self.deterministic_masks or self.split != "train":
             local_rng = np.random.default_rng(self.seed + idx)
+            k = self.mask_channels
         else:
             local_rng = np.random.default_rng()
+            k = int(local_rng.integers(self.mask_channels_min, self.mask_channels_max + 1))
 
-        channels = local_rng.choice(96, size=self.mask_channels, replace=False)
+        channels = local_rng.choice(96, size=k, replace=False)
         mask = np.zeros((96,), dtype=np.float32)
         mask[channels] = 1.0
         return mask

@@ -14,7 +14,7 @@ from src.dataset import SBPWindowDataset
 from src.eval import evaluate_model
 from src.io import load_metadata, load_sessions
 from src.losses import masked_mse_loss
-from src.model import TemporalCNNBaseline
+from src.model import build_model
 from src.preprocess import compute_train_session_stats
 from src.utils import ensure_dir, resolve_device, seed_everything, split_train_val_sessions
 
@@ -23,7 +23,9 @@ def _build_loaders(
     data_dir: str,
     metadata_path: str,
     window_size: int,
-    mask_channels: int,
+    train_mask_min: int,
+    train_mask_max: int,
+    val_mask_channels: int,
     seed: int,
     batch_size: int,
     num_workers: int,
@@ -35,7 +37,6 @@ def _build_loaders(
     train_sessions = load_sessions(data_dir, train_ids, split="train")
     val_sessions = load_sessions(data_dir, val_ids, split="train")
 
-    # Save channel-level fallback stats for test-time normalization.
     train_means = []
     train_stds = []
     for s in train_sessions:
@@ -50,7 +51,9 @@ def _build_loaders(
         window_size=window_size,
         split="train",
         seed=seed,
-        mask_channels=mask_channels,
+        mask_channels=train_mask_max,
+        mask_channels_min=train_mask_min,
+        mask_channels_max=train_mask_max,
         deterministic_masks=False,
     )
     val_ds = SBPWindowDataset(
@@ -58,7 +61,9 @@ def _build_loaders(
         window_size=window_size,
         split="val",
         seed=seed,
-        mask_channels=mask_channels,
+        mask_channels=val_mask_channels,
+        mask_channels_min=val_mask_channels,
+        mask_channels_max=val_mask_channels,
         deterministic_masks=True,
         max_centers_per_session=200,
     )
@@ -79,8 +84,23 @@ def _build_loaders(
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
     )
-
     return train_loader, val_loader, train_ids, val_ids, global_mean, global_std
+
+
+def _resolve_model_kwargs(args: argparse.Namespace) -> Dict[str, int | float]:
+    base_kwargs: Dict[str, int | float] = {
+        "input_dim": 196,
+        "hidden_dim": args.hidden_dim,
+        "output_dim": 96,
+        "num_layers": args.num_layers,
+        "kernel_size": args.kernel_size,
+        "dropout": args.dropout,
+        "dilation_base": args.dilation_base,
+    }
+    if args.model == "tcn":
+        base_kwargs["dilation_cap"] = args.dilation_cap
+        base_kwargs["gn_groups"] = args.gn_groups
+    return base_kwargs
 
 
 def train(args: argparse.Namespace) -> None:
@@ -92,21 +112,17 @@ def train(args: argparse.Namespace) -> None:
         data_dir=args.data_dir,
         metadata_path=metadata_path,
         window_size=args.window_size,
-        mask_channels=args.mask_channels,
+        train_mask_min=args.mask_min,
+        train_mask_max=args.mask_max,
+        val_mask_channels=args.mask_channels,
         seed=args.seed,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         val_fraction=args.val_fraction,
     )
 
-    model = TemporalCNNBaseline(
-        input_dim=196,
-        hidden_dim=args.hidden_dim,
-        output_dim=96,
-        num_layers=args.num_layers,
-        kernel_size=args.kernel_size,
-        dropout=args.dropout,
-    ).to(device)
+    model_kwargs = _resolve_model_kwargs(args)
+    model = build_model(args.model, **model_kwargs).to(device)
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = None
@@ -115,10 +131,11 @@ def train(args: argparse.Namespace) -> None:
 
     ckpt_dir = ensure_dir(args.checkpoint_dir)
     best_path = ckpt_dir / args.checkpoint_name
-
     best_val_nmse = float("inf")
 
     print(f"Device: {device}")
+    print(f"Model: {args.model} | kwargs={model_kwargs}")
+    print(f"Train mask range: [{args.mask_min}, {args.mask_max}] | Val mask channels: {args.mask_channels}")
     print(f"Train sessions: {len(train_ids)} | Val sessions: {len(val_ids)}")
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
@@ -136,9 +153,6 @@ def train(args: argparse.Namespace) -> None:
 
             optimizer.zero_grad(set_to_none=True)
             y_hat = model(x_sbp, x_kin, obs_mask)
-            if epoch == 1 and n_batches == 0:
-                print("x_sbp", x_sbp.shape, "x_kin", x_kin.shape, "obs_mask", obs_mask.shape)
-                print("y", y.shape, "y_hat", y_hat.shape, "mask", mask.shape)
             loss = masked_mse_loss(y_hat, y, mask)
             loss.backward()
             optimizer.step()
@@ -151,7 +165,6 @@ def train(args: argparse.Namespace) -> None:
 
         train_loss = train_loss_sum / max(1, n_batches)
         val_metrics = evaluate_model(model, val_loader, device=device)
-
         print(
             f"Epoch {epoch:03d}/{args.epochs:03d} | "
             f"train_loss={train_loss:.6f} | "
@@ -163,15 +176,9 @@ def train(args: argparse.Namespace) -> None:
             best_val_nmse = val_metrics["nmse"]
             torch.save(
                 {
+                    "model_name": args.model,
                     "model_state_dict": model.state_dict(),
-                    "model_kwargs": {
-                        "input_dim": 196,
-                        "hidden_dim": args.hidden_dim,
-                        "output_dim": 96,
-                        "num_layers": args.num_layers,
-                        "kernel_size": args.kernel_size,
-                        "dropout": args.dropout,
-                    },
+                    "model_kwargs": model_kwargs,
                     "window_size": args.window_size,
                     "train_global_mean": global_mean,
                     "train_global_std": global_std,
@@ -188,11 +195,16 @@ def train(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Temporal CNN baseline for masked SBP reconstruction.")
+    parser = argparse.ArgumentParser(description="Train masked SBP reconstruction models.")
     parser.add_argument("--data-dir", type=str, default="kaggle_data")
     parser.add_argument("--metadata-file", type=str, default="metadata.csv")
+    parser.add_argument("--model", type=str, choices=["cnn", "tcn"], default="tcn")
+
     parser.add_argument("--window-size", type=int, default=201)
-    parser.add_argument("--mask-channels", type=int, default=30)
+    parser.add_argument("--mask-channels", type=int, default=30, help="Fixed mask channels used for validation")
+    parser.add_argument("--mask-min", type=int, default=10, help="Train-time minimum masked channels per window")
+    parser.add_argument("--mask-max", type=int, default=60, help="Train-time maximum masked channels per window")
+
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=20)
@@ -203,10 +215,15 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(use_cosine_scheduler=True)
     parser.add_argument("--val-fraction", type=float, default=0.30)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--num-layers", type=int, default=4)
-    parser.add_argument("--kernel-size", type=int, default=9)
-    parser.add_argument("--dropout", type=float, default=0.2)
+
+    parser.add_argument("--hidden-dim", type=int, default=192)
+    parser.add_argument("--num-layers", type=int, default=8)
+    parser.add_argument("--kernel-size", type=int, default=7)
+    parser.add_argument("--dropout", type=float, default=0.15)
+    parser.add_argument("--dilation-base", type=int, default=2)
+    parser.add_argument("--dilation-cap", type=int, default=64)
+    parser.add_argument("--gn-groups", type=int, default=8)
+
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--checkpoint-name", type=str, default="best.pt")
     parser.add_argument("--device", type=str, default="auto")
@@ -214,8 +231,13 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.window_size % 2 == 0:
         raise ValueError("--window-size must be odd")
+    if args.mask_min < 1 or args.mask_max > 96 or args.mask_min > args.mask_max:
+        raise ValueError("Require 1 <= --mask-min <= --mask-max <= 96")
+    if args.mask_channels < 1 or args.mask_channels > 96:
+        raise ValueError("--mask-channels must be in [1,96]")
     return args
 
 
 if __name__ == "__main__":
     train(parse_args())
+

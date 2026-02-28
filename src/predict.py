@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from src.io import load_metadata, load_sessions
-from src.model import TemporalCNNBaseline
+from src.model import build_model
 from src.preprocess import apply_denorm, apply_norm, compute_test_session_stats
 from src.utils import resolve_device
 
@@ -150,10 +150,12 @@ def _load_model(
     except TypeError:
         # Backward compatibility with older torch versions that do not expose weights_only.
         ckpt = torch.load(checkpoint_path, map_location=device)
+    model_name = ckpt.get("model_name", "cnn")
     model_kwargs = ckpt["model_kwargs"]
     if debug:
         _print_checkpoint_info(label=label, checkpoint_path=checkpoint_path, state_dict=ckpt["model_state_dict"])
-    model = TemporalCNNBaseline(**model_kwargs)
+        print(f"[{label}] model_name={model_name} | model_kwargs={model_kwargs}")
+    model = build_model(model_name, **model_kwargs)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
     model.eval()

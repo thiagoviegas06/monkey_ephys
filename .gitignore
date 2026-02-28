@@ -2,3 +2,4 @@
 submission.csv
 /src/__pycache__
 *.csv
+analyze_predictions.ipynb
