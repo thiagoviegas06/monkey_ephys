@@ -1,10 +1,26 @@
-
 import random
 import csv
+import os
+import time
+from types import SimpleNamespace
+
 from train import train
 
-def random_search(num_trials=50, seed=42):
-    random.seed(seed)
+def sample_params(rng: random.Random, param_space: dict) -> dict:
+    params = {k: rng.choice(v) for k, v in param_space.items()}
+
+    if params["mask_min"] > params["mask_max"]:
+        params["mask_min"], params["mask_max"] = params["mask_max"], params["mask_min"]
+
+    if params["kernel_size"] % 2 == 0:
+        params["kernel_size"] += 1
+
+    return params
+
+
+def random_search(num_trials=50, seed=42, results_file="hyperparam_results.csv"):
+    rng = random.Random(seed)
+
     param_space = {
         "num_layers": [4, 8, 12, 16],
         "hidden_dim": [64, 128, 192, 256, 384],
@@ -19,49 +35,82 @@ def random_search(num_trials=50, seed=42):
         "mask_min": [5, 10, 20],
         "mask_max": [40, 60, 80],
         "val_fraction": [0.1, 0.2, 0.3, 0.4],
+        "epochs": [20, 40, 60],
     }
 
-    results_file = "hyperparam_results.csv"
-    with open(results_file, "w", newline="") as csvfile:
-        fieldnames = list(param_space.keys()) + ["val_nmse", "checkpoint_name"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
+    fieldnames = (
+        ["trial", "seed", "status", "error", "wall_sec"]
+        + list(param_space.keys())
+        + ["val_nmse", "checkpoint_name"]
+    )
 
-        for trial in range(num_trials):
-            params = {k: random.choice(v) for k, v in param_space.items()}
-            checkpoint_name = (
-                f"tcn_layers{params['num_layers']}_hidden{params['hidden_dim']}_kernel{params['kernel_size']}"
-                f"_dropout{params['dropout']}_dilationbase{params['dilation_base']}_dilationcap{params['dilation_cap']}"
-                f"_gngroups{params['gn_groups']}_batch{params['batch_size']}_lr{params['lr']}_wd{params['weight_decay']}"
-                f"_maskmin{params['mask_min']}_maskmax{params['mask_max']}_valfrac{params['val_fraction']}.pt"
+    file_exists = os.path.exists(results_file)
+    with open(results_file, "a", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+
+        for trial in range(1, num_trials + 1):
+            params = sample_params(rng, param_space)
+            checkpoint_name = f"trial{trial:03d}.pt"  # FIXED
+
+            args = SimpleNamespace(
+                model="tcn",
+                num_layers=params["num_layers"],
+                hidden_dim=params["hidden_dim"],
+                kernel_size=params["kernel_size"],
+                dropout=params["dropout"],
+                dilation_base=params["dilation_base"],
+                dilation_cap=params["dilation_cap"],
+                gn_groups=params["gn_groups"],
+                batch_size=params["batch_size"],
+                lr=params["lr"],
+                weight_decay=params["weight_decay"],
+                mask_min=params["mask_min"],
+                mask_max=params["mask_max"],
+                mask_channels=30,  # RECOMMENDED: fixed val masking for fair comparison
+                val_fraction=params["val_fraction"],
+                epochs=params["epochs"],
+                checkpoint_name=checkpoint_name,
+                seed=seed,
+                device="auto",
+                window_size=201,
+                data_dir="kaggle_data",
+                metadata_file="metadata.csv",
+                checkpoint_dir="checkpoints_randomsearch",
+                num_workers=0,
+                use_cosine_scheduler=True,
             )
-            args = [
-                "--model", "tcn",
-                "--num-layers", str(params["num_layers"]),
-                "--hidden-dim", str(params["hidden_dim"]),
-                "--kernel-size", str(params["kernel_size"]),
-                "--dropout", str(params["dropout"]),
-                "--dilation-base", str(params["dilation_base"]),
-                "--dilation-cap", str(params["dilation_cap"]),
-                "--gn-groups", str(params["gn_groups"]),
-                "--batch-size", str(params["batch_size"]),
-                "--lr", str(params["lr"]),
-                "--weight-decay", str(params["weight_decay"]),
-                "--mask-min", str(params["mask_min"]),
-                "--mask-max", str(params["mask_max"]),
-                "--val-fraction", str(params["val_fraction"]),
-                "--checkpoint-name", checkpoint_name,
-            ]
-            print(f"Trial {trial+1}/{num_trials}: Training with args: {' '.join(args)}")
-            result = train(train.parse_args(args))
-            # Assume train() returns val_nmse, update if needed
-            val_nmse = None
-            if isinstance(result, dict) and "best_val_nmse" in result:
-                val_nmse = result["best_val_nmse"]
-            writer.writerow({**params, "val_nmse": val_nmse, "checkpoint_name": checkpoint_name})
+
+            print(f"[trial {trial}/{num_trials}] {checkpoint_name}")
+            t0 = time.time()
+
+            row = {
+                "trial": trial,
+                "seed": seed,
+                **params,
+                "checkpoint_name": checkpoint_name,
+                "val_nmse": None,
+                "status": "ok",
+                "error": "",
+                "wall_sec": None,
+            }
+
+            try:
+                result = train(args)  # FIXED: actually run training
+
+                if isinstance(result, dict):
+                    row["val_nmse"] = result.get("best_val_nmse", result.get("val_nmse"))
+                elif isinstance(result, (float, int)):
+                    row["val_nmse"] = float(result)
+
+            except Exception as e:
+                row["status"] = "fail"
+                row["error"] = repr(e)
+
+            row["wall_sec"] = round(time.time() - t0, 2)
+            writer.writerow(row)
+            csvfile.flush()
 
 if __name__ == "__main__":
-    random_search(num_trials=50)
-
-
-
+    random_search(num_trials=50, seed=42)

@@ -192,6 +192,7 @@ def train(args: argparse.Namespace) -> None:
             print(f"Saved best checkpoint: {best_path} (val_nmse={best_val_nmse:.6f})")
 
     print(f"Training finished. Best val NMSE: {best_val_nmse:.6f}")
+    return {"best_val_nmse": best_val_nmse, "best_path": str(best_path)}
 
 
 def parse_args() -> argparse.Namespace:
