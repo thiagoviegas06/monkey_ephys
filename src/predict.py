@@ -259,11 +259,7 @@ def _predict_session_matrix(
         obs_mask = batch["obs_mask"].to(device) # (B,T,96)
         centers = batch["center"].cpu().numpy().astype(np.int64)
 
-        y_hat = model(x_sbp, x_kin, obs_mask).cpu().numpy().astype(np.float32)
-        
-        # Handle both (B,96,T) and (B,T,96) output shapes (CNN vs TCN)
-        if y_hat.shape[-1] != 96:
-            y_hat = y_hat.transpose(0, 2, 1)  # Convert (B,96,T) -> (B,T,96)
+        y_hat = model(x_sbp, x_kin, obs_mask).cpu().numpy().astype(np.float32)  # (B,96,T)
 
         if batch_idx == 0:
             first_batch_y_hat = y_hat.copy()
@@ -293,7 +289,7 @@ def _predict_session_matrix(
             if start >= end or ws_start >= ws_end:
                 continue
 
-            pred_bt = y_hat[i]  # (T,96) - already in correct shape from normalization above
+            pred_bt = y_hat[i].T  # (T,96)
             pred_sum[start:end] += pred_bt[ws_start:ws_end]
             pred_count[start:end] += 1.0
 
