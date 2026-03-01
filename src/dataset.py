@@ -17,33 +17,33 @@ class _PreparedSession:
     sbp_norm: np.ndarray
     kinematics: np.ndarray
     trial_ids: np.ndarray
+    trial_start: np.ndarray
+    trial_end: np.ndarray
     mean: np.ndarray
     std: np.ndarray
 
 
-def _valid_centers_for_trial_ids(trial_ids: np.ndarray, half_window: int) -> np.ndarray:
+def _all_valid_centers_for_trial_ids(trial_ids: np.ndarray) -> np.ndarray:
     n_bins = len(trial_ids)
     if n_bins == 0:
         return np.empty((0,), dtype=np.int64)
+    return np.flatnonzero(trial_ids >= 0).astype(np.int64)
+
+
+def _compute_trial_boundaries(trial_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    n_bins = len(trial_ids)
+    trial_start = np.empty((n_bins,), dtype=np.int64)
+    trial_end = np.empty((n_bins,), dtype=np.int64)
+    if n_bins == 0:
+        return trial_start, trial_end
 
     boundaries = np.where(np.diff(trial_ids) != 0)[0] + 1
     starts = np.concatenate([[0], boundaries])
     ends = np.concatenate([boundaries, [n_bins]])
-
-    centers: List[np.ndarray] = []
     for start, end in zip(starts, ends):
-        trial_id = trial_ids[start]
-        if trial_id < 0:
-            continue
-
-        lo = start + half_window
-        hi = end - half_window
-        if lo < hi:
-            centers.append(np.arange(lo, hi, dtype=np.int64))
-
-    if not centers:
-        return np.empty((0,), dtype=np.int64)
-    return np.concatenate(centers)
+        trial_start[start:end] = start
+        trial_end[start:end] = end
+    return trial_start, trial_end
 
 
 class SBPWindowDataset(Dataset):
@@ -90,18 +90,22 @@ class SBPWindowDataset(Dataset):
         for session in sessions:
             mean, std = compute_train_session_stats(session.sbp)
             sbp_norm = apply_norm(session.sbp, mean, std)
+            trial_ids = session.trial_ids.astype(np.int64)
+            trial_start, trial_end = _compute_trial_boundaries(trial_ids)
 
             prepared = _PreparedSession(
                 session_id=session.session_id,
                 sbp_norm=sbp_norm,
                 kinematics=session.kinematics.astype(np.float32),
-                trial_ids=session.trial_ids.astype(np.int64),
+                trial_ids=trial_ids,
+                trial_start=trial_start,
+                trial_end=trial_end,
                 mean=mean,
                 std=std,
             )
             self.sessions.append(prepared)
 
-            centers = _valid_centers_for_trial_ids(prepared.trial_ids, self.half_window)
+            centers = _all_valid_centers_for_trial_ids(prepared.trial_ids)
             if max_centers_per_session is not None and len(centers) > max_centers_per_session:
                 centers = np.sort(rng.choice(centers, size=max_centers_per_session, replace=False))
 
@@ -131,12 +135,36 @@ class SBPWindowDataset(Dataset):
         session_idx, center = self.index_map[idx]
         session = self.sessions[session_idx]
 
-        start = center - self.half_window
-        end = center + self.half_window + 1
+        ts = int(session.trial_start[center])
+        te = int(session.trial_end[center])
 
-        x_kin = session.kinematics[start:end].astype(np.float32, copy=True)
-        x_sbp = session.sbp_norm[start:end].astype(np.float32, copy=True)
-        y_seq = session.sbp_norm[start:end].astype(np.float32, copy=True)
+        rel_c = center - ts
+        seg_len = te - ts
+
+        start_rel = rel_c - self.half_window
+        end_rel = rel_c + self.half_window + 1
+
+        pad_left = max(0, -start_rel)
+        pad_right = max(0, end_rel - seg_len)
+
+        a = max(0, start_rel)
+        b = min(seg_len, end_rel)
+
+        x_sbp_seg = session.sbp_norm[ts:te][a:b]
+        x_kin_seg = session.kinematics[ts:te][a:b]
+
+        if x_sbp_seg.shape[0] == 0:
+            x_sbp_seg = session.sbp_norm[center:center + 1]
+            x_kin_seg = session.kinematics[center:center + 1]
+            pad_left = self.half_window
+            pad_right = self.half_window
+
+        x_sbp = np.pad(x_sbp_seg, ((pad_left, pad_right), (0, 0)), mode="edge").astype(np.float32, copy=False)
+        x_kin = np.pad(x_kin_seg, ((pad_left, pad_right), (0, 0)), mode="edge").astype(np.float32, copy=False)
+        y_seq = x_sbp.copy()
+
+        if x_sbp.shape[0] != self.window_size:
+            raise RuntimeError(f"Bad window length: got {x_sbp.shape[0]} expected {self.window_size}")
 
         mask = self._sample_channel_mask(idx)                 # (96,) 1=masked
         mask_bool = mask.astype(bool)
