@@ -19,6 +19,7 @@ def evaluate_model(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
+    amp_dtype: torch.dtype | None = None,
 ) -> Dict[str, float]:
     model.eval()
     loss_sum = 0.0
@@ -26,15 +27,20 @@ def evaluate_model(
     n_batches = 0
 
     for batch in dataloader:
-        x_sbp = batch["x_sbp"].to(device)
-        x_kin = batch["x_kin"].to(device)
-        obs_mask = batch["obs_mask"].to(device)
-        y = batch["y_seq"].to(device).transpose(1, 2)
-        mask = batch["mask"].to(device)
+        x_sbp = batch["x_sbp"].to(device, non_blocking=True)
+        x_kin = batch["x_kin"].to(device, non_blocking=True)
+        obs_mask = batch["obs_mask"].to(device, non_blocking=True)
+        y = batch["y_seq"].to(device, non_blocking=True).transpose(1, 2)
+        mask = batch["mask"].to(device, non_blocking=True)
 
-        y_hat = model(x_sbp, x_kin, obs_mask)
-        loss = masked_mse_loss(y_hat, y, mask)
-        nmse = nmse_masked(y_hat, y, mask)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=amp_dtype is not None,
+        ):
+            y_hat = model(x_sbp, x_kin, obs_mask)
+            loss = masked_mse_loss(y_hat, y, mask)
+            nmse = nmse_masked(y_hat, y, mask)
 
         loss_sum += float(loss.item())
         nmse_sum += float(nmse.item())

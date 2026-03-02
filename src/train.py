@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -30,6 +31,8 @@ def _build_loaders(
     batch_size: int,
     num_workers: int,
     val_fraction: float,
+    prefetch_factor: int,
+    persistent_workers: bool,
 ) -> Tuple[DataLoader, DataLoader, List[str], List[str], np.ndarray, np.ndarray]:
     metadata = load_metadata(metadata_path)
     train_ids, val_ids = split_train_val_sessions(metadata, val_fraction=val_fraction, seed=seed)
@@ -68,21 +71,26 @@ def _build_loaders(
         max_centers_per_session=200,
     )
 
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "drop_last": False,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["persistent_workers"] = persistent_workers
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
+        **loader_kwargs,
     )
     return train_loader, val_loader, train_ids, val_ids, global_mean, global_std
 
@@ -103,9 +111,32 @@ def _resolve_model_kwargs(args: argparse.Namespace) -> Dict[str, int | float]:
     return base_kwargs
 
 
+def _resolve_amp_dtype(precision: str, device: torch.device) -> torch.dtype | None:
+    if device.type != "cuda":
+        return None
+    if precision == "auto":
+        return torch.bfloat16
+    if precision == "bf16":
+        return torch.bfloat16
+    if precision == "fp16":
+        return torch.float16
+    return None
+
+
 def train(args: argparse.Namespace) -> None:
     seed_everything(args.seed)
     device = resolve_device(args.device)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = args.allow_tf32
+        torch.backends.cudnn.allow_tf32 = args.allow_tf32
+        if args.matmul_precision != "default":
+            torch.set_float32_matmul_precision(args.matmul_precision)
+        if args.deterministic:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = args.benchmark_cudnn
 
     metadata_path = str(Path(args.data_dir) / args.metadata_file)
     train_loader, val_loader, train_ids, val_ids, global_mean, global_std = _build_loaders(
@@ -119,10 +150,20 @@ def train(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         val_fraction=args.val_fraction,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=args.persistent_workers,
     )
 
     model_kwargs = _resolve_model_kwargs(args)
     model = build_model(args.model, **model_kwargs).to(device)
+    if args.compile_model and device.type == "cuda":
+        if hasattr(torch, "compile"):
+            model = torch.compile(model, mode=args.compile_mode)
+        else:
+            print("torch.compile not available in this PyTorch version; continuing without compilation.")
+    amp_dtype = _resolve_amp_dtype(args.precision, device)
+    use_grad_scaler = amp_dtype == torch.float16 and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = None
@@ -134,6 +175,15 @@ def train(args: argparse.Namespace) -> None:
     best_val_nmse = float("inf")
 
     print(f"Device: {device}")
+    print(
+        f"Precision: {args.precision} (resolved={amp_dtype}) | "
+        f"compile={args.compile_model and device.type == 'cuda'}"
+    )
+    if device.type == "cuda":
+        print(
+            f"TF32={args.allow_tf32} | cudnn.benchmark={torch.backends.cudnn.benchmark} | "
+            f"deterministic={torch.backends.cudnn.deterministic}"
+        )
     print(f"Model: {args.model} | kwargs={model_kwargs}")
     print(f"Train mask range: [{args.mask_min}, {args.mask_max}] | Val mask channels: {args.mask_channels}")
     print(f"Train sessions: {len(train_ids)} | Val sessions: {len(val_ids)}")
@@ -145,17 +195,28 @@ def train(args: argparse.Namespace) -> None:
         n_batches = 0
 
         for batch in train_loader:
-            x_sbp = batch["x_sbp"].to(device)
-            x_kin = batch["x_kin"].to(device)
-            obs_mask = batch["obs_mask"].to(device)
-            y = batch["y_seq"].to(device).transpose(1, 2)
-            mask = batch["mask"].to(device)
+            x_sbp = batch["x_sbp"].to(device, non_blocking=True)
+            x_kin = batch["x_kin"].to(device, non_blocking=True)
+            obs_mask = batch["obs_mask"].to(device, non_blocking=True)
+            y = batch["y_seq"].to(device, non_blocking=True).transpose(1, 2)
+            mask = batch["mask"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            y_hat = model(x_sbp, x_kin, obs_mask)
-            loss = masked_mse_loss(y_hat, y, mask)
-            loss.backward()
-            optimizer.step()
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=amp_dtype is not None,
+            ):
+                y_hat = model(x_sbp, x_kin, obs_mask)
+                loss = masked_mse_loss(y_hat, y, mask)
+
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             train_loss_sum += float(loss.item())
             n_batches += 1
@@ -164,7 +225,7 @@ def train(args: argparse.Namespace) -> None:
             scheduler.step()
 
         train_loss = train_loss_sum / max(1, n_batches)
-        val_metrics = evaluate_model(model, val_loader, device=device)
+        val_metrics = evaluate_model(model, val_loader, device=device, amp_dtype=amp_dtype)
         print(
             f"Epoch {epoch:03d}/{args.epochs:03d} | "
             f"train_loss={train_loss:.6f} | "
@@ -207,7 +268,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-max", type=int, default=60, help="Train-time maximum masked channels per window")
 
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=min(8, max(1, (os.cpu_count() or 1) // 2)))
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--persistent-workers", dest="persistent_workers", action="store_true")
+    parser.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
+    parser.set_defaults(persistent_workers=True)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -224,6 +289,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dilation-base", type=int, default=2)
     parser.add_argument("--dilation-cap", type=int, default=64)
     parser.add_argument("--gn-groups", type=int, default=8)
+    parser.add_argument("--precision", type=str, choices=["auto", "fp32", "bf16", "fp16"], default="auto")
+    parser.add_argument("--compile-model", dest="compile_model", action="store_true")
+    parser.add_argument("--no-compile-model", dest="compile_model", action="store_false")
+    parser.set_defaults(compile_model=True)
+    parser.add_argument("--compile-mode", type=str, choices=["default", "reduce-overhead", "max-autotune"], default="max-autotune")
+    parser.add_argument("--allow-tf32", dest="allow_tf32", action="store_true")
+    parser.add_argument("--no-allow-tf32", dest="allow_tf32", action="store_false")
+    parser.set_defaults(allow_tf32=True)
+    parser.add_argument("--benchmark-cudnn", dest="benchmark_cudnn", action="store_true")
+    parser.add_argument("--no-benchmark-cudnn", dest="benchmark_cudnn", action="store_false")
+    parser.set_defaults(benchmark_cudnn=True)
+    parser.add_argument("--deterministic", action="store_true", help="Deterministic mode (slower; disables cudnn benchmark).")
+    parser.add_argument(
+        "--matmul-precision",
+        type=str,
+        choices=["default", "high", "medium"],
+        default="high",
+        help="torch.set_float32_matmul_precision setting for CUDA.",
+    )
 
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--checkpoint-name", type=str, default="best.pt")
@@ -236,9 +320,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("Require 1 <= --mask-min <= --mask-max <= 96")
     if args.mask_channels < 1 or args.mask_channels > 96:
         raise ValueError("--mask-channels must be in [1,96]")
+    if args.prefetch_factor < 1:
+        raise ValueError("--prefetch-factor must be >= 1")
     return args
 
 
 if __name__ == "__main__":
     train(parse_args())
-
