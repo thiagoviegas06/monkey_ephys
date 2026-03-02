@@ -200,12 +200,36 @@ def train(args: argparse.Namespace) -> None:
         train_loss_sum = 0.0
         n_batches = 0
 
+        printed = False  # print mask stats once per epoch
+
         for batch in train_loader:
             x_sbp = batch["x_sbp"].to(device, non_blocking=True)
             x_kin = batch["x_kin"].to(device, non_blocking=True)
             obs_mask = batch["obs_mask"].to(device, non_blocking=True)
             y = batch["y_seq"].to(device, non_blocking=True).transpose(1, 2)
-            mask = batch["mask"].to(device, non_blocking=True)
+            mask = batch["mask"].to(device, non_blocking=True)  # (B,96)
+
+            if not printed:
+                # Basic sanity
+                print("mask unique:", torch.unique(mask).tolist())
+                masked_per_sample = mask.sum(dim=1)
+                print("masked chans per sample (first 8):", masked_per_sample[:8].tolist())
+                print(
+                    "masked chans stats:",
+                    {
+                        "min": int(masked_per_sample.min().item()),
+                        "max": int(masked_per_sample.max().item()),
+                        "mean": float(masked_per_sample.float().mean().item()),
+                    },
+                )
+
+                # Hard checks (tune these if you expect variation)
+                assert mask.ndim == 2 and mask.shape[1] == 96, f"mask shape wrong: {tuple(mask.shape)}"
+                assert torch.all((mask == 0) | (mask == 1)), "mask must be binary 0/1"
+                assert int(masked_per_sample.min().item()) >= args.mask_min, "too few masked channels"
+                assert int(masked_per_sample.max().item()) <= args.mask_max, "too many masked channels"
+
+                printed = True
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(
