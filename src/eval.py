@@ -81,6 +81,7 @@ def run_eval(args: argparse.Namespace) -> None:
         mask_channels_min=args.mask_channels,
         mask_channels_max=args.mask_channels,
         deterministic_masks=True,
+        max_centers_per_session=args.max_val_centers_per_session,
     )
 
     val_loader = DataLoader(
@@ -107,6 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-channels", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--max-val-centers-per-session", type=int, default=None)
     parser.add_argument("--val-fraction", type=float, default=0.30)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
@@ -114,6 +116,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.window_size % 2 == 0:
         raise ValueError("--window-size must be odd")
+    if args.max_val_centers_per_session is not None and args.max_val_centers_per_session < 1:
+        raise ValueError("--max-val-centers-per-session must be >= 1 when set")
     return args
 
 

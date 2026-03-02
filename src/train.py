@@ -33,6 +33,8 @@ def _build_loaders(
     val_fraction: float,
     prefetch_factor: int,
     persistent_workers: bool,
+    max_train_centers_per_session: int | None,
+    max_val_centers_per_session: int | None,
 ) -> Tuple[DataLoader, DataLoader, List[str], List[str], np.ndarray, np.ndarray]:
     metadata = load_metadata(metadata_path)
     train_ids, val_ids = split_train_val_sessions(metadata, val_fraction=val_fraction, seed=seed)
@@ -58,6 +60,7 @@ def _build_loaders(
         mask_channels_min=train_mask_min,
         mask_channels_max=train_mask_max,
         deterministic_masks=False,
+        max_centers_per_session=max_train_centers_per_session,
     )
     val_ds = SBPWindowDataset(
         sessions=val_sessions,
@@ -68,7 +71,7 @@ def _build_loaders(
         mask_channels_min=val_mask_channels,
         mask_channels_max=val_mask_channels,
         deterministic_masks=True,
-        max_centers_per_session=200,
+        max_centers_per_session=max_val_centers_per_session,
     )
 
     loader_kwargs = {
@@ -152,6 +155,8 @@ def train(args: argparse.Namespace) -> None:
         val_fraction=args.val_fraction,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
+        max_train_centers_per_session=args.max_train_centers_per_session,
+        max_val_centers_per_session=args.max_val_centers_per_session,
     )
 
     model_kwargs = _resolve_model_kwargs(args)
@@ -188,6 +193,7 @@ def train(args: argparse.Namespace) -> None:
     print(f"Train mask range: [{args.mask_min}, {args.mask_max}] | Val mask channels: {args.mask_channels}")
     print(f"Train sessions: {len(train_ids)} | Val sessions: {len(val_ids)}")
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
+    print(f"Eval every: {args.eval_every} epoch(s)")
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -225,32 +231,36 @@ def train(args: argparse.Namespace) -> None:
             scheduler.step()
 
         train_loss = train_loss_sum / max(1, n_batches)
-        val_metrics = evaluate_model(model, val_loader, device=device, amp_dtype=amp_dtype)
-        print(
-            f"Epoch {epoch:03d}/{args.epochs:03d} | "
-            f"train_loss={train_loss:.6f} | "
-            f"val_loss={val_metrics['loss']:.6f} | "
-            f"val_nmse={val_metrics['nmse']:.6f}"
-        )
-
-        if val_metrics["nmse"] < best_val_nmse:
-            best_val_nmse = val_metrics["nmse"]
-            torch.save(
-                {
-                    "model_name": args.model,
-                    "model_state_dict": model.state_dict(),
-                    "model_kwargs": model_kwargs,
-                    "window_size": args.window_size,
-                    "train_global_mean": global_mean,
-                    "train_global_std": global_std,
-                    "train_session_ids": train_ids,
-                    "val_session_ids": val_ids,
-                    "best_val_nmse": best_val_nmse,
-                    "epoch": epoch,
-                },
-                best_path,
+        should_eval = (epoch % args.eval_every == 0) or (epoch == args.epochs)
+        if should_eval:
+            val_metrics = evaluate_model(model, val_loader, device=device, amp_dtype=amp_dtype)
+            print(
+                f"Epoch {epoch:03d}/{args.epochs:03d} | "
+                f"train_loss={train_loss:.6f} | "
+                f"val_loss={val_metrics['loss']:.6f} | "
+                f"val_nmse={val_metrics['nmse']:.6f}"
             )
-            print(f"Saved best checkpoint: {best_path} (val_nmse={best_val_nmse:.6f})")
+
+            if val_metrics["nmse"] < best_val_nmse:
+                best_val_nmse = val_metrics["nmse"]
+                torch.save(
+                    {
+                        "model_name": args.model,
+                        "model_state_dict": model.state_dict(),
+                        "model_kwargs": model_kwargs,
+                        "window_size": args.window_size,
+                        "train_global_mean": global_mean,
+                        "train_global_std": global_std,
+                        "train_session_ids": train_ids,
+                        "val_session_ids": val_ids,
+                        "best_val_nmse": best_val_nmse,
+                        "epoch": epoch,
+                    },
+                    best_path,
+                )
+                print(f"Saved best checkpoint: {best_path} (val_nmse={best_val_nmse:.6f})")
+        else:
+            print(f"Epoch {epoch:03d}/{args.epochs:03d} | train_loss={train_loss:.6f} | val_skipped")
 
     print(f"Training finished. Best val NMSE: {best_val_nmse:.6f}")
     return {"best_val_nmse": best_val_nmse, "best_path": str(best_path)}
@@ -273,6 +283,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--persistent-workers", dest="persistent_workers", action="store_true")
     parser.add_argument("--no-persistent-workers", dest="persistent_workers", action="store_false")
     parser.set_defaults(persistent_workers=True)
+    parser.add_argument(
+        "--max-train-centers-per-session",
+        type=int,
+        default=None,
+        help="Optional cap on train windows per session to control epoch runtime.",
+    )
+    parser.add_argument(
+        "--max-val-centers-per-session",
+        type=int,
+        default=200,
+        help="Optional cap on validation windows per session during training.",
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=1,
+        help="Run validation every N epochs (always runs on final epoch).",
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -322,6 +350,12 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--mask-channels must be in [1,96]")
     if args.prefetch_factor < 1:
         raise ValueError("--prefetch-factor must be >= 1")
+    if args.max_train_centers_per_session is not None and args.max_train_centers_per_session < 1:
+        raise ValueError("--max-train-centers-per-session must be >= 1 when set")
+    if args.max_val_centers_per_session is not None and args.max_val_centers_per_session < 1:
+        raise ValueError("--max-val-centers-per-session must be >= 1 when set")
+    if args.eval_every < 1:
+        raise ValueError("--eval-every must be >= 1")
     return args
 
 
