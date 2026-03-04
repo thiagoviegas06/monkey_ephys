@@ -2,83 +2,247 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class ResDilatedBlock(nn.Module):
-    def __init__(self, channels: int, kernel_size: int, dilation: int, dropout: float):
+class SBP_Reconstruction_UNet(nn.Module):
+    """
+    U-Net for masked SBP reconstruction.
+    Optimized for (W=200, C=96) shape - pools only in time dimension.
+    
+    Mask convention: True = masked (to be predicted), False = observed
+    """
+    def __init__(self, base_channels=64, in_ch=2, out_ch=1, gn_groups=8):
         super().__init__()
-        pad = (kernel_size - 1) // 2 * dilation  # same-length padding
 
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size,
-                               padding=pad, dilation=dilation)
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size,
-                               padding=pad, dilation=dilation)
+        def norm(c):
+            g = min(gn_groups, c)
+            while c % g != 0 and g > 1:
+                g -= 1
+            return nn.GroupNorm(g, c)
 
-        self.norm1 = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
-        self.norm2 = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
+        def conv_block(cin, cout):
+            return nn.Sequential(
+                nn.Conv2d(cin, cout, 3, padding=1),
+                norm(cout),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(cout, cout, 3, padding=1),
+                norm(cout),
+                nn.ReLU(inplace=True),
+            )
 
-        self.dropout = nn.Dropout(dropout)
+        # Pool only in time dimension to preserve channel structure
+        # (W, C) -> (W/2, C)
+        self.pool = nn.MaxPool2d(kernel_size=(2, 1))
+        self.up = lambda x: F.interpolate(x, scale_factor=(2, 1), mode="bilinear", align_corners=False)
 
+        # Encoder - progressively downsample time
+        self.enc1 = conv_block(in_ch, base_channels)           # 64
+        self.enc2 = conv_block(base_channels, base_channels*2) # 128
+        self.enc3 = conv_block(base_channels*2, base_channels*4) # 256
+
+        # Bottleneck
+        self.bottleneck = conv_block(base_channels*4, base_channels*8) # 512
+
+        # Decoder - progressively upsample time with skip connections
+        self.dec3 = conv_block(base_channels*8 + base_channels*4, base_channels*4)
+        self.dec2 = conv_block(base_channels*4 + base_channels*2, base_channels*2)
+        self.dec1 = conv_block(base_channels*2 + base_channels, base_channels)
+
+        # Output projection
+        self.out = nn.Conv2d(base_channels, out_ch, kernel_size=1)
+
+    def forward(self, x_sbp, mask):
+        """
+        x_sbp: (B, W, C)  - masked SBP input (0s where masked)
+        mask:  (B, W, C)  - bool tensor, True where masked, False where observed
+        
+        Returns: (B, W, C) - reconstructed SBP
+        """
+        B, W, C = x_sbp.shape
+        
+        # Create observed mask (inverse of mask)
+        obs_mask = ~mask  # True where observed
+        obs = obs_mask.float()
+
+        # 2-channel input: [masked_signal, observation_indicator]
+        # This tells the model which positions are already known
+        x = torch.stack([x_sbp, obs], dim=1)  # (B, 2, W, C)
+
+        # Encoder path
+        # Input: 200x96 -> 100x96 -> 50x96 -> 25x96
+        e1 = self.enc1(x)            # (B, 64, W, C)
+        e2 = self.enc2(self.pool(e1))# (B, 128, W/2, C)
+        e3 = self.enc3(self.pool(e2))# (B, 256, W/4, C)
+
+        # Bottleneck
+        b = self.bottleneck(self.pool(e3))  # (B, 512, W/8, C)
+
+        # Decoder path with skip connections
+        # 25x96 -> 50x96 -> 100x96 -> 200x96
+        d3 = self.up(b)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+
+        # Project to output
+        out = self.out(d1).squeeze(1)  # (B, W, C)
+
+        # Keep observed entries unchanged; only predict masked positions
+        # This ensures the model only changes what needs to be reconstructed
+        out = out * mask.float() + x_sbp * obs
+        
+        return out
+
+
+class SimpleCNN(nn.Module):
+    """
+    Lightweight CNN for masked SBP reconstruction.
+    No downsampling - processes at full (200, 96) resolution throughout.
+    Good baseline to compare against U-Net.
+    """
+    def __init__(self, hidden_channels=128, num_layers=6):
+        super().__init__()
+        
+        layers = []
+        # Input: 2 channels (signal + mask indicator)
+        layers.append(nn.Conv2d(2, hidden_channels, kernel_size=3, padding=1))
+        layers.append(nn.GroupNorm(8, hidden_channels))
+        layers.append(nn.ReLU(inplace=True))
+        
+        # Middle layers with residual-like connections
+        for _ in range(num_layers):
+            layers.append(nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1))
+            layers.append(nn.GroupNorm(8, hidden_channels))
+            layers.append(nn.ReLU(inplace=True))
+        
+        # Output: 1 channel (reconstructed signal)
+        layers.append(nn.Conv2d(hidden_channels, 1, kernel_size=1))
+        
+        self.net = nn.Sequential(*layers)
+    
+    def forward(self, x_sbp, mask):
+        """
+        x_sbp: (B, W, C) - masked SBP input
+        mask:  (B, W, C) - True where masked
+        """
+        obs_mask = ~mask
+        obs = obs_mask.float()
+        
+        # Stack signal and observation indicator
+        x = torch.stack([x_sbp, obs], dim=1)  # (B, 2, W, C)
+        
+        # Process through CNN
+        out = self.net(x).squeeze(1)  # (B, W, C)
+        
+        # Keep observed values, only predict masked
+        out = out * mask.float() + x_sbp * obs
+        
+        return out
+
+
+class ResNetBlock(nn.Module):
+    """Residual block with GroupNorm"""
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.gn1 = nn.GroupNorm(8, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.gn2 = nn.GroupNorm(8, channels)
+        
     def forward(self, x):
-        # x: (B, C, T)
-        h = self.conv1(x)
-        h = self.norm1(h)
-        h = F.gelu(h)
-        h = self.dropout(h)
-
-        h = self.conv2(h)
-        h = self.norm2(h)
-        h = F.gelu(h)
-        h = self.dropout(h)
-
-        return x + h  # residual
+        residual = x
+        out = F.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
+        out += residual
+        return F.relu(out)
 
 
-class SBPInpaintingTCN(nn.Module):
+class ResNetReconstructor(nn.Module):
     """
-    Input:
-      x_sbp: (B, W, 96)  masked
-      kin:   (B, W, 4)
-      obs_mask: (B, W, 96) 1 where observed, 0 where masked (float or bool)
-
-    Output:
-      y_hat: (B, W, 96)
+    ResNet-style architecture for SBP reconstruction.
+    Uses residual connections for better gradient flow.
     """
-    def __init__(
-        self,
-        in_dim: int = 196,     # 96 sbp + 4 kin + 96 obs_mask
-        hidden: int = 256,
-        out_dim: int = 96,
-        depth: int = 8,
-        kernel_size: int = 7,
-        dropout: float = 0.1,
-        dilation_base: int = 2,
-        dilation_cap: int = 128,
-    ):
+    def __init__(self, hidden_channels=128, num_blocks=8):
         super().__init__()
+        
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.Conv2d(2, hidden_channels, 3, padding=1),
+            nn.GroupNorm(8, hidden_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Residual blocks
+        self.blocks = nn.ModuleList([
+            ResNetBlock(hidden_channels) for _ in range(num_blocks)
+        ])
+        
+        # Output projection
+        self.output_proj = nn.Conv2d(hidden_channels, 1, 1)
+        
+    def forward(self, x_sbp, mask):
+        """
+        x_sbp: (B, W, C) - masked SBP input
+        mask:  (B, W, C) - True where masked
+        """
+        obs_mask = ~mask
+        obs = obs_mask.float()
+        
+        # Stack inputs
+        x = torch.stack([x_sbp, obs], dim=1)  # (B, 2, W, C)
+        
+        # Process
+        x = self.input_proj(x)
+        
+        for block in self.blocks:
+            x = block(x)
+        
+        out = self.output_proj(x).squeeze(1)  # (B, W, C)
+        
+        # Keep observed values
+        out = out * mask.float() + x_sbp * obs
+        
+        return out
 
-        self.in_proj = nn.Conv1d(in_dim, hidden, kernel_size=1)
 
-        blocks = []
-        d = 1
-        for _ in range(depth):
-            blocks.append(ResDilatedBlock(hidden, kernel_size, dilation=d, dropout=dropout))
-            d = min(d * dilation_base, dilation_cap)
-        self.blocks = nn.ModuleList(blocks)
+"""
+Usage Example:
+--------------
 
-        self.out_proj = nn.Conv1d(hidden, out_dim, kernel_size=1)
+from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor
+from losses import masked_nmse_loss
 
-    def forward(self, x_sbp, kin, obs_mask):
-        # x_sbp: (B,W,96), kin: (B,W,4), obs_mask:(B,W,96)
-        if obs_mask.dtype != x_sbp.dtype:
-            obs_mask = obs_mask.to(dtype=x_sbp.dtype)
+# Choose a model
+model = SBP_Reconstruction_UNet(base_channels=64)  # Best overall
+# model = SimpleCNN(hidden_channels=128, num_layers=6)  # Fastest
+# model = ResNetReconstructor(hidden_channels=128, num_blocks=8)  # Good middle ground
 
-        x = torch.cat([x_sbp, kin, obs_mask], dim=-1)  # (B,W,196)
+# In training loop:
+for batch in dataloader:
+    x_sbp = batch['x_sbp']  # (B, 200, 96) - zeros where masked
+    y_sbp = batch['y_sbp']  # (B, 200, 96) - ground truth
+    mask = batch['mask']     # (B, 200, 96) - True where masked
+    
+    # Forward pass
+    pred = model(x_sbp, mask)
+    
+    # Compute loss only on masked positions
+    loss = masked_nmse_loss(pred, y_sbp, mask)
+    
+    # Backward pass
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
 
-        # to (B,C,T)
-        x = x.transpose(1, 2)  # (B,196,W)
+Model Comparison:
+- SBP_Reconstruction_UNet: Best performance, captures multi-scale patterns
+- SimpleCNN: Fastest training, good baseline
+- ResNetReconstructor: Better gradient flow than SimpleCNN, competitive with U-Net
 
-        x = self.in_proj(x)    # (B,hidden,W)
-        for blk in self.blocks:
-            x = blk(x)
-        y = self.out_proj(x)   # (B,96,W)
-
-        return y.transpose(1, 2)  # (B,W,96)
+All models handle (200, 96) shape and use the convention: mask=True means masked.
+"""

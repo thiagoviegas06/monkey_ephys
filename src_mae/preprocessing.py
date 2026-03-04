@@ -249,10 +249,13 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
                 "day_from_nearest": float(session.day_from_nearest),
             }
 
-            print(f"Saving sample for session {session.session_id}, window starting at {w0}, masked span ({t0},{t1}) with {int(M.sum())} masked positions.")
-            """
-            with open(os.path.join(out_dir, f"{session.session_id}_{w0}.pkl"), "wb") as f:
-                pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)"""
+            sample_path = os.path.join(out_dir, f"{session.session_id}_{w0}.pkl")
+            with open(sample_path, "wb") as f:
+                pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            if len(w0s) <= 5 or w0 == w0s[0]:  # Print first window or if few windows
+                print(f"  Saved: {session.session_id}_{w0}.pkl | span=({t0},{t1}) | masked={int(M.sum())} positions")
+
 
 def preprocess(data_path, window_size=128, K=500, seed=0, p_mask_trial=0.03):
     sessions, max_bin_count = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
