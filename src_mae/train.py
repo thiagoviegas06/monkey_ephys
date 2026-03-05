@@ -15,7 +15,7 @@ from tqdm import tqdm
 from glob import glob
 
 from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor
-from losses import masked_nmse_loss, masked_mse_loss
+from losses import masked_nmse_loss, masked_mse_loss, kaggle_aligned_nmse_loss
 from preprocessing import preprocess_non_overlapping
 
 # ============================================================================
@@ -31,6 +31,8 @@ class Config:
     
     # Preprocessing
     preprocess = False  # Set True to run preprocessing (only needed once)
+                        # NOTE: When running preprocess=True for first time, use updated pipeline
+                        # that saves channel_var from full session for Kaggle metric alignment
     windows_dir = "kaggle_data/masked_windows"  # Where preprocessed windows are saved
     
     # Model
@@ -65,6 +67,7 @@ class SBPDataset(Dataset):
         - x_sbp: (W, 96) masked SBP (zeros where masked)
         - y_sbp: (W, 96) ground truth SBP
         - mask: (W, 96) boolean, True where masked
+        - channel_var: (96,) per-channel variance from full session (for Kaggle-aligned loss)
         - kin: (W, 4) kinematics (not used in current model)
         - session_id: str
         - w0: int, window start position
@@ -104,6 +107,7 @@ class SBPDataset(Dataset):
                 - x_sbp: (W, C) tensor, masked input
                 - y_sbp: (W, C) tensor, ground truth
                 - mask: (W, C) boolean tensor, True=masked
+                - channel_var: (C,) tensor, per-channel variance from full session
                 - session_id: str
         """
         # Load pickle file
@@ -112,9 +116,10 @@ class SBPDataset(Dataset):
         
         # Convert to tensors (data already in correct format from preprocessing)
         return {
-            "x_sbp": torch.from_numpy(sample["x_sbp"]),  # (W, 96) float32
-            "y_sbp": torch.from_numpy(sample["y_sbp"]),  # (W, 96) float32
-            "mask": torch.from_numpy(sample["mask"]),    # (W, 96) bool
+            "x_sbp": torch.from_numpy(sample["x_sbp"]),           # (W, 96) float32
+            "y_sbp": torch.from_numpy(sample["y_sbp"]),           # (W, 96) float32
+            "mask": torch.from_numpy(sample["mask"]),             # (W, 96) bool
+            "channel_var": torch.from_numpy(sample["channel_var"]), # (96,) float32
             "session_id": sample["session_id"],
         }
 
@@ -169,6 +174,8 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         x_sbp = batch["x_sbp"].to(config.device)  # (B, W, C)
         y_sbp = batch["y_sbp"].to(config.device)  # (B, W, C)
         mask = batch["mask"].to(config.device)     # (B, W, C)
+        channel_var = batch["channel_var"].to(config.device)  # (B, C) per-channel variance from session
+        session_ids = batch["session_id"]  # list of session IDs for proper grouping
         
         batch_size = x_sbp.size(0)
         
@@ -177,7 +184,8 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         
         # ===== Compute loss =====
         # Loss is computed ONLY on masked positions
-        loss = masked_nmse_loss(pred, y_sbp, mask)
+        # Uses Kaggle-aligned NMSE that groups by (session, channel)
+        loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)
         
         # ===== Backward pass =====
         optimizer.zero_grad()
@@ -199,7 +207,7 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         })
         
         # Detailed logging every N batches
-        if (batch_idx + 1) % config.log_every == 0:
+        if (batch_idx + 1) % config.log_every == 10:
             # Compute additional metrics for debugging
             with torch.no_grad():
                 mse = masked_mse_loss(pred, y_sbp, mask)
@@ -227,6 +235,59 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
     
     avg_loss = total_loss / total_samples
     return avg_loss
+
+
+def validate_one_epoch(model, dataloader, config, epoch):
+    """
+    Validation for one epoch - computes loss without backprop.
+    
+    Args:
+        model: PyTorch model
+        dataloader: DataLoader
+        config: Config object
+        epoch: Current epoch number
+    
+    Returns:
+        Average validation loss over the epoch
+    """
+    model.eval()
+    
+    total_loss = 0.0
+    total_samples = 0
+    
+    # Progress bar
+    pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}/{config.num_epochs}")
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(pbar):
+            # Move batch to device
+            x_sbp = batch["x_sbp"].to(config.device)  # (B, W, C)
+            y_sbp = batch["y_sbp"].to(config.device)  # (B, W, C)
+            mask = batch["mask"].to(config.device)     # (B, W, C)
+            channel_var = batch["channel_var"].to(config.device)  # (B, C)
+            session_ids = batch["session_id"]  # list of session IDs
+            
+            batch_size = x_sbp.size(0)
+            
+            # ===== Forward pass (no grad tracking) =====
+            pred = model(x_sbp, mask)  # (B, W, C)
+            
+            # ===== Compute loss =====
+            loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)
+            
+            # ===== Logging =====
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'val_loss': f'{loss.item():.4f}',
+                'avg_val_loss': f'{total_loss / total_samples:.4f}'
+            })
+    
+    avg_loss = total_loss / total_samples
+    return avg_loss
+
 
 
 # ============================================================================
@@ -279,7 +340,19 @@ def main():
     print("STEP 2: Loading Preprocessed Data")
     print("=" * 70)
     
-    train_dataset = SBPDataset(windows_dir=config.windows_dir)
+    # Load full dataset
+    full_dataset = SBPDataset(windows_dir=config.windows_dir)
+    
+    # 80/20 train/val split
+    num_samples = len(full_dataset)
+    train_size = int(0.8 * num_samples)
+    val_size = num_samples - train_size
+    
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(config.seed)
+    )
     
     train_loader = DataLoader(
         train_dataset,
@@ -289,10 +362,22 @@ def main():
         pin_memory=True if config.device == "cuda" else False
     )
     
-    print(f"\nDataLoader created:")
-    print(f"  Total windows: {len(train_dataset)}")
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True if config.device == "cuda" else False
+    )
+    
+    print(f"\nDataset split (80/20):")
+    print(f"  Total windows: {num_samples}")
+    print(f"  Training: {train_size} ({100*train_size/num_samples:.1f}%)")
+    print(f"  Validation: {val_size} ({100*val_size/num_samples:.1f}%)")
+    print(f"\nTrain DataLoader:")
     print(f"  Batches per epoch: {len(train_loader)}")
-    print(f"  Samples per epoch: {len(train_dataset)}")
+    print(f"\nValidation DataLoader:")
+    print(f"  Batches: {len(val_loader)}")
     
     # ===== Step 3: Build Model =====
     print("\n" + "=" * 70)
@@ -317,17 +402,39 @@ def main():
     print("STEP 4: Training")
     print("=" * 70)
     
+    best_val_loss = float('inf')
+    best_epoch = 0
+    
     for epoch in range(1, config.num_epochs + 1):
         print(f"\n{'=' * 70}")
         print(f"Epoch {epoch}/{config.num_epochs}")
         print(f"{'=' * 70}")
         
         # Train for one epoch
-        avg_loss = train_one_epoch(model, train_loader, optimizer, config, epoch)
+        train_loss = train_one_epoch(model, train_loader, optimizer, config, epoch)
+        print(f"\n[Epoch {epoch}] Train NMSE Loss: {train_loss:.6f}")
         
-        print(f"\n[Epoch {epoch}] Average NMSE Loss: {avg_loss:.6f}")
+        # Validate
+        val_loss = validate_one_epoch(model, val_loader, config, epoch)
+        print(f"[Epoch {epoch}] Val NMSE Loss: {val_loss:.6f}")
         
-        # Save checkpoint
+        # Track best validation loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            # Save best model
+            best_model_path = os.path.join(config.checkpoint_dir, "best_model.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'config': config.__dict__,
+            }, best_model_path)
+            print(f"✓ Best model saved (val_loss: {val_loss:.6f}): {best_model_path}")
+        
+        # Save regular checkpoint
         if epoch % config.save_every == 0:
             checkpoint_path = os.path.join(
                 config.checkpoint_dir,
@@ -337,13 +444,15 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
                 'config': config.__dict__,
             }, checkpoint_path)
             print(f"✓ Checkpoint saved: {checkpoint_path}")
     
     print("\n" + "=" * 70)
     print("Training Complete!")
+    print(f"Best model: epoch {best_epoch} with val_loss={best_val_loss:.6f}")
     print("=" * 70)
 
 

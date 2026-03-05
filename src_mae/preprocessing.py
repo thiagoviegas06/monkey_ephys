@@ -210,6 +210,27 @@ def apply_random_mask_to_window(sbp, start_bin, end_bin, rng, channels_per_bin=3
 
     return x, mask
 
+def compute_per_channel_variance(sbp, w0, W):
+    window = sbp[w0:w0 + W]
+    variances = np.var(window, axis=0)
+    return variances
+
+def compute_global_channel_variance(sbp_sessions, w0, W):
+    all_windows = []
+    for sbp in sbp_sessions:
+        if sbp.shape[0] >= w0 + W:
+            window = sbp[w0:w0 + W]
+            all_windows.append(window)
+    if not all_windows:
+        raise ValueError("No valid windows found for variance computation")
+    all_data = np.concatenate(all_windows, axis=0)
+    global_variance = np.var(all_data, axis=0)
+    return global_variance
+
+def compute_session_channel_variance(sbp):
+    session_variance = np.var(sbp, axis=0)
+    return session_variance
+
 
 def preprocess_non_overlapping(data_path, window_size=128, seed=0):
     out_dir = os.path.join(data_path, "masked_windows")
@@ -229,6 +250,11 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
         w0s = non_overlapping_windows(N, window_size)
         print(f"{session.session_id} | N={N} | windows={len(w0s)}")
 
+        session_variance = compute_session_channel_variance(sbp)
+        variance_shape = session_variance.shape
+        print(f"  Session channel variance shape: {variance_shape}")
+        print(f"  Session channel variance (mean across channels): {session_variance.mean():.4f}")
+
         for w0 in w0s:
             y = sbp[w0:w0 + window_size]          # (W,96)
             kin_w = kin[w0:w0 + window_size]      # (W,4)
@@ -242,6 +268,7 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
                 "y_sbp": y.astype(np.float32),
                 "mask": M,
                 "kin": kin_w.astype(np.float32),
+                "channel_var": session_variance.astype(np.float32),  # (96,) per-channel variance from full session
                 "session_id": session.session_id,
                 "w0": int(w0),
                 "span": (int(t0), int(t1)),
