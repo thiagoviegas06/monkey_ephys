@@ -6,6 +6,7 @@ Clear 2-step process: preprocess -> train
 """
 import os
 import pickle
+import csv
 import numpy as np
 import torch
 import torch.nn as nn
@@ -44,6 +45,12 @@ class Config:
     learning_rate = 1e-4
     weight_decay = 1e-5
     num_epochs = 25
+    val_ratio = 0.2
+    split_mode = "test_proximity_session"  # options: "random_window", "random_session", "temporal_session", "test_proximity_session"
+    proximity_temperature_days = 80.0
+    proximity_randomness = 0.25
+    early_stopping_patience = 6
+    early_stopping_min_delta = 1e-4
     
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -54,6 +61,128 @@ class Config:
     
     # Logging
     log_every = 10  # Log every N batches
+
+
+def _session_id_from_sample_path(sample_path: str) -> str:
+    return os.path.basename(sample_path).split("_")[0]
+
+
+def _load_session_days(metadata_csv_path: str):
+    day_by_session = {}
+    with open(metadata_csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            session_id = row["session_id"]
+            day_by_session[session_id] = float(row["day"])
+    return day_by_session
+
+
+def _load_metadata_day_split(metadata_csv_path: str):
+    rows = []
+    with open(metadata_csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(
+                {
+                    "session_id": row["session_id"],
+                    "day": float(row["day"]),
+                    "split": row["split"],
+                }
+            )
+    return rows
+
+
+def _nearest_test_day_distance(day, test_days):
+    if len(test_days) == 0:
+        return float("inf")
+    return float(min(abs(day - td) for td in test_days))
+
+
+def build_split_indices(
+    sample_files,
+    metadata_csv_path,
+    val_ratio=0.2,
+    split_mode="temporal_session",
+    seed=42,
+    proximity_temperature_days=80.0,
+    proximity_randomness=0.25,
+):
+    session_to_indices = {}
+    for idx, sample_file in enumerate(sample_files):
+        sid = _session_id_from_sample_path(sample_file)
+        session_to_indices.setdefault(sid, []).append(idx)
+
+    all_sessions = sorted(session_to_indices.keys())
+    if len(all_sessions) < 2:
+        raise ValueError("Need at least 2 sessions to create train/validation split")
+
+    n_val_sessions = max(1, int(round(len(all_sessions) * val_ratio)))
+    n_val_sessions = min(n_val_sessions, len(all_sessions) - 1)
+
+    if split_mode == "random_window":
+        num_samples = len(sample_files)
+        indices = np.arange(num_samples)
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
+        val_size = int(round(num_samples * val_ratio))
+        val_indices = np.sort(indices[:val_size]).tolist()
+        train_indices = np.sort(indices[val_size:]).tolist()
+        train_sessions = sorted({_session_id_from_sample_path(sample_files[i]) for i in train_indices})
+        val_sessions = sorted({_session_id_from_sample_path(sample_files[i]) for i in val_indices})
+        return train_indices, val_indices, train_sessions, val_sessions
+
+    sessions = list(all_sessions)
+    if split_mode == "temporal_session":
+        day_by_session = _load_session_days(metadata_csv_path)
+        sessions.sort(key=lambda sid: day_by_session.get(sid, float("inf")))
+        val_sessions = set(sessions[-n_val_sessions:])
+    elif split_mode == "random_session":
+        rng = np.random.default_rng(seed)
+        rng.shuffle(sessions)
+        val_sessions = set(sessions[:n_val_sessions])
+    elif split_mode == "test_proximity_session":
+        rng = np.random.default_rng(seed)
+        metadata_rows = _load_metadata_day_split(metadata_csv_path)
+        day_by_session = {r["session_id"]: r["day"] for r in metadata_rows}
+        test_days = [r["day"] for r in metadata_rows if r["split"] == "test"]
+
+        if len(test_days) == 0:
+            rng.shuffle(sessions)
+            val_sessions = set(sessions[:n_val_sessions])
+        else:
+            dists = np.array(
+                [_nearest_test_day_distance(day_by_session.get(sid, float("inf")), test_days) for sid in sessions],
+                dtype=np.float64,
+            )
+            temp = max(1e-6, float(proximity_temperature_days))
+            proximity_scores = np.exp(-dists / temp)
+            if float(proximity_scores.sum()) == 0.0:
+                proximity_scores = np.ones_like(proximity_scores)
+            proximity_probs = proximity_scores / proximity_scores.sum()
+
+            rand_mix = float(np.clip(proximity_randomness, 0.0, 1.0))
+            uniform_probs = np.full_like(proximity_probs, 1.0 / len(proximity_probs))
+            sample_probs = (1.0 - rand_mix) * proximity_probs + rand_mix * uniform_probs
+            sample_probs = sample_probs / sample_probs.sum()
+
+            chosen = rng.choice(np.arange(len(sessions)), size=n_val_sessions, replace=False, p=sample_probs)
+            val_sessions = {sessions[i] for i in chosen}
+    else:
+        raise ValueError(f"Unknown split_mode: {split_mode}")
+
+    train_sessions = [sid for sid in sessions if sid not in val_sessions]
+    val_sessions = [sid for sid in sessions if sid in val_sessions]
+
+    train_indices = []
+    val_indices = []
+    for sid in train_sessions:
+        train_indices.extend(session_to_indices[sid])
+    for sid in val_sessions:
+        val_indices.extend(session_to_indices[sid])
+
+    train_indices = sorted(train_indices)
+    val_indices = sorted(val_indices)
+    return train_indices, val_indices, sorted(train_sessions), sorted(val_sessions)
 
 
 # ============================================================================
@@ -195,8 +324,6 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         optimizer.step()
-        if scheduler:
-            scheduler.step()
         
         # ===== Logging =====
         total_loss += loss.item() * batch_size
@@ -207,33 +334,6 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None)
             'loss': f'{loss.item():.4f}',
             'avg_loss': f'{total_loss / total_samples:.4f}'
         })
-        
-        # Detailed logging every N batches
-        if (batch_idx + 1) % config.log_every == 10:
-            # Compute additional metrics for debugging
-            with torch.no_grad():
-                mse = masked_mse_loss(pred, y_sbp, mask)
-                
-                # Check how many positions are masked
-                n_masked = mask.sum().item()
-                n_total = mask.numel()
-                pct_masked = 100.0 * n_masked / n_total
-                
-                # Check prediction statistics on masked positions
-                masked_pred = pred[mask]
-                masked_true = y_sbp[mask]
-                
-                pred_mean = masked_pred.mean().item()
-                pred_std = masked_pred.std().item()
-                true_mean = masked_true.mean().item()
-                true_std = masked_true.std().item()
-            
-            print(f"\n[Epoch {epoch}, Batch {batch_idx + 1}/{len(dataloader)}]")
-            print(f"  NMSE Loss: {loss.item():.6f}")
-            print(f"  MSE Loss:  {mse.item():.6f}")
-            print(f"  Masked: {n_masked}/{n_total} ({pct_masked:.2f}%)")
-            print(f"  Pred (masked): mean={pred_mean:.4f}, std={pred_std:.4f}")
-            print(f"  True (masked): mean={true_mean:.4f}, std={true_std:.4f}")
     
     avg_loss = total_loss / total_samples
     return avg_loss
@@ -345,16 +445,21 @@ def main():
     # Load full dataset
     full_dataset = SBPDataset(windows_dir=config.windows_dir)
     
-    # 80/20 train/val split
+    # Train/val split
     num_samples = len(full_dataset)
-    train_size = int(0.8 * num_samples)
-    val_size = num_samples - train_size
-    
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(config.seed)
+    metadata_csv_path = os.path.join(config.data_path, "metadata.csv")
+    train_indices, val_indices, train_sessions, val_sessions = build_split_indices(
+        sample_files=full_dataset.sample_files,
+        metadata_csv_path=metadata_csv_path,
+        val_ratio=config.val_ratio,
+        split_mode=config.split_mode,
+        seed=config.seed,
+        proximity_temperature_days=config.proximity_temperature_days,
+        proximity_randomness=config.proximity_randomness,
     )
+
+    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
     
     train_loader = DataLoader(
         train_dataset,
@@ -372,10 +477,12 @@ def main():
         pin_memory=True if config.device == "cuda" else False
     )
     
-    print(f"\nDataset split (80/20):")
+    print(f"\nDataset split ({config.split_mode}):")
     print(f"  Total windows: {num_samples}")
-    print(f"  Training: {train_size} ({100*train_size/num_samples:.1f}%)")
-    print(f"  Validation: {val_size} ({100*val_size/num_samples:.1f}%)")
+    print(f"  Training windows: {len(train_dataset)} ({100*len(train_dataset)/num_samples:.1f}%)")
+    print(f"  Validation windows: {len(val_dataset)} ({100*len(val_dataset)/num_samples:.1f}%)")
+    print(f"  Training sessions: {len(train_sessions)}")
+    print(f"  Validation sessions: {len(val_sessions)}")
     print(f"\nTrain DataLoader:")
     print(f"  Batches per epoch: {len(train_loader)}")
     print(f"\nValidation DataLoader:")
@@ -400,7 +507,7 @@ def main():
     )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer, T_max=config.num_epochs, eta_min=1e-6
+        optimizer, T_max=config.num_epochs, eta_min=1e-6
     )
 
     
@@ -411,6 +518,7 @@ def main():
     
     best_val_loss = float('inf')
     best_epoch = 0
+    epochs_without_improvement = 0
     
     for epoch in range(1, config.num_epochs + 1):
         print(f"\n{'=' * 70}")
@@ -424,11 +532,15 @@ def main():
         # Validate
         val_loss = validate_one_epoch(model, val_loader, config, epoch)
         print(f"[Epoch {epoch}] Val NMSE Loss: {val_loss:.6f}")
+
+        scheduler.step()
+        print(f"[Epoch {epoch}] LR: {optimizer.param_groups[0]['lr']:.2e}")
         
         # Track best validation loss
-        if val_loss < best_val_loss:
+        if val_loss < (best_val_loss - config.early_stopping_min_delta):
             best_val_loss = val_loss
             best_epoch = epoch
+            epochs_without_improvement = 0
             # Save best model
             best_model_path = os.path.join(config.checkpoint_dir, "best_model.pt")
             torch.save({
@@ -440,6 +552,12 @@ def main():
                 'config': config.__dict__,
             }, best_model_path)
             print(f"✓ Best model saved (val_loss: {val_loss:.6f}): {best_model_path}")
+        else:
+            epochs_without_improvement += 1
+            print(
+                f"[Epoch {epoch}] No val improvement "
+                f"({epochs_without_improvement}/{config.early_stopping_patience})"
+            )
         
         # Save regular checkpoint
         if epoch % config.save_every == 0:
@@ -456,6 +574,13 @@ def main():
                 'config': config.__dict__,
             }, checkpoint_path)
             print(f"✓ Checkpoint saved: {checkpoint_path}")
+
+        if epochs_without_improvement >= config.early_stopping_patience:
+            print(
+                f"Early stopping triggered at epoch {epoch} "
+                f"(best epoch: {best_epoch}, best val: {best_val_loss:.6f})"
+            )
+            break
     
     print("\n" + "=" * 70)
     print("Training Complete!")
