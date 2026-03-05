@@ -48,7 +48,7 @@ class Config:
     
     # Checkpoints
     checkpoint_dir = "checkpoints"
-    save_every = 1  # Save checkpoint every N epochs
+    save_every = 5  # Save checkpoint every N epochs
     
     # Logging
     log_every = 10  # Log every N batches
