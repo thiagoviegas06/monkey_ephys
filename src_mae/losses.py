@@ -151,7 +151,7 @@ def kaggle_aligned_nmse_loss(pred: torch.Tensor,
             sess_pred = pred[sess_mask]  # (N_sess, W, C)
             sess_target = target[sess_mask]  # (N_sess, W, C)
             sess_mask_data = mask[sess_mask]  # (N_sess, W, C)
-            sess_var = channel_var[sess_mask[0:1]]  # (1, C) - same for all samples in session
+            sess_var = channel_var[sess_mask]  # (N_sess, C)
             
             # Sum squared errors and count for this session across all samples
             # Shape results: (C,)
@@ -162,7 +162,8 @@ def kaggle_aligned_nmse_loss(pred: torch.Tensor,
             sess_mse_c = sess_sq_error.sum(dim=(0, 1)) / sess_n_masked.clamp(min=1)
             
             # Normalize by session's channel variance: (C,)
-            sess_var_c = sess_var.squeeze(0).clamp(min=eps)  # (C,)
+            # All samples from same session have identical channel_var, so take first
+            sess_var_c = sess_var[0].clamp(min=eps)  # (C,)
             sess_nmse_c = sess_mse_c / sess_var_c
             
             # Only include channels that were masked in this session
