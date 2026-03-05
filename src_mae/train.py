@@ -43,13 +43,13 @@ class Config:
     batch_size = 16
     learning_rate = 1e-4
     weight_decay = 1e-5
-    num_epochs = 10
+    num_epochs = 25
     
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Checkpoints
-    checkpoint_dir = "checkpoints"
+    checkpoint_dir = "checkpoints_sbp_reconstruction"
     save_every = 5  # Save checkpoint every N epochs
     
     # Logging
@@ -147,7 +147,7 @@ def build_model(config):
 # ============================================================================
 # Training Loop
 # ============================================================================
-def train_one_epoch(model, dataloader, optimizer, config, epoch):
+def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None):
     """
     Train for one epoch.
     
@@ -195,6 +195,8 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         optimizer.step()
+        if scheduler:
+            scheduler.step()
         
         # ===== Logging =====
         total_loss += loss.item() * batch_size
@@ -396,6 +398,11 @@ def main():
         lr=config.learning_rate,
         weight_decay=config.weight_decay
     )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=config.num_epochs, eta_min=1e-6
+    )
+
     
     # ===== Step 5: Training Loop =====
     print("\n" + "=" * 70)
@@ -411,7 +418,7 @@ def main():
         print(f"{'=' * 70}")
         
         # Train for one epoch
-        train_loss = train_one_epoch(model, train_loader, optimizer, config, epoch)
+        train_loss = train_one_epoch(model, train_loader, optimizer, config, epoch, scheduler=scheduler)
         print(f"\n[Epoch {epoch}] Train NMSE Loss: {train_loss:.6f}")
         
         # Validate
