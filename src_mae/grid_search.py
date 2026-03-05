@@ -125,7 +125,7 @@ def make_run_config(args, combo, run_dir):
         "early_stopping_patience": early_patience,
         "early_stopping_min_delta": early_min_delta,
         "save_every": args.save_every,
-        "checkpoint_dir": str(run_dir / "checkpoints"),
+        "checkpoint_dir": str(run_dir / "checkpoints_grid"),
     }
     return cfg
 
@@ -190,6 +190,11 @@ def save_results_csv(results, out_csv):
         "proximity_randomness",
         "early_stopping_patience",
         "early_stopping_min_delta",
+        "model_name",
+        "preprocess",
+        "data_path",
+        "windows_dir",
+        "save_every",
         "checkpoint_dir",
         "log_path",
     ]
