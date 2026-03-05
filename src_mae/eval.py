@@ -9,6 +9,40 @@ from pathlib import Path
 from tqdm import tqdm
 from glob import glob
 from preprocessing import sample_span_start
+from config import Config
+from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, SBPImputer
+
+config = Config()
+
+# ============================================================================
+# Model Builder
+# ============================================================================
+def build_model(config):
+    """Build model based on config."""
+    if config.model_name == "unet":
+        model = SBP_Reconstruction_UNet(base_channels=config.base_channels)
+        print(f"Built U-Net with base_channels={config.base_channels}")
+    elif config.model_name == "simple_cnn":
+        model = SimpleCNN(hidden_channels=128, num_layers=6)
+        print("Built SimpleCNN")
+    elif config.model_name == "resnet":
+        model = ResNetReconstructor(hidden_channels=128, num_blocks=8)
+        print("Built ResNet Reconstructor")
+    elif config.model_name == "transformer":
+        model = SBPImputer(
+            d_model=config.d_model,
+            nhead=config.nhead,
+            num_layers=config.num_layers,
+            dropout=config.dropout,
+            sbp_channels=config.sbp_channels,
+            kin_channels=config.kin_channels
+        )
+        print(f"Built Transformer Reconstructor with d_model={config.d_model}, nhead={config.nhead}, num_layers={config.num_layers}, dropout={config.dropout}")
+    else:
+        raise ValueError(f"Unknown model: {config.model_name}")
+    
+    return model.to(config.device)
+
 
 def mask_segments(mask_2d: np.ndarray):
     """
@@ -133,12 +167,124 @@ def preprocess_test(data_path, window_size, metadata_csv):
             })
     return session_objs
 
+#DIEGO INCORRECT ATTEMPT TO RUN EVALUATION
+def evaluate_and_submit(data_path, model_path, output_csv="submission.csv", window_size=200):
+    """
+    Runs the trained model on the masked test data and generates the Kaggle submission CSV.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # 1. Load the trained model
+    print(f"Loading model weights from {model_path}...")
+    model = build_model(config)
+    
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file {model_path} not found! Please train the model first.")
+        
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    # 2. Get the list of test sessions from metadata
+    metadata_path = os.path.join(data_path, "metadata.csv")
+    metadata = pd.read_csv(metadata_path)
+    test_sessions = metadata[metadata["split"] == "test"]["session_id"].tolist()
+    
+    if not test_sessions:
+        print("No test sessions found in metadata.csv. Please check your splits.")
+        return
+
+    # 3. Iterate over test sessions to generate dense predictions
+    session_preds = {}
+    print("Running inference on test sessions...")
+    
+    with torch.no_grad():
+        for sess_id in tqdm(test_sessions, desc="Processing Sessions"):
+            sbp_path = os.path.join(data_path, "test", f"{sess_id}_sbp_masked.npy")
+            mask_path = os.path.join(data_path, "test", f"{sess_id}_mask.npy")
+            kin_path = os.path.join(data_path, "test", f"{sess_id}_kinematics.npy")
+            
+            if not os.path.exists(sbp_path):
+                print(f"Missing data for {sess_id}, skipping...")
+                continue
+                
+            x_sbp = np.load(sbp_path).astype(np.float32)
+            mask = np.load(mask_path).astype(np.float32)
+            kin = np.load(kin_path).astype(np.float32)
+            
+            seq_len = x_sbp.shape[0]
+            pred_sbp_full = np.zeros_like(x_sbp)
+            
+            # Process in chunks of `window_size` to prevent Out-of-Memory (OOM) errors
+            # and to match the sequence lengths seen during training.
+            for i in range(0, seq_len, window_size):
+                end = min(i + window_size, seq_len)
+                
+                # Extract chunk and add batch dimension (B=1)
+                x_chunk = torch.tensor(x_sbp[i:end]).unsqueeze(0).to(device)
+                kin_chunk = torch.tensor(kin[i:end]).unsqueeze(0).to(device)
+                mask_chunk = torch.tensor(mask[i:end]).unsqueeze(0).to(device)
+                
+                # Forward pass
+                out_chunk = model(x_chunk, kin_chunk, mask_chunk)
+                
+                # Store chunk predictions back into the full session array
+                pred_sbp_full[i:end] = out_chunk.squeeze(0).cpu().numpy()
+                
+            session_preds[sess_id] = pred_sbp_full
+
+    # 4. Map the dense predictions to the required submission format
+    print("Mapping predictions to Kaggle format...")
+    test_mask_df = pd.read_csv(os.path.join(data_path, "test_mask.csv"))
+    
+    predictions_list = []
+    
+    # We iterate over the index file to pick out the exact row/col that was masked
+    # Note: If your CSV uses different headers for time bins and channels (e.g., 'row_idx', 'col_idx'),
+    # you will need to update the keys inside this loop accordingly.
+    for _, row in tqdm(test_mask_df.iterrows(), total=len(test_mask_df), desc="Formatting Submission"):
+        sample_id = int(row['sample_id'])
+        sess_id = row['session_id']
+        time_bin = int(row['time_bin'])
+        channel = int(row['channel'])
+        
+        # Retrieve the predicted value for this specific bin and channel
+        pred_val = session_preds[sess_id][time_bin, channel]
+        
+        predictions_list.append({
+            'sample_id': sample_id,
+            'predicted_sbp': pred_val
+        })
+        
+    # 5. Save the final submission file
+    submission_df = pd.DataFrame(predictions_list)
+    
+    # Ensure it's sorted by sample_id exactly as requested by Kaggle
+    submission_df = submission_df.sort_values(by='sample_id')
+    submission_df.to_csv(output_csv, index=False)
+    
+    print(f"\nEvaluation complete! Saved ready-to-submit predictions to: {output_csv}")
+    print(submission_df.head())
 
 if __name__ == "__main__":
-    data_path = "kaggle_data"
-    metadata_csv = f"{data_path}/metadata.csv"
-    window_size = 200
-    session_objs = preprocess_test(data_path, window_size, metadata_csv)
-    print(f"Total windows created: {len(session_objs)}")
+    # Point this to the root of your kaggle_data folder
+    DATA_DIR = "kaggle_data" 
+    MODEL_WEIGHTS = "checkpoints/best_transformer.pth"
+    OUTPUT_FILE = "submission.csv"
+    
+    evaluate_and_submit(
+        data_path=DATA_DIR, 
+        model_path=MODEL_WEIGHTS, 
+        output_csv=OUTPUT_FILE,
+        window_size=200
+    )
+
+
+# if __name__ == "__main__":
+#     data_path = "kaggle_data"
+#     metadata_csv = f"{data_path}/metadata.csv"
+#     window_size = 200
+#     session_objs = preprocess_test(data_path, window_size, metadata_csv)
+#     print(f"Total windows created: {len(session_objs)}")
 
 

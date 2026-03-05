@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 class SBP_Reconstruction_UNet(nn.Module):
     """
@@ -49,7 +50,7 @@ class SBP_Reconstruction_UNet(nn.Module):
         # Output projection
         self.out = nn.Conv2d(base_channels, out_ch, kernel_size=1)
 
-    def forward(self, x_sbp, mask):
+    def forward(self, x_sbp, kin, mask):
         """
         x_sbp: (B, W, C)  - masked SBP input (0s where masked)
         mask:  (B, W, C)  - bool tensor, True where masked, False where observed
@@ -125,7 +126,7 @@ class SimpleCNN(nn.Module):
         
         self.net = nn.Sequential(*layers)
     
-    def forward(self, x_sbp, mask):
+    def forward(self, x_sbp, kin, mask):
         """
         x_sbp: (B, W, C) - masked SBP input
         mask:  (B, W, C) - True where masked
@@ -185,7 +186,7 @@ class ResNetReconstructor(nn.Module):
         # Output projection
         self.output_proj = nn.Conv2d(hidden_channels, 1, 1)
         
-    def forward(self, x_sbp, mask):
+    def forward(self, x_sbp, kin, mask):
         """
         x_sbp: (B, W, C) - masked SBP input
         mask:  (B, W, C) - True where masked
@@ -206,6 +207,86 @@ class ResNetReconstructor(nn.Module):
         
         # Keep observed values
         out = out * mask.float() + x_sbp * obs
+        
+        return out
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor, shape [batch_size, seq_len, embedding_dim]
+        """
+        x = x + self.pe[:, :x.size(1), :]
+        return x
+
+class SBPImputer(nn.Module):
+    def __init__(self, sbp_channels=96, kin_channels=4, d_model=256, nhead=8, num_layers=4, dropout=0.1):
+        super(SBPImputer, self).__init__()
+        
+        # The input consists of:
+        # 1. The masked SBP data (96 channels)
+        # 2. The kinematic data (4 channels)
+        # 3. The Boolean mask indicator (96 channels) - Lets the model know exactly what needs filling
+        in_features = sbp_channels + kin_channels + sbp_channels
+        
+        # Projection layer to map raw inputs to transformer hidden dimensions
+        self.input_projection = nn.Sequential(
+            nn.Linear(in_features, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model)
+        )
+        
+        self.pos_encoder = PositionalEncoding(d_model)
+        
+        # Transformer Encoder
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=d_model * 4, 
+            dropout=dropout, 
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+        
+        # Output layer maps back to the 96 SBP channels
+        self.output_projection = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, sbp_channels),
+            nn.ReLU() # SBP is generally non-negative, ReLU guarantees positive predictions
+        )
+
+    def forward(self, x_sbp, kin, mask):
+        """
+        Args:
+            x_sbp: [Batch, Time, 96]
+            kin: [Batch, Time, 4]
+            mask: [Batch, Time, 96]
+        Returns:
+            predictions: [Batch, Time, 96]
+        """
+        # Concatenate features along the channel dimension
+        x = torch.cat([x_sbp, kin, mask], dim=-1)
+        
+        # Project and add position encodings
+        x = self.input_projection(x)
+        x = self.pos_encoder(x)
+        
+        # Pass through Transformer
+        encoded = self.transformer(x)
+        
+        # Predict missing values
+        out = self.output_projection(encoded)
         
         return out
 

@@ -14,110 +14,15 @@ from pathlib import Path
 from tqdm import tqdm
 from glob import glob
 
-from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor
+from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, SBPImputer
+from dataloader import SBPDataset, get_dataloaders
 from losses import masked_nmse_loss, masked_mse_loss
 from preprocessing import preprocess_non_overlapping
-
-# ============================================================================
-# Configuration
-# ============================================================================
-class Config:
-    """Training configuration - modify these parameters"""
-    
-    # Data
-    data_path = "kaggle_data"
-    window_size = 200
-    seed = 42
-    
-    # Preprocessing
-    preprocess = False  # Set True to run preprocessing (only needed once)
-    windows_dir = "kaggle_data/masked_windows"  # Where preprocessed windows are saved
-    
-    # Model
-    model_name = "unet"  # Options: "unet", "simple_cnn", "resnet"
-    base_channels = 64   # For UNet/ResNet
-    
-    # Training
-    batch_size = 16
-    learning_rate = 1e-4
-    weight_decay = 1e-5
-    num_epochs = 10
-    
-    # Device
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Checkpoints
-    checkpoint_dir = "checkpoints"
-    save_every = 5  # Save checkpoint every N epochs
-    
-    # Logging
-    log_every = 10  # Log every N batches
+from config import Config
 
 
-# ============================================================================
-# Dataset Class
-# ============================================================================
-class SBPDataset(Dataset):
-    """
-    PyTorch Dataset that loads pre-generated windows from preprocessing.
-    
-    Each .pkl file contains:
-        - x_sbp: (W, 96) masked SBP (zeros where masked)
-        - y_sbp: (W, 96) ground truth SBP
-        - mask: (W, 96) boolean, True where masked
-        - kin: (W, 4) kinematics (not used in current model)
-        - session_id: str
-        - w0: int, window start position
-        - span: (t0, t1) masked time span
-        - day: float
-        - day_from_nearest: float
-    """
-    
-    def __init__(self, windows_dir):
-        """
-        Args:
-            windows_dir: Directory containing preprocessed .pkl files
-        """
-        self.windows_dir = windows_dir
-        
-        # Find all .pkl files
-        pkl_pattern = os.path.join(windows_dir, "*.pkl")
-        self.sample_files = sorted(glob(pkl_pattern))
-        
-        if len(self.sample_files) == 0:
-            raise ValueError(
-                f"No .pkl files found in {windows_dir}. "
-                f"Run with Config.preprocess=True first!"
-            )
-        
-        print(f"Found {len(self.sample_files)} preprocessed windows")
-    
-    def __len__(self):
-        return len(self.sample_files)
-    
-    def __getitem__(self, idx):
-        """
-        Load one preprocessed window.
-        
-        Returns:
-            dict with keys:
-                - x_sbp: (W, C) tensor, masked input
-                - y_sbp: (W, C) tensor, ground truth
-                - mask: (W, C) boolean tensor, True=masked
-                - session_id: str
-        """
-        # Load pickle file
-        with open(self.sample_files[idx], 'rb') as f:
-            sample = pickle.load(f)
-        
-        # Convert to tensors (data already in correct format from preprocessing)
-        return {
-            "x_sbp": torch.from_numpy(sample["x_sbp"]),  # (W, 96) float32
-            "y_sbp": torch.from_numpy(sample["y_sbp"]),  # (W, 96) float32
-            "mask": torch.from_numpy(sample["mask"]),    # (W, 96) bool
-            "session_id": sample["session_id"],
-        }
-
+# Create configuration instance as global variable for easy access in functions
+config = Config()
 
 # ============================================================================
 # Model Builder
@@ -133,6 +38,16 @@ def build_model(config):
     elif config.model_name == "resnet":
         model = ResNetReconstructor(hidden_channels=128, num_blocks=8)
         print("Built ResNet Reconstructor")
+    elif config.model_name == "transformer":
+        model = SBPImputer(
+            d_model=config.d_model,
+            nhead=config.nhead,
+            num_layers=config.num_layers,
+            dropout=config.dropout,
+            sbp_channels=config.sbp_channels,
+            kin_channels=config.kin_channels
+        )
+        print(f"Built Transformer Reconstructor with d_model={config.d_model}, nhead={config.nhead}, num_layers={config.num_layers}, dropout={config.dropout}")
     else:
         raise ValueError(f"Unknown model: {config.model_name}")
     
@@ -168,24 +83,27 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         # Move batch to device
         x_sbp = batch["x_sbp"].to(config.device)  # (B, W, C)
         y_sbp = batch["y_sbp"].to(config.device)  # (B, W, C)
-        mask = batch["mask"].to(config.device)     # (B, W, C)
+        kin = batch["kin"].to(config.device)      # (B, W, 4)
+        
+        # The model's concat step needs floats, but the inverse logic in the loss (~mask) needs bools
+        mask_float = batch["mask"].to(config.device).float()
+        mask_bool = batch["mask"].to(config.device).bool()
         
         batch_size = x_sbp.size(0)
+        optimizer.zero_grad()
         
         # ===== Forward pass =====
-        pred = model(x_sbp, mask)  # (B, W, C)
+        pred = model(x_sbp, kin, mask_float)  # (B, W, C)
         
         # ===== Compute loss =====
         # Loss is computed ONLY on masked positions
-        loss = masked_nmse_loss(pred, y_sbp, mask)
+        loss = masked_nmse_loss(pred, y_sbp, mask_bool)
         
         # ===== Backward pass =====
-        optimizer.zero_grad()
         loss.backward()
-        
-        # Optional: gradient clipping for stability
+
+        # Gradient clipping for model stability
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
         optimizer.step()
         
         # ===== Logging =====
@@ -202,31 +120,92 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         if (batch_idx + 1) % config.log_every == 0:
             # Compute additional metrics for debugging
             with torch.no_grad():
-                mse = masked_mse_loss(pred, y_sbp, mask)
+                mse = masked_mse_loss(pred, y_sbp, mask_bool)
                 
                 # Check how many positions are masked
-                n_masked = mask.sum().item()
-                n_total = mask.numel()
+                n_masked = mask_bool.sum().item()
+                n_total = mask_bool.numel()
                 pct_masked = 100.0 * n_masked / n_total
                 
                 # Check prediction statistics on masked positions
-                masked_pred = pred[mask]
-                masked_true = y_sbp[mask]
+                masked_pred = pred[mask_bool]
+                masked_true = y_sbp[mask_bool]
                 
-                pred_mean = masked_pred.mean().item()
-                pred_std = masked_pred.std().item()
-                true_mean = masked_true.mean().item()
-                true_std = masked_true.std().item()
+                pred_mean = masked_pred.mean().item() if n_masked > 0 else 0.0
+                pred_std = masked_pred.std().item() if n_masked > 1 else 0.0
+                true_mean = masked_true.mean().item() if n_masked > 0 else 0.0
+                true_std = masked_true.std().item() if n_masked > 1 else 0.0
             
-            print(f"\n[Epoch {epoch}, Batch {batch_idx + 1}/{len(dataloader)}]")
-            print(f"  NMSE Loss: {loss.item():.6f}")
-            print(f"  MSE Loss:  {mse.item():.6f}")
-            print(f"  Masked: {n_masked}/{n_total} ({pct_masked:.2f}%)")
-            print(f"  Pred (masked): mean={pred_mean:.4f}, std={pred_std:.4f}")
-            print(f"  True (masked): mean={true_mean:.4f}, std={true_std:.4f}")
+            # print(f"\n[Epoch {epoch}, Batch {batch_idx + 1}/{len(dataloader)}]")
+            # print(f"  NMSE Loss: {loss.item():.6f}")
+            # print(f"  MSE Loss:  {mse.item():.6f}")
+            # print(f"  Masked: {n_masked}/{n_total} ({pct_masked:.2f}%)")
+            # print(f"  Pred (masked): mean={pred_mean:.4f}, std={pred_std:.4f}")
+            # print(f"  True (masked): mean={true_mean:.4f}, std={true_std:.4f}")
     
     avg_loss = total_loss / total_samples
     return avg_loss
+
+
+def validate_one_epoch(model, dataloader, device, epoch, num_epochs, log_every=50):
+    model.eval()
+    
+    total_loss = 0.0
+    total_samples = 0
+    
+    pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}/{num_epochs}")
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(pbar):
+            x_sbp = batch["x_sbp"].to(device)
+            y_sbp = batch["y_sbp"].to(device)
+            kin = batch["kin"].to(device)
+            mask_float = batch["mask"].to(device).float()
+            mask_bool = batch["mask"].to(device).bool()
+            
+            batch_size = x_sbp.size(0)
+            
+            # ===== Forward pass =====
+            pred = model(x_sbp, kin, mask_float)
+            
+            # ===== Compute loss =====
+            loss = masked_nmse_loss(pred, y_sbp, mask_bool)
+            
+            # ===== Logging =====
+            total_loss += loss.item() * batch_size
+            total_samples += batch_size
+            
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'avg_loss': f'{total_loss / total_samples:.4f}'
+            })
+            
+            # Detailed logging every N batches or at the very end of the validation epoch
+            if (batch_idx + 1) % log_every == 0 or (batch_idx + 1) == len(dataloader):
+                mse = masked_mse_loss(pred, y_sbp, mask_bool)
+                
+                n_masked = mask_bool.sum().item()
+                n_total = mask_bool.numel()
+                pct_masked = 100.0 * n_masked / n_total
+                
+                masked_pred = pred[mask_bool]
+                masked_true = y_sbp[mask_bool]
+                
+                pred_mean = masked_pred.mean().item() if n_masked > 0 else 0.0
+                pred_std = masked_pred.std().item() if n_masked > 1 else 0.0
+                true_mean = masked_true.mean().item() if n_masked > 0 else 0.0
+                true_std = masked_true.std().item() if n_masked > 1 else 0.0
+                
+                print(f"\n[Val Epoch {epoch}, Batch {batch_idx + 1}/{len(dataloader)}]")
+                print(f"  NMSE Loss: {loss.item():.6f}")
+                print(f"  MSE Loss:  {mse.item():.6f}")
+                print(f"  Masked: {n_masked}/{n_total} ({pct_masked:.2f}%)")
+                print(f"  Pred (masked): mean={pred_mean:.4f}, std={pred_std:.4f}")
+                print(f"  True (masked): mean={true_mean:.4f}, std={true_std:.4f}")
+                
+    avg_loss = total_loss / total_samples
+    return avg_loss
+
 
 
 # ============================================================================
@@ -234,9 +213,8 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
 # ============================================================================
 def main():
     """Main training function."""
+    global config
     
-    # Configuration
-    config = Config()
     print("=" * 70)
     print("Training Configuration")
     print("=" * 70)
@@ -279,6 +257,16 @@ def main():
     print("STEP 2: Loading Preprocessed Data")
     print("=" * 70)
     
+
+    train_loader, val_loader, train_dataset, val_dataset = get_dataloaders(
+        windows_dir=config.windows_dir,
+        batch_size=config.batch_size,
+        val_split=0.2,
+        shuffle=True,
+        num_workers=4,  # Parallel data loading
+        pin_memory=True if config.device == "cuda" else False
+    )
+
     train_dataset = SBPDataset(windows_dir=config.windows_dir)
     
     train_loader = DataLoader(
@@ -291,8 +279,10 @@ def main():
     
     print(f"\nDataLoader created:")
     print(f"  Total windows: {len(train_dataset)}")
-    print(f"  Batches per epoch: {len(train_loader)}")
-    print(f"  Samples per epoch: {len(train_dataset)}")
+    print(f"  Train Batches per epoch: {len(train_loader)}")
+    print(f"  Train Samples per epoch: {len(train_dataset)}")
+    print(f"  Validation Batches per epoch: {len(val_loader)}")
+    print(f"  Validation Samples per epoch: {len(val_dataset)}")
     
     # ===== Step 3: Build Model =====
     print("\n" + "=" * 70)
@@ -317,6 +307,8 @@ def main():
     print("STEP 4: Training")
     print("=" * 70)
     
+    best_val_nmse = float('inf')
+
     for epoch in range(1, config.num_epochs + 1):
         print(f"\n{'=' * 70}")
         print(f"Epoch {epoch}/{config.num_epochs}")
@@ -327,6 +319,20 @@ def main():
         
         print(f"\n[Epoch {epoch}] Average NMSE Loss: {avg_loss:.6f}")
         
+        # Validation Phase
+        print("\nValidating on validation set...")
+        epoch_val_nmse = validate_one_epoch(model, val_loader, config.device, epoch, config.num_epochs)
+        
+        print(f"Epoch [{epoch}/{config.num_epochs}] | Train NMSE: {avg_loss:.4f} | Val NMSE: {epoch_val_nmse:.4f}")
+
+        # Save the best model weights
+        if epoch_val_nmse < best_val_nmse:
+            best_val_nmse = epoch_val_nmse
+            best_val_path = os.path.join(config.checkpoint_dir, f"best_{config.model_name}.pth")
+            torch.save(model.state_dict(), best_val_path)
+            print("  -> Saved new best model.")
+
+
         # Save checkpoint
         if epoch % config.save_every == 0:
             checkpoint_path = os.path.join(
