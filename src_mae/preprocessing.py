@@ -4,6 +4,7 @@ import zlib
 import pickle
 import os
 from pathlib import Path
+from drift_estimation import robust_session_norm
 
 # paste your rows here once; or load from csv
 STATS = [
@@ -232,7 +233,7 @@ def compute_session_channel_variance(sbp):
     return session_variance
 
 
-def preprocess_non_overlapping(data_path, window_size=128, seed=0):
+def preprocess_non_overlapping(data_path, window_size=128, seed=0, normalize = False):
     out_dir = os.path.join(data_path, "masked_windows")
     os.makedirs(out_dir, exist_ok=True)
     sessions, max_bin_count = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
@@ -246,6 +247,9 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
         N = sbp.shape[0]
         if N < window_size:
             continue
+
+        if normalize:
+            sbp = robust_session_norm(sbp)
         rng = np.random.default_rng(seed + (hash(session.session_id) & 0xFFFFFFFF))
         w0s = non_overlapping_windows(N, window_size)
         print(f"{session.session_id} | N={N} | windows={len(w0s)}")
@@ -282,6 +286,7 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
             
             if len(w0s) <= 5 or w0 == w0s[0]:  # Print first window or if few windows
                 print(f"  Saved: {session.session_id}_{w0}.pkl | span=({t0},{t1}) | masked={int(M.sum())} positions")
+
 
 
 def preprocess(data_path, window_size=128, K=500, seed=0, p_mask_trial=0.03):

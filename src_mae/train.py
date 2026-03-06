@@ -15,7 +15,7 @@ from pathlib import Path
 from tqdm import tqdm
 from glob import glob
 
-from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor
+from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, TCNReconstructor
 from losses import masked_nmse_loss, masked_mse_loss, kaggle_aligned_nmse_loss
 from preprocessing import preprocess_non_overlapping
 
@@ -37,8 +37,12 @@ class Config:
     windows_dir = "kaggle_data/masked_windows"  # Where preprocessed windows are saved
     
     # Model
-    model_name = "unet"  # Options: "unet", "simple_cnn", "resnet"
-    base_channels = 64   # For UNet/ResNet
+    model_name = "tcn"  # Options: "tcn", "unet", "simple_cnn", "resnet"
+    # TCN-specific
+    hidden_channels = 128
+    num_tcn_layers = 7
+    # UNet-specific
+    base_channels = 64
     
     # Training
     batch_size = 16
@@ -258,7 +262,15 @@ class SBPDataset(Dataset):
 # ============================================================================
 def build_model(config):
     """Build model based on config."""
-    if config.model_name == "unet":
+    if config.model_name == "tcn":
+        model = TCNReconstructor(
+            hidden_channels=config.hidden_channels,
+            num_layers=config.num_tcn_layers
+        )
+        rf = model.get_receptive_field()
+        print(f"Built TCN with hidden_channels={config.hidden_channels}, "
+              f"num_layers={config.num_tcn_layers}, receptive_field={rf}")
+    elif config.model_name == "unet":
         model = SBP_Reconstruction_UNet(base_channels=config.base_channels)
         print(f"Built U-Net with base_channels={config.base_channels}")
     elif config.model_name == "simple_cnn":
@@ -269,7 +281,7 @@ def build_model(config):
         print("Built ResNet Reconstructor")
     else:
         raise ValueError(f"Unknown model: {config.model_name}")
-    
+
     return model.to(config.device)
 
 

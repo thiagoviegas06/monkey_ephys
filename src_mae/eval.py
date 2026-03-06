@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor
+from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, TCNReconstructor
 from preprocessing import sample_span_start
 
 
@@ -71,8 +71,6 @@ def build_randomized_windows_from_mask(mask_2d: np.ndarray, window_size: int, rn
 def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regions=10):
     masked_files = os.path.join(data_path, "test/*_sbp_masked.npy")
     session_data = {}
-
-    _ = pd.read_csv(metadata_csv)
 
     for file in sorted(glob(masked_files)):
         session_id = Path(file).stem.split("_")[0]

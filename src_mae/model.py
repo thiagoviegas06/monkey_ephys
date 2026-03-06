@@ -210,15 +210,188 @@ class ResNetReconstructor(nn.Module):
         return out
 
 
+class TCNResidualBlock(nn.Module):
+    """
+    Temporal Convolutional Network (TCN) residual block.
+    Uses Conv1d with dilated convolutions for wide receptive field.
+    """
+    def __init__(self, channels, kernel_size=3, dilation=1, dropout=0.2):
+        super().__init__()
+        # Padding for bidirectional convolution that maintains temporal dimension
+        # For kernel_size=3: padding = dilation (same on both sides)
+        padding = dilation * (kernel_size // 2)
+
+        self.conv1 = nn.Conv1d(
+            channels, channels, kernel_size=kernel_size,
+            padding=padding, dilation=dilation
+        )
+        self.gn1 = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(
+            channels, channels, kernel_size=kernel_size,
+            padding=padding, dilation=dilation
+        )
+        self.gn2 = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """
+        x: (B, C, T) - tensor in Conv1d format
+        Returns: (B, C, T)
+        """
+        residual = x
+
+        out = self.conv1(x)
+        out = self.gn1(out)
+        out = F.relu(out)
+        out = self.dropout1(out)
+
+        out = self.conv2(out)
+        out = self.gn2(out)
+        out = self.dropout2(out)
+
+        out = out + residual
+        out = F.relu(out)
+        return out
+
+
+class TCNReconstructor(nn.Module):
+    """
+    Temporal Convolutional Network (TCN) for masked SBP reconstruction.
+
+    Bidirectional temporal processing with dilated convolutions.
+    Matches the I/O contract: forward(x_sbp, mask) -> (B, W, C)
+
+    Receptive field calculation (kernel_size=3):
+    - Layer with dilation d spans 2*d+1 temporal positions
+    - With dilations [1,2,4,8,4,2,1]: RF ~ 45 timesteps
+    - Well within W=200 window while capturing meaningful patterns
+
+    Args:
+        hidden_channels: Number of hidden channels in TCN layers
+        num_layers: Number of residual blocks (odd for symmetric dilations)
+        kernel_size: Conv1d kernel size (default 3)
+        dropout: Dropout probability (default 0.2)
+        dilation_multiplier: Base for exponential dilation schedule (default 2)
+    """
+    def __init__(
+        self,
+        hidden_channels=128,
+        num_layers=7,
+        kernel_size=3,
+        dropout=0.2,
+        dilation_multiplier=2
+    ):
+        super().__init__()
+
+        self.hidden_channels = hidden_channels
+        self.num_layers = num_layers
+        self.kernel_size = kernel_size
+
+        # Input projection: 2*C-channel input [x_sbp, obs_mask] -> hidden_channels
+        # C=96, so input has 192 channels (96 signal + 96 mask indicator)
+        self.input_proj = nn.Sequential(
+            nn.Conv1d(2 * 96, hidden_channels, kernel_size=1),
+            nn.GroupNorm(num_groups=min(8, hidden_channels), num_channels=hidden_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # Build dilation schedule: exponential growth then symmetry
+        # E.g., for num_layers=7: [1, 2, 4, 8, 4, 2, 1]
+        half = num_layers // 2
+        dilations = [dilation_multiplier ** i for i in range(half)]
+        dilations.append(dilation_multiplier ** half)  # Peak dilation
+        dilations = dilations + dilations[-2::-1]  # Symmetric: reverse without repeating peak
+        assert len(dilations) == num_layers, f"Expected {num_layers} dilations, got {len(dilations)}"
+
+        # Build residual blocks with increasing then decreasing dilations
+        self.blocks = nn.ModuleList([
+            TCNResidualBlock(
+                hidden_channels,
+                kernel_size=kernel_size,
+                dilation=dilations[i],
+                dropout=dropout
+            )
+            for i in range(num_layers)
+        ])
+
+        # Output projection: hidden_channels -> 1 channel (reconstructed signal)
+        self.output_proj = nn.Sequential(
+            nn.Conv1d(hidden_channels, hidden_channels, kernel_size=1),
+            nn.GroupNorm(num_groups=min(8, hidden_channels), num_channels=hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(hidden_channels, 1, kernel_size=1)
+        )
+
+        # Store dilations for documentation
+        self.dilations = dilations
+
+    def forward(self, x_sbp, mask):
+        """
+        x_sbp: (B, W, C) - masked SBP input (0s where masked)
+        mask:  (B, W, C) - bool tensor, True where masked
+
+        Returns:
+            (B, W, C) - reconstructed SBP with observed values preserved
+        """
+        B, W, C = x_sbp.shape
+
+        # Validate shapes
+        assert x_sbp.shape == (B, W, C), f"x_sbp shape {x_sbp.shape} doesn't match expected (B, W, C)"
+        assert mask.shape == (B, W, C), f"mask shape {mask.shape} doesn't match x_sbp"
+        assert C == 96, f"Expected 96 channels, got {C}"
+        assert W == 200, f"Expected 200 time steps, got {W}"
+
+        # Create observation mask (inverse of mask)
+        obs_mask = (~mask).float()  # True where observed
+
+        # Stack inputs along channel dimension: [x_sbp, obs_mask]
+        # (B, W, C) + (B, W, C) -> (B, W, 2*C)
+        x = torch.cat([x_sbp, obs_mask], dim=2)  # (B, W, 2*C)
+
+        # Transpose to Conv1d format: (B, W, 2*C) -> (B, 2*C, W)
+        x = x.transpose(1, 2)  # (B, 2*C, W)
+
+        # Input projection: 2*C channels -> hidden_channels
+        x = self.input_proj(x)  # (B, hidden_channels, W)
+
+        # Apply residual blocks
+        for block in self.blocks:
+            x = block(x)  # (B, hidden_channels, W)
+
+        # Output projection: hidden_channels -> C (one per channel)
+        out = self.output_proj(x)  # (B, C, W)
+
+        # Transpose back to (B, W, C)
+        out = out.transpose(1, 2)  # (B, W, C)
+
+        # Keep observed entries unchanged; only predict masked positions
+        out = out * mask.float() + x_sbp * obs_mask
+
+        return out
+
+    def get_receptive_field(self):
+        """
+        Estimate receptive field size based on kernel size and dilations.
+        RF = 1 + sum(2 * dilation_i) for kernel_size=3
+        """
+        rf = 1
+        for dilation in self.dilations:
+            rf += 2 * dilation
+        return rf
+
+
 """
 Usage Example:
 --------------
 
-from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor
+from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, TCNReconstructor
 from losses import masked_nmse_loss
 
 # Choose a model
-model = SBP_Reconstruction_UNet(base_channels=64)  # Best overall
+model = TCNReconstructor(hidden_channels=128, num_layers=7)  # New TCN baseline
+# model = SBP_Reconstruction_UNet(base_channels=64)  # Conv2d U-Net
 # model = SimpleCNN(hidden_channels=128, num_layers=6)  # Fastest
 # model = ResNetReconstructor(hidden_channels=128, num_blocks=8)  # Good middle ground
 
@@ -227,19 +400,20 @@ for batch in dataloader:
     x_sbp = batch['x_sbp']  # (B, 200, 96) - zeros where masked
     y_sbp = batch['y_sbp']  # (B, 200, 96) - ground truth
     mask = batch['mask']     # (B, 200, 96) - True where masked
-    
+
     # Forward pass
     pred = model(x_sbp, mask)
-    
+
     # Compute loss only on masked positions
     loss = masked_nmse_loss(pred, y_sbp, mask)
-    
+
     # Backward pass
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
 Model Comparison:
+- TCNReconstructor: Conv1d temporal convolutions, bidirectional, dilated, efficient
 - SBP_Reconstruction_UNet: Best performance, captures multi-scale patterns
 - SimpleCNN: Fastest training, good baseline
 - ResNetReconstructor: Better gradient flow than SimpleCNN, competitive with U-Net
