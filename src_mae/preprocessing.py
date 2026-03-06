@@ -229,11 +229,44 @@ def compute_global_channel_variance(sbp_sessions, w0, W):
     return global_variance
 
 def compute_session_channel_variance(sbp):
+    """Standard variance (keep for backward compatibility)."""
     session_variance = np.var(sbp, axis=0)
     return session_variance
 
 
-def preprocess_non_overlapping(data_path, window_size=128, seed=0, normalize = False):
+def compute_robust_channel_variance(sbp, method="mad"):
+    """
+    Compute per-channel variance robust to outliers and signal drift.
+
+    Uses either Median Absolute Deviation (MAD) or Interquartile Range (IQR),
+    both of which are robust to amplitude drift and outliers.
+
+    Args:
+        sbp: (T, C) full session
+        method: "mad" (median absolute deviation) or "iqr" (interquartile range)
+
+    Returns:
+        (C,) robust variance estimate per channel
+    """
+    if method == "mad":
+        # MAD-based variance: (MAD/0.6745)^2 approximates σ^2 for Gaussian
+        med = np.median(sbp, axis=0, keepdims=True)
+        mad = np.median(np.abs(sbp - med), axis=0)
+        var_robust = (mad / 0.6745) ** 2
+    elif method == "iqr":
+        # IQR-based variance: (Q3-Q1)^2 / (4*1.35) approximates σ^2
+        q1 = np.percentile(sbp, 25, axis=0)
+        q3 = np.percentile(sbp, 75, axis=0)
+        iqr = q3 - q1
+        var_robust = (iqr / 2.7) ** 2
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    # Clamp to avoid zero variance (numerical stability)
+    return np.maximum(var_robust, 1e-6)
+
+
+def preprocess_non_overlapping(data_path, window_size=128, seed=0, normalize=True):
     out_dir = os.path.join(data_path, "masked_windows")
     os.makedirs(out_dir, exist_ok=True)
     sessions, max_bin_count = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
@@ -254,10 +287,11 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0, normalize = F
         w0s = non_overlapping_windows(N, window_size)
         print(f"{session.session_id} | N={N} | windows={len(w0s)}")
 
-        session_variance = compute_session_channel_variance(sbp)
+        # Use robust variance estimation (resistant to drift and outliers)
+        session_variance = compute_robust_channel_variance(sbp, method="mad")
         variance_shape = session_variance.shape
         print(f"  Session channel variance shape: {variance_shape}")
-        print(f"  Session channel variance (mean across channels): {session_variance.mean():.4f}")
+        print(f"  Session channel variance (robust MAD-based, mean): {session_variance.mean():.4f}")
 
         for w0 in w0s:
             y = sbp[w0:w0 + window_size]          # (W,96)

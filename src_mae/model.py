@@ -316,12 +316,12 @@ class TCNReconstructor(nn.Module):
             for i in range(num_layers)
         ])
 
-        # Output projection: hidden_channels -> 1 channel (reconstructed signal)
+        # Output projection: hidden_channels -> 96 channels (one reconstruction per SBP channel)
         self.output_proj = nn.Sequential(
             nn.Conv1d(hidden_channels, hidden_channels, kernel_size=1),
             nn.GroupNorm(num_groups=min(8, hidden_channels), num_channels=hidden_channels),
             nn.ReLU(inplace=True),
-            nn.Conv1d(hidden_channels, 1, kernel_size=1)
+            nn.Conv1d(hidden_channels, 96, kernel_size=1)  # FIXED: output 96 channels, not 1!
         )
 
         # Store dilations for documentation

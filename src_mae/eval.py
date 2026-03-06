@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, TCNReconstructor
-from preprocessing import sample_span_start
+from preprocessing import sample_span_start, robust_session_norm
 
 
 def mask_segments(mask_2d: np.ndarray):
@@ -68,7 +68,21 @@ def build_randomized_windows_from_mask(mask_2d: np.ndarray, window_size: int, rn
     return windows
 
 
-def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regions=10):
+def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regions=10, normalize=True):
+    """
+    Preprocess test data for evaluation/submission.
+
+    Args:
+        data_path: Path to kaggle_data directory
+        window_size: Size of windows to extract
+        metadata_csv: Path to metadata CSV
+        seed: Random seed for reproducibility
+        expected_regions: Expected number of masked regions per session
+        normalize: Whether to apply robust_session_norm (CRITICAL: must match training!)
+
+    Returns:
+        dict mapping session_id to test data
+    """
     masked_files = os.path.join(data_path, "test/*_sbp_masked.npy")
     session_data = {}
 
@@ -76,9 +90,14 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
         session_id = Path(file).stem.split("_")[0]
         rng = np.random.default_rng(seed + (hash(session_id) & 0xFFFFFFFF))
 
-        masked_sbp = np.load(file)
+        masked_sbp = np.load(file).astype(np.float32)
         mask = np.load(file.replace("sbp_masked", "mask"))
         kin = np.load(file.replace("sbp_masked", "kinematics"))
+
+        # Apply normalization if requested (should match training preprocessing)
+        if normalize:
+            # CRITICAL: Use same normalization as training to avoid distribution mismatch
+            masked_sbp = robust_session_norm(masked_sbp)
 
         segs = mask_segments(mask)
         windows = build_randomized_windows_from_mask(mask, window_size, rng)
@@ -112,15 +131,23 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
     return session_data
 
 
-def build_model(model_name: str, base_channels: int) -> nn.Module:
+def build_model(model_name: str, base_channels: int = 64) -> nn.Module:
+    """Build model for inference.
+
+    Args:
+        model_name: One of "tcn", "unet", "simple_cnn", "resnet"
+        base_channels: For UNet/ResNet (ignored for TCN)
+    """
     model_name = model_name.lower()
+    if model_name == "tcn":
+        return TCNReconstructor(hidden_channels=128, num_layers=7)
     if model_name == "unet":
         return SBP_Reconstruction_UNet(base_channels=base_channels)
     if model_name == "simple_cnn":
         return SimpleCNN(hidden_channels=128, num_layers=6)
     if model_name == "resnet":
         return ResNetReconstructor(hidden_channels=128, num_blocks=8)
-    raise ValueError(f"Unknown model_name '{model_name}'")
+    raise ValueError(f"Unknown model_name '{model_name}' (options: tcn, unet, simple_cnn, resnet)")
 
 
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
