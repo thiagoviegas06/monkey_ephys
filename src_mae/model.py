@@ -210,47 +210,108 @@ class ResNetReconstructor(nn.Module):
         return out
 
 
+class DepthwiseSeparableConv1d(nn.Module):
+    """
+    Depthwise-separable convolution for efficient temporal processing.
+
+    First applies depthwise conv (per-channel), then pointwise (1x1) for mixing.
+    More efficient than standard conv and allows better channel interactions.
+    """
+    def __init__(self, channels, kernel_size=3, dilation=1):
+        super().__init__()
+        padding = dilation * (kernel_size // 2)
+
+        # Depthwise: one filter per input channel
+        self.depthwise = nn.Conv1d(
+            channels, channels, kernel_size=kernel_size,
+            padding=padding, dilation=dilation, groups=channels
+        )
+        # Pointwise: mix across channels
+        self.pointwise = nn.Conv1d(channels, channels, kernel_size=1)
+
+    def forward(self, x):
+        """x: (B, C, T)"""
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+
+
+class ChannelFFN(nn.Module):
+    """
+    Channel-wise feedforward network for mixing spatial/channel information.
+
+    Applies point-wise (1x1) convolutions with expansion:
+    C -> 4*C -> C
+    This allows nonlinear mixing of channel information.
+    """
+    def __init__(self, channels, expansion_factor=4, dropout=0.2):
+        super().__init__()
+        hidden = int(channels * expansion_factor)
+
+        self.up = nn.Conv1d(channels, hidden, kernel_size=1)
+        self.gn_up = nn.GroupNorm(num_groups=min(8, hidden), num_channels=hidden)
+        self.down = nn.Conv1d(hidden, channels, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """x: (B, C, T) - operates independently per timestep"""
+        residual = x
+
+        # Expand channels
+        out = self.up(x)
+        out = self.gn_up(out)
+        out = F.gelu(out)
+        out = self.dropout(out)
+
+        # Contract back
+        out = self.down(out)
+        out = out + residual
+        return out
+
+
 class TCNResidualBlock(nn.Module):
     """
-    Temporal Convolutional Network (TCN) residual block.
-    Uses Conv1d with dilated convolutions for wide receptive field.
+    Enhanced TCN residual block with temporal + channel mixing.
+
+    Uses depthwise-separable convolutions for temporal processing,
+    then channel FFN for explicit channel interactions.
+    Provides both local temporal patterns AND inter-channel mixing.
     """
     def __init__(self, channels, kernel_size=3, dilation=1, dropout=0.2):
         super().__init__()
-        # Padding for bidirectional convolution that maintains temporal dimension
-        # For kernel_size=3: padding = dilation (same on both sides)
-        padding = dilation * (kernel_size // 2)
 
-        self.conv1 = nn.Conv1d(
-            channels, channels, kernel_size=kernel_size,
-            padding=padding, dilation=dilation
+        # Temporal processing: depthwise-separable conv
+        self.temporal_conv = DepthwiseSeparableConv1d(
+            channels, kernel_size=kernel_size, dilation=dilation
         )
-        self.gn1 = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
+        self.gn_temporal = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
         self.dropout1 = nn.Dropout(dropout)
 
-        self.conv2 = nn.Conv1d(
-            channels, channels, kernel_size=kernel_size,
-            padding=padding, dilation=dilation
-        )
-        self.gn2 = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
-        self.dropout2 = nn.Dropout(dropout)
+        # Channel mixing: FFN-style pointwise operations
+        self.channel_ffn = ChannelFFN(channels, expansion_factor=4, dropout=dropout)
 
     def forward(self, x):
         """
         x: (B, C, T) - tensor in Conv1d format
         Returns: (B, C, T)
+
+        Process flow:
+        1. Temporal: depthwise-separable conv (per-channel temporal, then mix)
+        2. Channel: FFN for inter-channel interactions
+        3. Residual connection throughout
         """
         residual = x
 
-        out = self.conv1(x)
-        out = self.gn1(out)
+        # Temporal processing
+        out = self.temporal_conv(x)
+        out = self.gn_temporal(out)
         out = F.relu(out)
         out = self.dropout1(out)
 
-        out = self.conv2(out)
-        out = self.gn2(out)
-        out = self.dropout2(out)
+        # Channel mixing
+        out = self.channel_ffn(out)
 
+        # Residual
         out = out + residual
         out = F.relu(out)
         return out
@@ -258,10 +319,18 @@ class TCNResidualBlock(nn.Module):
 
 class TCNReconstructor(nn.Module):
     """
-    Temporal Convolutional Network (TCN) for masked SBP reconstruction.
+    Enhanced Temporal Convolutional Network (TCN) for masked SBP reconstruction.
 
-    Bidirectional temporal processing with dilated convolutions.
-    Matches the I/O contract: forward(x_sbp, mask) -> (B, W, C)
+    Architecture combines:
+    1. **Temporal Processing**: Depthwise-separable Conv1d for efficient per-channel temporal patterns
+    2. **Channel Mixing**: FFN-style pointwise operations (C -> 4C -> C) for inter-channel interactions
+    3. **Dilated Receptive Field**: Exponential dilation [1,2,4,8,4,2,1] for 45-timestep RF
+    4. **Bidirectional**: Non-causal convolutions for offline reconstruction
+
+    This design allows the model to learn:
+    - Local temporal patterns within each SBP channel
+    - Nonlinear dependencies between channels (biologically realistic)
+    - Both fine (dilation=1) and coarse (dilation=8) temporal scales
 
     Receptive field calculation (kernel_size=3):
     - Layer with dilation d spans 2*d+1 temporal positions
@@ -269,11 +338,11 @@ class TCNReconstructor(nn.Module):
     - Well within W=200 window while capturing meaningful patterns
 
     Args:
-        hidden_channels: Number of hidden channels in TCN layers
-        num_layers: Number of residual blocks (odd for symmetric dilations)
-        kernel_size: Conv1d kernel size (default 3)
-        dropout: Dropout probability (default 0.2)
-        dilation_multiplier: Base for exponential dilation schedule (default 2)
+        hidden_channels: Number of hidden channels in TCN layers (default: 128)
+        num_layers: Number of residual blocks (default: 7, odd for symmetric dilations)
+        kernel_size: Temporal Conv1d kernel size (default: 3)
+        dropout: Dropout probability (default: 0.2)
+        dilation_multiplier: Base for exponential dilation schedule (default: 2)
     """
     def __init__(
         self,
