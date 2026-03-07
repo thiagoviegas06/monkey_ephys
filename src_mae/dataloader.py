@@ -71,6 +71,7 @@ class SBPDataset(Dataset):
             "y_sbp": torch.from_numpy(sample["y_sbp"]).float(),  # (W, 96) float32
             "mask": torch.from_numpy(sample["mask"]).float(),    # (W, 96) bool
             "kin": torch.from_numpy(sample["kin"]).float(),      # (W, 4) float32
+            "channel_var": torch.from_numpy(sample["channel_var"]).float(), # (96,) float32
             "session_id": sample["session_id"],
             "macro_timestamp": sample["w0"],  # Using window start position as macro timestamp
         }

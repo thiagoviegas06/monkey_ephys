@@ -16,15 +16,16 @@ class Config:
     windows_dir = "kaggle_data/masked_windows"  # Where preprocessed windows are saved
     
     # Model
-    model_name = "transformer"  # Options: "unet", "simple_cnn", "resnet", "transformer"
+    model_name = "tcn_transformer"   # Options: "unet", "simple_cnn", "resnet", "transformer", "tcn_transformer"
     base_channels = 64   # For UNet/ResNet
     sbp_channels = 96
     kin_channels = 4
     
     # For transformer model
-    d_model = 256  # 96 SBP + 4 kin + 96 mask = 196 total input channels, so d_model should be >= 196)
+    d_model = 64  # Embedding dimension for transformer
     nhead = 8  # Number of attention heads
     num_layers = 4 # Number of transformer encoder blocks stacked on top of each other
+    tcn_levels = 4  # Number of TCN dilation layers
     dropout = 0.1  # Dropout rate in transformer for regularization
     
     # Training

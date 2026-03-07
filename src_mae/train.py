@@ -15,7 +15,7 @@ from pathlib import Path
 from tqdm import tqdm
 from glob import glob
 
-from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, SBPImputer
+from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, SBPImputer, SBP_TCN_Transformer
 from dataloader import SBPDataset, get_dataloaders
 from losses import masked_nmse_loss, kaggle_aligned_nmse_loss
 from preprocessing import preprocess_non_overlapping
@@ -39,6 +39,17 @@ def build_model(config):
     elif config.model_name == "resnet":
         model = ResNetReconstructor(hidden_channels=128, num_blocks=8)
         print("Built ResNet Reconstructor")
+    elif config.model_name == "tcn_transformer":
+        model = SBP_TCN_Transformer(
+            sbp_channels=config.sbp_channels,
+            kin_channels=config.kin_channels,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            num_layers=config.num_layers,
+            tcn_levels=config.tcn_levels,  # Pass the new config variable
+            dropout=config.dropout
+        )
+        print("Built Hybrid TCN + Cross-Channel Transformer")
     elif config.model_name == "transformer":
         model = SBPImputer(
             d_model=config.d_model,
