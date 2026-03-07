@@ -472,11 +472,11 @@ class SpatialTCN(nn.Module):
         kernel_size: Conv2d kernel size (default: 3)
         dilations: List of dilation rates (default: [1, 2, 4, 8])
     """
-    def __init__(self, base_channels=64, num_layers=4, kernel_size=3, dilations=None):
+    def __init__(self, base_channels=64, num_layers=4, kernel_size=5, dilations=None):
         super().__init__()
 
         if dilations is None:
-            dilations = [1, 2, 4, 8]
+            dilations = dilations = [1, 2, 4, 8, 16, 32]
         assert len(dilations) == num_layers, f"num_layers={num_layers} but {len(dilations)} dilations"
 
         self.base_channels = base_channels
@@ -484,7 +484,7 @@ class SpatialTCN(nn.Module):
         # Input: (B, 2, W, C)
         # First conv to expand channels
         self.input_block = nn.Sequential(
-            nn.Conv2d(2, base_channels, kernel_size=3, padding=1),
+            nn.Conv2d(2, base_channels, kernel_size=5, padding=2),
             nn.GroupNorm(num_groups=min(8, base_channels), num_channels=base_channels),
             nn.ReLU(inplace=True)
         )
