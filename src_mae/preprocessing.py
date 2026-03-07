@@ -4,6 +4,7 @@ import zlib
 import pickle
 import os
 from pathlib import Path
+from tqdm import tqdm
 
 # paste your rows here once; or load from csv
 STATS = [
@@ -236,6 +237,9 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
     out_dir = os.path.join(data_path, "masked_windows")
     os.makedirs(out_dir, exist_ok=True)
     sessions, max_bin_count = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
+
+    # Add tqdm progress bar for sessions
+    sessions = tqdm(sessions, desc="Processing sessions")
 
     for session in sessions:
         if session.isTest():
