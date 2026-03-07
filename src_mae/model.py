@@ -330,17 +330,17 @@ class TCNReconstructor(nn.Module):
     This design allows the model to learn:
     - Local temporal patterns within each SBP channel
     - Nonlinear dependencies between channels (biologically realistic)
-    - Both fine (dilation=1) and coarse (dilation=8) temporal scales
+    - Both fine (dilation=1) and coarse (dilation=64) temporal scales
 
-    Receptive field calculation (kernel_size=3):
-    - Layer with dilation d spans 2*d+1 temporal positions
-    - With dilations [1,2,4,8,4,2,1]: RF ~ 45 timesteps
-    - Well within W=200 window while capturing meaningful patterns
+    Receptive field calculation (kernel_size=5):
+    - Layer with dilation d spans 4*d+1 temporal positions
+    - With dilations [1,2,4,8,16,32,64]: RF ~ 257 timesteps
+    - Exceeds W=200 window, giving full context visibility
 
     Args:
         hidden_channels: Number of hidden channels in TCN layers (default: 128)
-        num_layers: Number of residual blocks (default: 7, odd for symmetric dilations)
-        kernel_size: Temporal Conv1d kernel size (default: 3)
+        num_layers: Number of residual blocks (default: 7)
+        kernel_size: Temporal Conv1d kernel size (default: 5)
         dropout: Dropout probability (default: 0.2)
         dilation_multiplier: Base for exponential dilation schedule (default: 2)
     """
@@ -348,7 +348,7 @@ class TCNReconstructor(nn.Module):
         self,
         hidden_channels=128,
         num_layers=7,
-        kernel_size=3,
+        kernel_size=5,
         dropout=0.2,
         dilation_multiplier=2
     ):
@@ -366,12 +366,10 @@ class TCNReconstructor(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # Build dilation schedule: exponential growth then symmetry
-        # E.g., for num_layers=7: [1, 2, 4, 8, 4, 2, 1]
-        half = num_layers // 2
-        dilations = [dilation_multiplier ** i for i in range(half)]
-        dilations.append(dilation_multiplier ** half)  # Peak dilation
-        dilations = dilations + dilations[-2::-1]  # Symmetric: reverse without repeating peak
+        # Build dilation schedule: exponential growth to very large RF
+        # For num_layers=7: [1, 2, 4, 8, 16, 32, 64]
+        # RF with kernel_size=5: ~257 (covers full W=200 window with context)
+        dilations = [dilation_multiplier ** i for i in range(num_layers)]
         assert len(dilations) == num_layers, f"Expected {num_layers} dilations, got {len(dilations)}"
 
         # Build residual blocks with increasing then decreasing dilations
