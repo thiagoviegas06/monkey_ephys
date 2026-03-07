@@ -5,6 +5,7 @@ import pickle
 from glob import glob
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataset import random_split
+import random
 
 # ============================================================================
 # Dataset Class
@@ -34,7 +35,9 @@ class SBPDataset(Dataset):
         
         # Find all .pkl files
         pkl_pattern = os.path.join(windows_dir, "*.pkl")
-        self.sample_files = sorted(glob(pkl_pattern))
+        # self.sample_files = sorted(glob(pkl_pattern))
+        self.sample_files = glob(pkl_pattern) 
+        random.shuffle(self.sample_files)
         
         if len(self.sample_files) == 0:
             raise ValueError(
@@ -61,7 +64,7 @@ class SBPDataset(Dataset):
         # Load pickle file
         with open(self.sample_files[idx], 'rb') as f:
             sample = pickle.load(f)
-        
+
         # Convert to tensors (data already in correct format from preprocessing)
         return {
             "x_sbp": torch.from_numpy(sample["x_sbp"]).float(),  # (W, 96) float32
@@ -69,6 +72,7 @@ class SBPDataset(Dataset):
             "mask": torch.from_numpy(sample["mask"]).float(),    # (W, 96) bool
             "kin": torch.from_numpy(sample["kin"]).float(),      # (W, 4) float32
             "session_id": sample["session_id"],
+            "macro_timestamp": sample["w0"],  # Using window start position as macro timestamp
         }
     
 

@@ -210,86 +210,101 @@ class ResNetReconstructor(nn.Module):
         
         return out
 
-
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super(PositionalEncoding, self).__init__()
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
+        self.pe = pe.unsqueeze(0) # (1, max_len, d_model) for batch_first=True
 
     def forward(self, x):
+        # x shape: (batch, seq_len, d_model)
+        x = x + self.pe[:, :x.size(1), :].to(x.device)
+        return self.dropout(x)
+
+class ContinuousTimeEmbedding(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        # A small network to project a single scalar into the high-dimensional latent space
+        self.mlp = nn.Sequential(
+            nn.Linear(1, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, d_model)
+        )
+
+    def forward(self, macro_time):
         """
         Args:
-            x: Tensor, shape [batch_size, seq_len, embedding_dim]
+            macro_time: (batch_size, 1) - Normalized days/sessions since start
+        Returns:
+            time_emb: (batch_size, 1, d_model)
         """
-        x = x + self.pe[:, :x.size(1), :]
-        return x
+        # Pass through MLP and add a sequence dimension for broadcasting
+        time_emb = self.mlp(macro_time)
+        return time_emb.unsqueeze(1)
+
 
 class SBPImputer(nn.Module):
-    def __init__(self, sbp_channels=96, kin_channels=4, d_model=256, nhead=8, num_layers=4, dropout=0.1):
-        super(SBPImputer, self).__init__()
+    def __init__(self, sbp_channels=96, kin_channels=4, d_model=256, nhead=8, num_layers=4, dim_feedforward=512, dropout=0.1):
+        super().__init__()
         
-        # The input consists of:
-        # 1. The masked SBP data (96 channels)
-        # 2. The kinematic data (4 channels)
-        # 3. The Boolean mask indicator (96 channels) - Lets the model know exactly what needs filling
-        in_features = sbp_channels + kin_channels + sbp_channels
+        input_dim = sbp_channels + sbp_channels + kin_channels  # masked SBP + mask indicator + kinematics
         
-        # Projection layer to map raw inputs to transformer hidden dimensions
-        self.input_projection = nn.Sequential(
-            nn.Linear(in_features, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model)
-        )
+        self.input_proj = nn.Linear(input_dim, d_model)
         
-        self.pos_encoder = PositionalEncoding(d_model)
+        # Micro-time (intra-sequence) and Macro-time (inter-sequence) encoders
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        self.macro_time_encoder = ContinuousTimeEmbedding(d_model)
         
-        # Transformer Encoder
-        encoder_layers = nn.TransformerEncoderLayer(
+        self.norm = nn.LayerNorm(d_model)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, 
             nhead=nhead, 
-            dim_feedforward=d_model * 4, 
-            dropout=dropout, 
-            batch_first=True
+            dim_feedforward=dim_feedforward, 
+            dropout=dropout,
+            batch_first=True,
+            activation='gelu'
         )
-        self.transformer = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        
-        # Output layer maps back to the 96 SBP channels
-        self.output_projection = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, sbp_channels),
-            nn.ReLU() # SBP is generally non-negative, ReLU guarantees positive predictions
-        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.output_proj = nn.Linear(d_model, sbp_channels)
 
-    def forward(self, x_sbp, kin, mask):
+    def forward(self, sbp_masked, kinematics, mask, macro_time):
         """
         Args:
-            x_sbp: [Batch, Time, 96]
-            kin: [Batch, Time, 4]
-            mask: [Batch, Time, 96]
-        Returns:
-            predictions: [Batch, Time, 96]
+            sbp_masked: (batch, seq_len, 96) - Original data with missing values as 0
+            mask: (batch, seq_len, 96) - 1/True for masked (missing), 0/False for visible
+            kinematics: (batch, seq_len, 4)
+            macro_time: (batch, 1)
         """
-        # Concatenate features along the channel dimension
-        x = torch.cat([x_sbp, kin, mask], dim=-1)
+        # 1. Concatenate raw features
+        x = torch.cat([sbp_masked, mask.float(), kinematics], dim=-1)
         
-        # Project and add position encodings
-        x = self.input_projection(x)
-        x = self.pos_encoder(x)
+        # 2. Project and inject temporal embeddings (Micro + Macro)
+        x = self.input_proj(x)
+        x = self.pos_encoder(x) 
+        time_emb = self.macro_time_encoder(macro_time)
+        x = x + time_emb 
+        x = self.norm(x)
         
-        # Pass through Transformer
-        encoded = self.transformer(x)
+        # 3. Pass through Transformer
+        x = self.transformer_encoder(x)
         
-        # Predict missing values
-        out = self.output_projection(encoded)
+        # 4. Project back to SBP channels
+        raw_predictions = self.output_proj(x)
         
-        return out
-
+        # 5. Blend: Only apply predictions over the masked values
+        # torch.where(condition, if_true, if_false)
+        # If mask is 1 (True), use our prediction. If 0 (False), keep original SBP.
+        final_output = torch.where(mask.bool(), raw_predictions, sbp_masked)
+        
+        return final_output
 
 """
 Usage Example:

@@ -210,6 +210,27 @@ def apply_random_mask_to_window(sbp, start_bin, end_bin, rng, channels_per_bin=3
 
     return x, mask
 
+def compute_per_channel_variance(sbp, w0, W):
+    window = sbp[w0:w0 + W]
+    variances = np.var(window, axis=0)
+    return variances
+
+def compute_global_channel_variance(sbp_sessions, w0, W):
+    all_windows = []
+    for sbp in sbp_sessions:
+        if sbp.shape[0] >= w0 + W:
+            window = sbp[w0:w0 + W]
+            all_windows.append(window)
+    if not all_windows:
+        raise ValueError("No valid windows found for variance computation")
+    all_data = np.concatenate(all_windows, axis=0)
+    global_variance = np.var(all_data, axis=0)
+    return global_variance
+
+def compute_session_channel_variance(sbp):
+    session_variance = np.var(sbp, axis=0)
+    return session_variance
+
 
 def preprocess_non_overlapping(data_path, window_size=128, seed=0):
     out_dir = os.path.join(data_path, "masked_windows")
@@ -222,39 +243,76 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
         sbp, kin, starts_bins, end_bins = session.load_data(data_path)
         if sbp is None:
             continue
+        
         N = sbp.shape[0]
         if N < window_size:
             continue
+            
+        # Dynamically calculate 50% of the total channels (e.g., 48 if C=96)
+        C = sbp.shape[1]
+        max_mask_channels = int(C * 0.50)
+
         rng = np.random.default_rng(seed + (hash(session.session_id) & 0xFFFFFFFF))
         w0s = non_overlapping_windows(N, window_size)
         print(f"{session.session_id} | N={N} | windows={len(w0s)}")
 
+        session_variance = compute_session_channel_variance(sbp)
+        print(f"  Session channel variance shape: {session_variance.shape}")
+
         for w0 in w0s:
-            y = sbp[w0:w0 + window_size]          # (W,96)
-            kin_w = kin[w0:w0 + window_size]      # (W,4)
-            L = sample_span_len(rng, W=window_size)
-            t0 = sample_span_start(rng, W=window_size, L=L)
-            t1 = t0 + L
-            x, M = apply_random_mask_to_window(y, t0, t1, rng, channels_per_bin=30)
+            y = sbp[w0:w0 + window_size]          # (W, C)
+            kin_w = kin[w0:w0 + window_size]      # (W, 4)
 
-            sample = {
-                "x_sbp": x.astype(np.float32),
-                "y_sbp": y.astype(np.float32),
-                "mask": M,
-                "kin": kin_w.astype(np.float32),
-                "session_id": session.session_id,
-                "w0": int(w0),
-                "span": (int(t0), int(t1)),
-                "day": float(session.day),
-                "day_from_nearest": float(session.day_from_nearest),
-            }
+            # Generate 2 independent sets
+            for set_idx in range(2):
+                
+                # Sample the temporal span ONCE per set so the progressive 
+                # masking occurs over the same continuous block of time
+                L = sample_span_len(rng, W=window_size)
+                t0 = sample_span_start(rng, W=window_size, L=L)
+                t1 = t0 + L
 
-            sample_path = os.path.join(out_dir, f"{session.session_id}_{w0}.pkl")
-            with open(sample_path, "wb") as f:
-                pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
+                # Generate 10 progressively masked versions
+                for step in range(10):
+                    
+                    # Scale from 10% to 100% of the maximum allowed masking (50% of total channels)
+                    # Step 0 = 10% of 48 = ~5 channels
+                    # Step 9 = 100% of 48 = 48 channels
+                    fraction = (step + 1) / 10.0
+                    channels_per_bin = int(np.round(max_mask_channels * fraction))
+                    
+                    # Calling this dynamically generates a completely new random mask 
+                    # layout for the selected number of channels.
+                    x, M = apply_random_mask_to_window(y, t0, t1, rng, channels_per_bin=channels_per_bin)
+
+                    sample = {
+                        "x_sbp": x.astype(np.float32),
+                        "y_sbp": y.astype(np.float32),
+                        "mask": M,
+                        "kin": kin_w.astype(np.float32),
+                        "channel_var": session_variance.astype(np.float32),
+                        "session_id": session.session_id,
+                        "w0": int(w0),
+                        "span": (int(t0), int(t1)),
+                        "day": float(session.day),
+                        "day_from_nearest": float(session.day_from_nearest),
+                        
+                        # Save the augmentation metadata for downstream tracking
+                        "set_idx": set_idx, 
+                        "mask_step": step,
+                        "channels_masked_per_bin": channels_per_bin
+                    }
+
+                    # Update filename to prevent overwrites and identify the augmentation
+                    filename = f"{session.session_id}_{w0}_set{set_idx}_step{step}.pkl"
+                    sample_path = os.path.join(out_dir, filename)
+                    
+                    with open(sample_path, "wb") as f:
+                        pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
             
-            if len(w0s) <= 5 or w0 == w0s[0]:  # Print first window or if few windows
-                print(f"  Saved: {session.session_id}_{w0}.pkl | span=({t0},{t1}) | masked={int(M.sum())} positions")
+            # Print a status update for the first window to confirm it's working
+            if w0 == w0s[0]:  
+                print(f"  Saved 20 augmented variations for window {w0}")
 
 
 def preprocess(data_path, window_size=128, K=500, seed=0, p_mask_trial=0.03):

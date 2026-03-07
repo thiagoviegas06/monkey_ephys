@@ -7,3 +7,4 @@ analyze_predictions.ipynb
 *.zip
 /.vscode
 /checkpoints
+*.pth

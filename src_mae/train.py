@@ -84,6 +84,7 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         x_sbp = batch["x_sbp"].to(config.device)  # (B, W, C)
         y_sbp = batch["y_sbp"].to(config.device)  # (B, W, C)
         kin = batch["kin"].to(config.device)      # (B, W, 4)
+        macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()  # (B, 1)
         
         # The model's concat step needs floats, but the inverse logic in the loss (~mask) needs bools
         mask_float = batch["mask"].to(config.device).float()
@@ -93,7 +94,7 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         optimizer.zero_grad()
         
         # ===== Forward pass =====
-        pred = model(x_sbp, kin, mask_float)  # (B, W, C)
+        pred = model(x_sbp, kin, mask_float, macro_timestamp)  # (B, W, C)
         
         # ===== Compute loss =====
         # Loss is computed ONLY on masked positions
@@ -160,13 +161,14 @@ def validate_one_epoch(model, dataloader, device, epoch, num_epochs, log_every=5
             x_sbp = batch["x_sbp"].to(device)
             y_sbp = batch["y_sbp"].to(device)
             kin = batch["kin"].to(device)
+            macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()
             mask_float = batch["mask"].to(device).float()
             mask_bool = batch["mask"].to(device).bool()
             
             batch_size = x_sbp.size(0)
             
             # ===== Forward pass =====
-            pred = model(x_sbp, kin, mask_float)
+            pred = model(x_sbp, kin, mask_float, macro_timestamp)
             
             # ===== Compute loss =====
             loss = masked_nmse_loss(pred, y_sbp, mask_bool)
@@ -196,12 +198,12 @@ def validate_one_epoch(model, dataloader, device, epoch, num_epochs, log_every=5
                 true_mean = masked_true.mean().item() if n_masked > 0 else 0.0
                 true_std = masked_true.std().item() if n_masked > 1 else 0.0
                 
-                print(f"\n[Val Epoch {epoch}, Batch {batch_idx + 1}/{len(dataloader)}]")
-                print(f"  NMSE Loss: {loss.item():.6f}")
-                print(f"  MSE Loss:  {mse.item():.6f}")
-                print(f"  Masked: {n_masked}/{n_total} ({pct_masked:.2f}%)")
-                print(f"  Pred (masked): mean={pred_mean:.4f}, std={pred_std:.4f}")
-                print(f"  True (masked): mean={true_mean:.4f}, std={true_std:.4f}")
+                # print(f"\n[Val Epoch {epoch}, Batch {batch_idx + 1}/{len(dataloader)}]")
+                # print(f"  NMSE Loss: {loss.item():.6f}")
+                # print(f"  MSE Loss:  {mse.item():.6f}")
+                # print(f"  Masked: {n_masked}/{n_total} ({pct_masked:.2f}%)")
+                # print(f"  Pred (masked): mean={pred_mean:.4f}, std={pred_std:.4f}")
+                # print(f"  True (masked): mean={true_mean:.4f}, std={true_std:.4f}")
                 
     avg_loss = total_loss / total_samples
     return avg_loss
@@ -346,7 +348,7 @@ def main():
                 'loss': avg_loss,
                 'config': config.__dict__,
             }, checkpoint_path)
-            print(f"✓ Checkpoint saved: {checkpoint_path}")
+            print(f"  --> Checkpoint saved: {checkpoint_path}")
     
     print("\n" + "=" * 70)
     print("Training Complete!")
