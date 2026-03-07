@@ -4,7 +4,6 @@ import zlib
 import pickle
 import os
 from pathlib import Path
-from drift_estimation import robust_session_norm
 
 # paste your rows here once; or load from csv
 STATS = [
@@ -198,12 +197,11 @@ def get_num_windows(num_bins, desired_window_size=200):
         return 1
     
 
-def apply_random_mask_to_window(sbp, start_bin, end_bin, rng, min_channels_per_bin=30, max_channels_per_bin=50):
+def apply_random_mask_to_window(sbp, start_bin, end_bin, rng, channels_per_bin=30):
     W, C = sbp.shape
 
     x = sbp.copy()
     mask = np.zeros((W, C), dtype=np.bool_)
-    channels_per_bin = rng.integers(min_channels_per_bin, max_channels_per_bin + 1)
 
     for t in range(start_bin, end_bin):
         masked_channels = rng.choice(C, size=channels_per_bin, replace=False)
@@ -230,44 +228,11 @@ def compute_global_channel_variance(sbp_sessions, w0, W):
     return global_variance
 
 def compute_session_channel_variance(sbp):
-    """Standard variance (keep for backward compatibility)."""
     session_variance = np.var(sbp, axis=0)
     return session_variance
 
 
-def compute_robust_channel_variance(sbp, method="mad"):
-    """
-    Compute per-channel variance robust to outliers and signal drift.
-
-    Uses either Median Absolute Deviation (MAD) or Interquartile Range (IQR),
-    both of which are robust to amplitude drift and outliers.
-
-    Args:
-        sbp: (T, C) full session
-        method: "mad" (median absolute deviation) or "iqr" (interquartile range)
-
-    Returns:
-        (C,) robust variance estimate per channel
-    """
-    if method == "mad":
-        # MAD-based variance: (MAD/0.6745)^2 approximates σ^2 for Gaussian
-        med = np.median(sbp, axis=0, keepdims=True)
-        mad = np.median(np.abs(sbp - med), axis=0)
-        var_robust = (mad / 0.6745) ** 2
-    elif method == "iqr":
-        # IQR-based variance: (Q3-Q1)^2 / (4*1.35) approximates σ^2
-        q1 = np.percentile(sbp, 25, axis=0)
-        q3 = np.percentile(sbp, 75, axis=0)
-        iqr = q3 - q1
-        var_robust = (iqr / 2.7) ** 2
-    else:
-        raise ValueError(f"Unknown method: {method}")
-
-    # Clamp to avoid zero variance (numerical stability)
-    return np.maximum(var_robust, 1e-6)
-
-
-def preprocess_non_overlapping(data_path, window_size=128, seed=0, normalize=True):
+def preprocess_non_overlapping(data_path, window_size=128, seed=0):
     out_dir = os.path.join(data_path, "masked_windows")
     os.makedirs(out_dir, exist_ok=True)
     sessions, max_bin_count = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
@@ -278,50 +243,76 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0, normalize=Tru
         sbp, kin, starts_bins, end_bins = session.load_data(data_path)
         if sbp is None:
             continue
+        
         N = sbp.shape[0]
         if N < window_size:
             continue
+            
+        # Dynamically calculate 50% of the total channels (e.g., 48 if C=96)
+        C = sbp.shape[1]
+        max_mask_channels = int(C * 0.50)
 
-        if normalize:
-            sbp = robust_session_norm(sbp)
         rng = np.random.default_rng(seed + (hash(session.session_id) & 0xFFFFFFFF))
         w0s = non_overlapping_windows(N, window_size)
         print(f"{session.session_id} | N={N} | windows={len(w0s)}")
 
-        # Use robust variance estimation (resistant to drift and outliers)
-        session_variance = compute_robust_channel_variance(sbp, method="mad")
-        variance_shape = session_variance.shape
-        print(f"  Session channel variance shape: {variance_shape}")
-        print(f"  Session channel variance (robust MAD-based, mean): {session_variance.mean():.4f}")
+        session_variance = compute_session_channel_variance(sbp)
+        print(f"  Session channel variance shape: {session_variance.shape}")
 
         for w0 in w0s:
-            y = sbp[w0:w0 + window_size]          # (W,96)
-            kin_w = kin[w0:w0 + window_size]      # (W,4)
-            L = sample_span_len(rng, W=window_size)
-            t0 = sample_span_start(rng, W=window_size, L=L)
-            t1 = t0 + L
-            x, M = apply_random_mask_to_window(y, t0, t1, rng, min_channels_per_bin=30, max_channels_per_bin=50)
+            y = sbp[w0:w0 + window_size]          # (W, C)
+            kin_w = kin[w0:w0 + window_size]      # (W, 4)
 
-            sample = {
-                "x_sbp": x.astype(np.float32),
-                "y_sbp": y.astype(np.float32),
-                "mask": M,
-                "kin": kin_w.astype(np.float32),
-                "channel_var": session_variance.astype(np.float32),  # (96,) per-channel variance from full session
-                "session_id": session.session_id,
-                "w0": int(w0),
-                "span": (int(t0), int(t1)),
-                "day": float(session.day),
-                "day_from_nearest": float(session.day_from_nearest),
-            }
+            # Generate 2 independent sets
+            for set_idx in range(2):
+                
+                # Sample the temporal span ONCE per set so the progressive 
+                # masking occurs over the same continuous block of time
+                L = sample_span_len(rng, W=window_size)
+                t0 = sample_span_start(rng, W=window_size, L=L)
+                t1 = t0 + L
 
-            sample_path = os.path.join(out_dir, f"{session.session_id}_{w0}.pkl")
-            with open(sample_path, "wb") as f:
-                pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
+                # Generate 10 progressively masked versions
+                for step in range(10):
+                    
+                    # Scale from 10% to 100% of the maximum allowed masking (50% of total channels)
+                    # Step 0 = 10% of 48 = ~5 channels
+                    # Step 9 = 100% of 48 = 48 channels
+                    fraction = (step + 1) / 10.0
+                    channels_per_bin = int(np.round(max_mask_channels * fraction))
+                    
+                    # Calling this dynamically generates a completely new random mask 
+                    # layout for the selected number of channels.
+                    x, M = apply_random_mask_to_window(y, t0, t1, rng, channels_per_bin=channels_per_bin)
+
+                    sample = {
+                        "x_sbp": x.astype(np.float32),
+                        "y_sbp": y.astype(np.float32),
+                        "mask": M,
+                        "kin": kin_w.astype(np.float32),
+                        "channel_var": session_variance.astype(np.float32),
+                        "session_id": session.session_id,
+                        "w0": int(w0),
+                        "span": (int(t0), int(t1)),
+                        "day": float(session.day),
+                        "day_from_nearest": float(session.day_from_nearest),
+                        
+                        # Save the augmentation metadata for downstream tracking
+                        "set_idx": set_idx, 
+                        "mask_step": step,
+                        "channels_masked_per_bin": channels_per_bin
+                    }
+
+                    # Update filename to prevent overwrites and identify the augmentation
+                    filename = f"{session.session_id}_{w0}_set{set_idx}_step{step}.pkl"
+                    sample_path = os.path.join(out_dir, filename)
+                    
+                    with open(sample_path, "wb") as f:
+                        pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
             
-            if len(w0s) <= 5 or w0 == w0s[0]:  # Print first window or if few windows
-                print(f"  Saved: {session.session_id}_{w0}.pkl | span=({t0},{t1}) | masked={int(M.sum())} positions")
-
+            # Print a status update for the first window to confirm it's working
+            if w0 == w0s[0]:  
+                print(f"  Saved 20 augmented variations for window {w0}")
 
 
 def preprocess(data_path, window_size=128, K=500, seed=0, p_mask_trial=0.03):
