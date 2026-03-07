@@ -6,6 +6,7 @@ Clear 2-step process: preprocess -> train
 """
 import os
 import pickle
+import csv
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,7 +17,7 @@ from glob import glob
 
 from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, SBPImputer
 from dataloader import SBPDataset, get_dataloaders
-from losses import masked_nmse_loss, masked_mse_loss
+from losses import masked_nmse_loss, kaggle_aligned_nmse_loss
 from preprocessing import preprocess_non_overlapping
 from config import Config
 
@@ -57,7 +58,7 @@ def build_model(config):
 # ============================================================================
 # Training Loop
 # ============================================================================
-def train_one_epoch(model, dataloader, optimizer, config, epoch):
+def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None):
     """
     Train for one epoch.
     
@@ -89,6 +90,9 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         # The model's concat step needs floats, but the inverse logic in the loss (~mask) needs bools
         mask_float = batch["mask"].to(config.device).float()
         mask_bool = batch["mask"].to(config.device).bool()
+        mask = batch["mask"].to(config.device)     # (B, W, C)
+        channel_var = batch["channel_var"].to(config.device)  # (B, C) per-channel variance from session
+        session_ids = batch["session_id"]  # list of session IDs for proper grouping
         
         batch_size = x_sbp.size(0)
         optimizer.zero_grad()
@@ -98,7 +102,8 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         
         # ===== Compute loss =====
         # Loss is computed ONLY on masked positions
-        loss = masked_nmse_loss(pred, y_sbp, mask_bool)
+        # Uses Kaggle-aligned NMSE that groups by (session, channel)
+        loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)
         
         # ===== Backward pass =====
         loss.backward()
@@ -116,95 +121,59 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
             'loss': f'{loss.item():.4f}',
             'avg_loss': f'{total_loss / total_samples:.4f}'
         })
-        
-        # Detailed logging every N batches
-        if (batch_idx + 1) % config.log_every == 0:
-            # Compute additional metrics for debugging
-            with torch.no_grad():
-                mse = masked_mse_loss(pred, y_sbp, mask_bool)
-                
-                # Check how many positions are masked
-                n_masked = mask_bool.sum().item()
-                n_total = mask_bool.numel()
-                pct_masked = 100.0 * n_masked / n_total
-                
-                # Check prediction statistics on masked positions
-                masked_pred = pred[mask_bool]
-                masked_true = y_sbp[mask_bool]
-                
-                pred_mean = masked_pred.mean().item() if n_masked > 0 else 0.0
-                pred_std = masked_pred.std().item() if n_masked > 1 else 0.0
-                true_mean = masked_true.mean().item() if n_masked > 0 else 0.0
-                true_std = masked_true.std().item() if n_masked > 1 else 0.0
-            
-            # print(f"\n[Epoch {epoch}, Batch {batch_idx + 1}/{len(dataloader)}]")
-            # print(f"  NMSE Loss: {loss.item():.6f}")
-            # print(f"  MSE Loss:  {mse.item():.6f}")
-            # print(f"  Masked: {n_masked}/{n_total} ({pct_masked:.2f}%)")
-            # print(f"  Pred (masked): mean={pred_mean:.4f}, std={pred_std:.4f}")
-            # print(f"  True (masked): mean={true_mean:.4f}, std={true_std:.4f}")
     
     avg_loss = total_loss / total_samples
     return avg_loss
 
 
-def validate_one_epoch(model, dataloader, device, epoch, num_epochs, log_every=50):
+def validate_one_epoch(model, dataloader, config, epoch):
+    """
+    Validation for one epoch - computes loss without backprop.
+    
+    Args:
+        model: PyTorch model
+        dataloader: DataLoader
+        config: Config object
+        epoch: Current epoch number
+    
+    Returns:
+        Average validation loss over the epoch
+    """
     model.eval()
     
     total_loss = 0.0
     total_samples = 0
     
-    pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}/{num_epochs}")
+    # Progress bar
+    pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}/{config.num_epochs}")
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(pbar):
-            x_sbp = batch["x_sbp"].to(device)
-            y_sbp = batch["y_sbp"].to(device)
-            kin = batch["kin"].to(device)
-            macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()
-            mask_float = batch["mask"].to(device).float()
-            mask_bool = batch["mask"].to(device).bool()
+            # Move batch to device
+            x_sbp = batch["x_sbp"].to(config.device)  # (B, W, C)
+            y_sbp = batch["y_sbp"].to(config.device)  # (B, W, C)
+            mask = batch["mask"].to(config.device)     # (B, W, C)
+            channel_var = batch["channel_var"].to(config.device)  # (B, C)
+            session_ids = batch["session_id"]  # list of session IDs
             
             batch_size = x_sbp.size(0)
             
-            # ===== Forward pass =====
-            pred = model(x_sbp, kin, mask_float, macro_timestamp)
+            # ===== Forward pass (no grad tracking) =====
+            pred = model(x_sbp, mask)  # (B, W, C)
             
             # ===== Compute loss =====
-            loss = masked_nmse_loss(pred, y_sbp, mask_bool)
+            loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)
             
             # ===== Logging =====
             total_loss += loss.item() * batch_size
             total_samples += batch_size
             
+            # Update progress bar
             pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg_loss': f'{total_loss / total_samples:.4f}'
+                'val_loss': f'{loss.item():.4f}',
+                'avg_val_loss': f'{total_loss / total_samples:.4f}'
             })
-            
-            # Detailed logging every N batches or at the very end of the validation epoch
-            if (batch_idx + 1) % log_every == 0 or (batch_idx + 1) == len(dataloader):
-                mse = masked_mse_loss(pred, y_sbp, mask_bool)
-                
-                n_masked = mask_bool.sum().item()
-                n_total = mask_bool.numel()
-                pct_masked = 100.0 * n_masked / n_total
-                
-                masked_pred = pred[mask_bool]
-                masked_true = y_sbp[mask_bool]
-                
-                pred_mean = masked_pred.mean().item() if n_masked > 0 else 0.0
-                pred_std = masked_pred.std().item() if n_masked > 1 else 0.0
-                true_mean = masked_true.mean().item() if n_masked > 0 else 0.0
-                true_std = masked_true.std().item() if n_masked > 1 else 0.0
-                
-                # print(f"\n[Val Epoch {epoch}, Batch {batch_idx + 1}/{len(dataloader)}]")
-                # print(f"  NMSE Loss: {loss.item():.6f}")
-                # print(f"  MSE Loss:  {mse.item():.6f}")
-                # print(f"  Masked: {n_masked}/{n_total} ({pct_masked:.2f}%)")
-                # print(f"  Pred (masked): mean={pred_mean:.4f}, std={pred_std:.4f}")
-                # print(f"  True (masked): mean={true_mean:.4f}, std={true_std:.4f}")
-                
+    
     avg_loss = total_loss / total_samples
     return avg_loss
 
@@ -303,39 +272,61 @@ def main():
         lr=config.learning_rate,
         weight_decay=config.weight_decay
     )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.num_epochs, eta_min=1e-6
+    )
+
     
     # ===== Step 5: Training Loop =====
     print("\n" + "=" * 70)
     print("STEP 4: Training")
     print("=" * 70)
     
-    best_val_nmse = float('inf')
-
+    best_val_loss = float('inf')
+    best_epoch = 0
+    epochs_without_improvement = 0
+    
     for epoch in range(1, config.num_epochs + 1):
         print(f"\n{'=' * 70}")
         print(f"Epoch {epoch}/{config.num_epochs}")
         print(f"{'=' * 70}")
         
         # Train for one epoch
-        avg_loss = train_one_epoch(model, train_loader, optimizer, config, epoch)
+        train_loss = train_one_epoch(model, train_loader, optimizer, config, epoch, scheduler=scheduler)
+        print(f"\n[Epoch {epoch}] Train NMSE Loss: {train_loss:.6f}")
         
-        print(f"\n[Epoch {epoch}] Average NMSE Loss: {avg_loss:.6f}")
+        # Validate
+        val_loss = validate_one_epoch(model, val_loader, config, epoch)
+        print(f"[Epoch {epoch}] Val NMSE Loss: {val_loss:.6f}")
+
+        scheduler.step()
+        print(f"[Epoch {epoch}] LR: {optimizer.param_groups[0]['lr']:.2e}")
         
-        # Validation Phase
-        print("\nValidating on validation set...")
-        epoch_val_nmse = validate_one_epoch(model, val_loader, config.device, epoch, config.num_epochs)
+        # Track best validation loss
+        if val_loss < (best_val_loss - config.early_stopping_min_delta):
+            best_val_loss = val_loss
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            # Save best model
+            best_model_path = os.path.join(config.checkpoint_dir, "best_model.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'config': config.__dict__,
+            }, best_model_path)
+            print(f"✓ Best model saved (val_loss: {val_loss:.6f}): {best_model_path}")
+        else:
+            epochs_without_improvement += 1
+            print(
+                f"[Epoch {epoch}] No val improvement "
+                f"({epochs_without_improvement}/{config.early_stopping_patience})"
+            )
         
-        print(f"Epoch [{epoch}/{config.num_epochs}] | Train NMSE: {avg_loss:.4f} | Val NMSE: {epoch_val_nmse:.4f}")
-
-        # Save the best model weights
-        if epoch_val_nmse < best_val_nmse:
-            best_val_nmse = epoch_val_nmse
-            best_val_path = os.path.join(config.checkpoint_dir, f"best_{config.model_name}.pth")
-            torch.save(model.state_dict(), best_val_path)
-            print("  -> Saved new best model.")
-
-
-        # Save checkpoint
+        # Save regular checkpoint
         if epoch % config.save_every == 0:
             checkpoint_path = os.path.join(
                 config.checkpoint_dir,
@@ -345,13 +336,22 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
                 'config': config.__dict__,
             }, checkpoint_path)
-            print(f"  --> Checkpoint saved: {checkpoint_path}")
+            print(f"--> Checkpoint saved: {checkpoint_path}")
+
+        if epochs_without_improvement >= config.early_stopping_patience:
+            print(
+                f"Early stopping triggered at epoch {epoch} "
+                f"(best epoch: {best_epoch}, best val: {best_val_loss:.6f})"
+            )
+            break
     
     print("\n" + "=" * 70)
     print("Training Complete!")
+    print(f"Best model: epoch {best_epoch} with val_loss={best_val_loss:.6f}")
     print("=" * 70)
 
 
