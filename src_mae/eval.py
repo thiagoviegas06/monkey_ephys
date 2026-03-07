@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, TCNReconstructor
+from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, TCNReconstructor, SpatialTCN
 from preprocessing import sample_span_start, robust_session_norm
 
 
@@ -135,10 +135,12 @@ def build_model(model_name: str, base_channels: int = 64) -> nn.Module:
     """Build model for inference.
 
     Args:
-        model_name: One of "tcn", "unet", "simple_cnn", "resnet"
-        base_channels: For UNet/ResNet (ignored for TCN)
+        model_name: One of "spatial_tcn", "tcn", "unet", "simple_cnn", "resnet"
+        base_channels: For UNet/SpatialTCN/ResNet (ignored for TCN)
     """
     model_name = model_name.lower()
+    if model_name == "spatial_tcn":
+        return SpatialTCN(base_channels=base_channels, num_layers=4, dilations=[1, 2, 4, 8])
     if model_name == "tcn":
         return TCNReconstructor(hidden_channels=128, num_layers=7)
     if model_name == "unet":
@@ -147,7 +149,7 @@ def build_model(model_name: str, base_channels: int = 64) -> nn.Module:
         return SimpleCNN(hidden_channels=128, num_layers=6)
     if model_name == "resnet":
         return ResNetReconstructor(hidden_channels=128, num_blocks=8)
-    raise ValueError(f"Unknown model_name '{model_name}' (options: tcn, unet, simple_cnn, resnet)")
+    raise ValueError(f"Unknown model_name '{model_name}' (options: spatial_tcn, tcn, unet, simple_cnn, resnet)")
 
 
 def find_latest_checkpoint(checkpoint_dir: str) -> str:

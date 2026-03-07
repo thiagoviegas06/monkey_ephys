@@ -15,7 +15,7 @@ from pathlib import Path
 from tqdm import tqdm
 from glob import glob
 
-from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, TCNReconstructor
+from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, TCNReconstructor, SpatialTCN
 from losses import masked_nmse_loss, masked_mse_loss, kaggle_aligned_nmse_loss
 from preprocessing import preprocess_non_overlapping
 
@@ -37,12 +37,13 @@ class Config:
     windows_dir = "kaggle_data/masked_windows"  # Where preprocessed windows are saved
     
     # Model
-    model_name = "tcn"  # Options: "tcn", "unet", "simple_cnn", "resnet"
+    model_name = "spatial_tcn"  # Options: "spatial_tcn", "tcn", "unet", "simple_cnn", "resnet"
+    # SpatialTCN-specific
+    base_channels = 128
+    num_spatial_tcn_layers = 6
     # TCN-specific
-    hidden_channels = 128
+    hidden_channels = 256
     num_tcn_layers = 7
-    # UNet-specific
-    base_channels = 64
     
     # Training
     batch_size = 16
@@ -262,7 +263,16 @@ class SBPDataset(Dataset):
 # ============================================================================
 def build_model(config):
     """Build model based on config."""
-    if config.model_name == "tcn":
+    if config.model_name == "spatial_tcn":
+        model = SpatialTCN(
+            base_channels=config.base_channels,
+            num_layers=config.num_spatial_tcn_layers,
+            dilations=[1, 2, 4, 8][:config.num_spatial_tcn_layers]
+        )
+        print(f"Built SpatialTCN with base_channels={config.base_channels}, "
+              f"num_layers={config.num_spatial_tcn_layers}")
+        print(f"  → Processes (W=200, C=96) as 2D spatial grid with Conv2d")
+    elif config.model_name == "tcn":
         model = TCNReconstructor(
             hidden_channels=config.hidden_channels,
             num_layers=config.num_tcn_layers
