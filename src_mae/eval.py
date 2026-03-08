@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 import tqdm
 
-from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor
 from preprocessing import sample_span_start
 from config import Config
 from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, SBPImputer, SBP_TCN_Transformer
@@ -164,17 +163,6 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
     return session_data
 
 
-def build_model(model_name: str, base_channels: int) -> nn.Module:
-    model_name = model_name.lower()
-    if model_name == "unet":
-        return SBP_Reconstruction_UNet(base_channels=base_channels)
-    if model_name == "simple_cnn":
-        return SimpleCNN(hidden_channels=128, num_layers=6)
-    if model_name == "resnet":
-        return ResNetReconstructor(hidden_channels=128, num_blocks=8)
-    raise ValueError(f"Unknown model_name '{model_name}'")
-
-
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
     candidates = sorted(glob(os.path.join(checkpoint_dir, "model_epoch_*.pt")))
     if not candidates:
@@ -198,11 +186,7 @@ def load_model(model_path: str, device: torch.device) -> nn.Module:
             "Checkpoint format not recognized. Expected a dict with 'model_state_dict'."
         )
 
-    config = ckpt.get("config", {})
-    model_name = config.get("model_name", "unet")
-    base_channels = int(config.get("base_channels", 64))
-
-    model = build_model(model_name=model_name, base_channels=base_channels).to(device)
+    model = build_model(config).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     return model
