@@ -328,7 +328,7 @@ def main():
             best_epoch = epoch
             epochs_without_improvement = 0
             # Save best model
-            best_model_path = os.path.join(config.checkpoint_dir, "best_model.pt")
+            best_model_path = os.path.join(config.checkpoint_dir, f"best_model{config.model_name}.pt")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),

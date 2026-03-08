@@ -298,8 +298,9 @@ def run_eval(model_path, data_path, output_csv, window_size, seed):
 
 
 def parse_args():
+    global config
     parser = argparse.ArgumentParser(description="Quick evaluation and Kaggle submission export.")
-    parser.add_argument("--model-path", type=str, default=None, help="Path to checkpoint .pt file")
+    parser.add_argument("--model-path", type=str, default=f"checkpoints/best_model{config.model_name}.pt", help="Path to checkpoint .pt file")
     parser.add_argument(
         "--checkpoint-dir",
         type=str,
@@ -321,7 +322,7 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    model_path = args.model_path if args.model_path else find_latest_checkpoint(args.checkpoint_dir)
+    model_path = args.model_path if args.model_path and os.path.exists(args.model_path) else find_latest_checkpoint(args.checkpoint_dir)
     run_eval(
         model_path=model_path,
         data_path=args.data_path,
