@@ -100,7 +100,6 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None)
         
         # The model's concat step needs floats, but the inverse logic in the loss (~mask) needs bools
         mask_float = batch["mask"].to(config.device).float()
-        mask_bool = batch["mask"].to(config.device).bool()
         mask = batch["mask"].to(config.device)     # (B, W, C)
         channel_var = batch["channel_var"].to(config.device)  # (B, C) per-channel variance from session
         session_ids = batch["session_id"]  # list of session IDs for proper grouping
@@ -163,14 +162,19 @@ def validate_one_epoch(model, dataloader, config, epoch):
             # Move batch to device
             x_sbp = batch["x_sbp"].to(config.device)  # (B, W, C)
             y_sbp = batch["y_sbp"].to(config.device)  # (B, W, C)
+            kin = batch["kin"].to(config.device)      # (B, W, 4)
+            macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()  # (B, 1)
+            
+            # The model's concat step needs floats, but the inverse logic in the loss (~mask) needs bools
+            mask_float = batch["mask"].to(config.device).float()
             mask = batch["mask"].to(config.device)     # (B, W, C)
-            channel_var = batch["channel_var"].to(config.device)  # (B, C)
-            session_ids = batch["session_id"]  # list of session IDs
+            channel_var = batch["channel_var"].to(config.device)  # (B, C) per-channel variance from session
+            session_ids = batch["session_id"]  # list of session IDs for proper grouping
             
             batch_size = x_sbp.size(0)
             
             # ===== Forward pass (no grad tracking) =====
-            pred = model(x_sbp, mask)  # (B, W, C)
+            pred = model(x_sbp, kin, mask_float, macro_timestamp)  # (B, W, C)
             
             # ===== Compute loss =====
             loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)
