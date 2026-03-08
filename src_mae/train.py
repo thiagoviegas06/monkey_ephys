@@ -33,12 +33,26 @@ def build_model(config):
     if config.model_name == "unet":
         model = SBP_Reconstruction_UNet(base_channels=config.base_channels)
         print(f"Built U-Net with base_channels={config.base_channels}")
+    
     elif config.model_name == "simple_cnn":
         model = SimpleCNN(hidden_channels=128, num_layers=6)
         print("Built SimpleCNN")
+    
     elif config.model_name == "resnet":
         model = ResNetReconstructor(hidden_channels=128, num_blocks=8)
         print("Built ResNet Reconstructor")
+    
+    elif config.model_name == "transformer":
+        model = SBPImputer(
+            d_model=config.d_model,
+            nhead=config.nhead,
+            num_layers=config.num_layers,
+            dropout=config.dropout,
+            sbp_channels=config.sbp_channels,
+            kin_channels=config.kin_channels
+        )
+        print(f"Built Transformer Reconstructor with d_model={config.d_model}, nhead={config.nhead}, num_layers={config.num_layers}, dropout={config.dropout}")
+
     elif config.model_name == "tcn_transformer":
         model = SBP_TCN_Transformer(
             sbp_channels=config.sbp_channels,
@@ -50,16 +64,6 @@ def build_model(config):
             dropout=config.dropout
         )
         print("Built Hybrid TCN + Cross-Channel Transformer")
-    elif config.model_name == "transformer":
-        model = SBPImputer(
-            d_model=config.d_model,
-            nhead=config.nhead,
-            num_layers=config.num_layers,
-            dropout=config.dropout,
-            sbp_channels=config.sbp_channels,
-            kin_channels=config.kin_channels
-        )
-        print(f"Built Transformer Reconstructor with d_model={config.d_model}, nhead={config.nhead}, num_layers={config.num_layers}, dropout={config.dropout}")
     else:
         raise ValueError(f"Unknown model: {config.model_name}")
     
