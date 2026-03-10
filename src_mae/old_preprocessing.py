@@ -197,13 +197,14 @@ def get_num_windows(num_bins, desired_window_size=200):
         return 1
     
 
-def apply_random_mask_to_window(sbp, start_bin, end_bin, rng, channels_per_bin=30):
+def apply_random_mask_to_window(sbp, start_bin, end_bin, rng, min_channels_per_bin=30, max_channels_per_bin=50):
     W, C = sbp.shape
 
     x = sbp.copy()
     mask = np.zeros((W, C), dtype=np.bool_)
 
     for t in range(start_bin, end_bin):
+        channels_per_bin = rng.integers(min_channels_per_bin, max_channels_per_bin + 1)
         masked_channels = rng.choice(C, size=channels_per_bin, replace=False)
         x[t, masked_channels] = 0.0
         mask[t, masked_channels] = True
@@ -261,7 +262,7 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
             L = sample_span_len(rng, W=window_size)
             t0 = sample_span_start(rng, W=window_size, L=L)
             t1 = t0 + L
-            x, M = apply_random_mask_to_window(y, t0, t1, rng, channels_per_bin=30)
+            x, M = apply_random_mask_to_window(y, t0, t1, rng, min_channels_per_bin=30, max_channels_per_bin=50)
 
             sample = {
                 "x_sbp": x.astype(np.float32),

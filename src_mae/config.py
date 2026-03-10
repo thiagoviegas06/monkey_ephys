@@ -12,7 +12,7 @@ class Config:
     seed = 42
     
     # Preprocessing
-    preprocess = False  # Set True to run preprocessing (only needed once)
+    preprocess = True  # Set True to run preprocessing (only needed once)
     windows_dir = "kaggle_data/masked_windows"  # Where preprocessed windows are saved
     
     # Model
