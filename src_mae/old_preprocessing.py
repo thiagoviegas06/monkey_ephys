@@ -174,7 +174,7 @@ def sample_window_start_containing_trial(starts, ends, N, W, rng):
     w0 = int(rng.integers(lo, hi + 1))
     return w0, ti
 
-def apply_mask_to_window(sbp, bin_mask):
+def apply_mask_to_window(sbp, bin_mask, K):
     masked_sbp_window = sbp.copy()
     masked_sbp_window[:, bin_mask] = 0
     return masked_sbp_window
@@ -197,16 +197,79 @@ def get_num_windows(num_bins, desired_window_size=200):
         return 1
     
 
-def apply_random_mask_to_window(sbp, start_bin, end_bin, rng, channels_per_bin=30):
+def apply_random_mask_to_window(sbp, start_bin, end_bin, rng, min_channels_per_bin=30, max_channels_per_bin=50):
     W, C = sbp.shape
 
     x = sbp.copy()
     mask = np.zeros((W, C), dtype=np.bool_)
 
     for t in range(start_bin, end_bin):
+        channels_per_bin = rng.integers(min_channels_per_bin, max_channels_per_bin + 1)
         masked_channels = rng.choice(C, size=channels_per_bin, replace=False)
         x[t, masked_channels] = 0.0
         mask[t, masked_channels] = True
+
+    return x, mask
+
+
+def sample_multi_span_lengths_and_starts(rng, W, num_spans=2, min_gap=10, stats=STATS):                                         
+      """                                                                                                                         
+      Sample K non-overlapping span lengths AND positions.                                                                        
+      All spans fit within [0, W) with at least min_gap between them.
+   
+      Returns: list of (t0, t1) tuples
+      """
+      total_gap_space = (num_spans - 1) * min_gap
+      total_budget = W - total_gap_space
+
+      if total_budget < num_spans:
+          # Can't fit K spans, fall back to 1
+          L = sample_span_len(rng, W, stats=stats)
+          t0 = sample_span_start(rng, W, L)
+          return [(t0, t0 + L)]
+
+      # Sample lengths for each span
+      lengths = []
+      remaining_budget = total_budget
+
+      for i in range(num_spans):
+          # Reserve minimum budget for remaining spans
+          min_reserved = (num_spans - i - 1) * 20
+          max_possible = remaining_budget - min_reserved
+
+          # Sample from triangular, but clip to what's available
+          L = sample_span_len(rng, max_possible, stats=stats)
+          lengths.append(L)
+          remaining_budget -= L
+
+      # Now sample positions with guaranteed gaps
+      spans = []
+      pos = 0
+
+      for i, length in enumerate(lengths):
+          # Random offset within this span's available range
+          available_for_offset = W - sum(lengths) - total_gap_space
+          offset = rng.integers(0, available_for_offset + 1) if available_for_offset > 0 else 0
+
+          t0 = pos + offset
+          t1 = t0 + length
+          spans.append((t0, t1))
+
+          pos = t1 + min_gap  # move past this span + gap
+
+      return spans
+
+def apply_multi_span_mask_to_window(sbp, spans, num_spans=2, rng=None, min_gap=10):
+    W, C = sbp.shape
+    x = sbp.copy()
+    mask = np.zeros((W, C), dtype=bool)
+
+    #spans = sample_multi_span_lengths_and_starts(rng, W, num_spans, min_gap)
+
+    for t0, t1 in spans:
+        channels = rng.choice(C, size=rng.integers(20, 40), replace=False)
+        x[t0:t1, channels] = 0.0
+        mask[t0:t1, channels] = True
 
     return x, mask
 
@@ -258,10 +321,13 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
         for w0 in w0s:
             y = sbp[w0:w0 + window_size]          # (W,96)
             kin_w = kin[w0:w0 + window_size]      # (W,4)
-            L = sample_span_len(rng, W=window_size)
-            t0 = sample_span_start(rng, W=window_size, L=L)
-            t1 = t0 + L
-            x, M = apply_random_mask_to_window(y, t0, t1, rng, channels_per_bin=30)
+            #L = sample_span_len(rng, W=window_size)
+            #t0 = sample_span_start(rng, W=window_size, L=L)
+            #t1 = t0 + L
+            #x, M = apply_random_mask_to_window(y, t0, t1, rng, min_channels_per_bin=30, max_channels_per_bin=50)
+            random_two_three = rng.integers(2, 4)  # 2 or 3 spans
+            spans = sample_multi_span_lengths_and_starts(rng, window_size, num_spans=random_two_three, min_gap=10)
+            x, M = apply_multi_span_mask_to_window(y, spans, num_spans=random_two_three, rng=rng, min_gap=10)
 
             sample = {
                 "x_sbp": x.astype(np.float32),
@@ -271,7 +337,7 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
                 "channel_var": session_variance.astype(np.float32),  # (96,) per-channel variance from full session
                 "session_id": session.session_id,
                 "w0": int(w0),
-                "span": (int(t0), int(t1)),
+                "spans": spans,
                 "day": float(session.day),
                 "day_from_nearest": float(session.day_from_nearest),
             }
@@ -281,7 +347,7 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
                 pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
             
             if len(w0s) <= 5 or w0 == w0s[0]:  # Print first window or if few windows
-                print(f"  Saved: {session.session_id}_{w0}.pkl | span=({t0},{t1}) | masked={int(M.sum())} positions")
+                print(f"  Saved: {session.session_id}_{w0}.pkl | spans={spans} | masked={int(M.sum())} positions")
 
 
 def preprocess(data_path, window_size=128, K=500, seed=0, p_mask_trial=0.03):

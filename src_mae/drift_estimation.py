@@ -147,6 +147,21 @@ def channel_fingerprint(X):
 def cosine_sim(a, b, eps=1e-9):
     return float(np.dot(a, b) / ((np.linalg.norm(a) * np.linalg.norm(b)) + eps))
 
+def sliding_channel_corr(X, window=2000):
+    T, C = X.shape
+    corrs = []
+
+    for t in range(0, T-window, window):
+        w = X[t:t+window]
+        corr = np.mean(np.corrcoef(w.T))
+        corrs.append(corr)
+
+    plt.plot(corrs)
+    plt.title("Average Channel Correlation Over Time")
+    plt.xlabel("Window")
+    plt.ylabel("Mean Correlation")
+    plt.show()
+
 def similarity_curve(fingerprints):
 
     S = len(fingerprints)
@@ -200,10 +215,15 @@ if __name__ == "__main__":
     corr_raw = np.corrcoef(fingerprints_raw)
     corr_norm = np.corrcoef(fingerprints_norm)
 
+
+   #----plot fingerprints side by side for all sessions---
+   #first flip x and y for better visualization (channels on y-axis)
+    
+
     # --- similarity vs distance (cosine) ---
     dist = []
     sim_raw = []
-    sim_norm = []
+    sim_norm = []   
 
     S = len(session_ids)
     for i in range(S):
@@ -220,7 +240,7 @@ if __name__ == "__main__":
     # --- plot similarity vs distance ---
     raw_curve = similarity_curve(fingerprints_raw)
     norm_curve = similarity_curve(fingerprints_norm)
-
+    """
     plt.figure(figsize=(8,5))
     plt.plot(raw_curve, label="RAW")
     plt.plot(norm_curve, label="NORMALIZED")
@@ -228,5 +248,34 @@ if __name__ == "__main__":
     plt.ylabel("Mean similarity")
     plt.title("Session similarity vs time")
     plt.legend()
+    plt.show()"""
+
+    fingerprints_raw = fingerprints_raw.T
+    fingerprints_norm = fingerprints_norm.T
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.title("Fingerprints (RAW)")
+    plt.imshow(fingerprints_raw, aspect='auto', origin='lower')
+    plt.colorbar()
+    plt.subplot(1, 2, 2)
+    plt.title("Fingerprints (NORMALIZED)")
+    plt.imshow(fingerprints_norm, aspect='auto', origin='lower')
+    plt.colorbar()
     plt.show()
+
+
+    from sklearn.decomposition import PCA
+    pca = PCA(n_components=2)
+    raw_2d = pca.fit_transform(fingerprints_raw)
+    norm_2d = pca.fit_transform(fingerprints_norm)
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.title("PCA of RAW fingerprints")
+    plt.scatter(raw_2d[:, 0], raw_2d[:, 1])
+    plt.subplot(1, 2, 2)
+    plt.title("PCA of NORMALIZED fingerprints")
+    plt.scatter(norm_2d[:, 0], norm_2d[:, 1])
+    plt.show()
+
+
 
