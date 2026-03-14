@@ -6,5 +6,7 @@ analyze_predictions.ipynb
 /src_mae/__pycache__
 *.zip
 /.vscode
-/checkpoints
+/checkpoints*
+/logs
 *.pth
+

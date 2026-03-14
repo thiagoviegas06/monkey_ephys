@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 from glob import glob
 from pathlib import Path
 
@@ -163,8 +164,13 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
     return session_data
 
 
+def natural_keys(text):
+    return [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', text)]
+
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
-    candidates = sorted(glob(os.path.join(checkpoint_dir, "model_epoch_*.pt")))
+    candidates = glob(os.path.join(checkpoint_dir, "model_epoch_*.pt"))
+    candidates.sort(key=natural_keys)
+
     if not candidates:
         raise FileNotFoundError(
             f"No checkpoints found in '{checkpoint_dir}'. "
@@ -270,7 +276,13 @@ def build_submission(sample_submission_path: str, predictions: dict, output_csv:
     return sub
 
 
-def run_eval(model_path, data_path, output_csv, window_size, seed):
+def run_eval(model_path, data_path, output_csv, window_size, seed, args):
+    global config
+    config.window_size = args.window_size
+    config.windows_dir = f"kaggle_data/masked_windows_{config.window_size}"
+    config.checkpoint_dir = f"checkpoints_{config.window_size}"
+
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     metadata_csv = os.path.join(data_path, "metadata.csv")
     sample_submission_csv = os.path.join(data_path, "sample_submission.csv")
@@ -300,7 +312,7 @@ def run_eval(model_path, data_path, output_csv, window_size, seed):
 def parse_args():
     global config
     parser = argparse.ArgumentParser(description="Quick evaluation and Kaggle submission export.")
-    parser.add_argument("--model-path", type=str, default=f"checkpoints/best_model{config.model_name}.pt", help="Path to checkpoint .pt file")
+    parser.add_argument("--model-path", type=str, default=f"checkpoints/best_model_{config.model_name}.pt", help="Path to checkpoint .pt file")
     parser.add_argument(
         "--checkpoint-dir",
         type=str,
@@ -322,11 +334,19 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    
+    args.checkpoint_dir = f"checkpoints_{args.window_size}"
+    args.model_path = os.path.join(args.checkpoint_dir, f"best_model_{config.model_name}.pt")
+    args.output_csv = f"submission_eval_{args.window_size}.csv"
+
+    print(f"Model Path in Args: {args.model_path}")
     model_path = args.model_path if args.model_path and os.path.exists(args.model_path) else find_latest_checkpoint(args.checkpoint_dir)
+
     run_eval(
         model_path=model_path,
         data_path=args.data_path,
         output_csv=args.output_csv,
         window_size=args.window_size,
         seed=args.seed,
+        args=args
     )

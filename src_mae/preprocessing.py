@@ -6,46 +6,6 @@ import os
 from pathlib import Path
 from tqdm import tqdm
 
-# paste your rows here once; or load from csv
-STATS = [
-    (51, 58.5, 82),
-    (59, 64.0, 183),
-    (56, 59.0, 70),
-    (47, 54.5, 117),
-    (52, 57.5, 152),
-    (46, 59.0, 108),
-    (63, 68.0, 104),
-    (51, 55.5, 108),
-    (54, 61.0, 114),
-    (54, 61.5, 123),
-    (54, 57.5, 86),
-    (51, 54.0, 103),
-    (38, 59.0, 119),
-    (53, 60.5, 167),
-    (51, 53.0, 58),
-    (54, 59.0, 131),
-    (53, 65.5, 72),
-    (54, 65.5, 129),
-    (55, 72.0, 101),
-    (53, 69.5, 122),
-    (37, 57.0, 128),
-    (54, 62.5, 117),
-    (55, 68.0, 121),
-    (37, 58.0, 90),
-]
-
-def sample_span_len(rng: np.random.Generator, W: int, stats=STATS) -> int:
-    """
-    Sample a contiguous masked span length, clipped to window size W.
-    Uses a mixture of per-session triangular distributions.
-    """
-    mn, med, mx = stats[int(rng.integers(0, len(stats)))]
-    # triangular expects left, mode, right
-    L = rng.triangular(left=mn, mode=med, right=mx)
-    L = int(np.round(L))
-    return max(1, min(W, L))
-
-
 def sample_span_start(rng, W, L, p_uniform=0.6, skew_strength=3.0):
     """
     Sample t0 in [0, W-L] with a mixture of:
@@ -175,12 +135,6 @@ def sample_window_start_containing_trial(starts, ends, N, W, rng):
     w0 = int(rng.integers(lo, hi + 1))
     return w0, ti
 
-def apply_mask_to_window(sbp, bin_mask):
-    masked_sbp_window = sbp.copy()
-    masked_sbp_window[:, bin_mask] = 0
-    return masked_sbp_window
-
-
 def non_overlapping_windows(N, W):
     """Generate non-overlapping window start indices."""
     w0s = []
@@ -190,43 +144,28 @@ def non_overlapping_windows(N, W):
         w0 += W
     return w0s
 
-def get_num_windows(num_bins, desired_window_size=200):
-    """Determine window size based on trial length."""
-    if num_bins >= desired_window_size:
-        return num_bins // desired_window_size
-    else:
-        return 1
-    
-
-def apply_random_mask_to_window(sbp, start_bin, end_bin, rng, channels_per_bin=30):
+def apply_elementwise_random_mask(sbp, rng, mask_fraction=0.4):
+    """
+    Randomly masks `mask_fraction` of ALL individual data points 
+    in the window (not full channels or specific time spans).
+    """
     W, C = sbp.shape
-
     x = sbp.copy()
     mask = np.zeros((W, C), dtype=np.bool_)
 
-    for t in range(start_bin, end_bin):
-        masked_channels = rng.choice(C, size=channels_per_bin, replace=False)
-        x[t, masked_channels] = 0.0
-        mask[t, masked_channels] = True
+    total_elements = W * C
+    num_masked = int(np.round(total_elements * mask_fraction))
+
+    # Pick random 1D indices representing the locations to mask
+    masked_indices_1d = rng.choice(total_elements, size=num_masked, replace=False)
+    
+    # Convert back to 2D indices
+    t_idx, c_idx = np.unravel_index(masked_indices_1d, (W, C))
+
+    x[t_idx, c_idx] = 0.0
+    mask[t_idx, c_idx] = True
 
     return x, mask
-
-def compute_per_channel_variance(sbp, w0, W):
-    window = sbp[w0:w0 + W]
-    variances = np.var(window, axis=0)
-    return variances
-
-def compute_global_channel_variance(sbp_sessions, w0, W):
-    all_windows = []
-    for sbp in sbp_sessions:
-        if sbp.shape[0] >= w0 + W:
-            window = sbp[w0:w0 + W]
-            all_windows.append(window)
-    if not all_windows:
-        raise ValueError("No valid windows found for variance computation")
-    all_data = np.concatenate(all_windows, axis=0)
-    global_variance = np.var(all_data, axis=0)
-    return global_variance
 
 def compute_session_channel_variance(sbp):
     session_variance = np.var(sbp, axis=0)
@@ -234,7 +173,7 @@ def compute_session_channel_variance(sbp):
 
 
 def preprocess_non_overlapping(data_path, window_size=128, seed=0):
-    out_dir = os.path.join(data_path, "masked_windows")
+    out_dir = os.path.join(data_path, f"masked_windows_{window_size}")
     os.makedirs(out_dir, exist_ok=True)
     sessions, max_bin_count = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
 
@@ -252,122 +191,52 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
         if N < window_size:
             continue
             
-        # Dynamically calculate 50% of the total channels (e.g., 48 if C=96)
-        C = sbp.shape[1]
-        max_mask_channels = int(C * 0.50)
-
         rng = np.random.default_rng(seed + (hash(session.session_id) & 0xFFFFFFFF))
         w0s = non_overlapping_windows(N, window_size)
-        print(f"{session.session_id} | N={N} | windows={len(w0s)}")
+        
+        # tqdm.write is better than print when using tqdm
+        tqdm.write(f"{session.session_id} | N={N} | windows={len(w0s)}")
 
         session_variance = compute_session_channel_variance(sbp)
-        print(f"  Session channel variance shape: {session_variance.shape}")
 
         for w0 in w0s:
             y = sbp[w0:w0 + window_size]          # (W, C)
             kin_w = kin[w0:w0 + window_size]      # (W, 4)
 
-            # Generate 2 independent sets
-            for set_idx in range(2):
+            # Generate 3 independent random 40% masks over the same window
+            for mask_idx in range(3):
                 
-                # Sample the temporal span ONCE per set so the progressive 
-                # masking occurs over the same continuous block of time
-                L = sample_span_len(rng, W=window_size)
-                t0 = sample_span_start(rng, W=window_size, L=L)
-                t1 = t0 + L
+                # Dynamically generate an entirely random 40% spread mask
+                x, M = apply_elementwise_random_mask(y, rng, mask_fraction=0.4)
 
-                # Generate 10 progressively masked versions
-                for step in range(10):
+                sample = {
+                    "x_sbp": x.astype(np.float32),
+                    "y_sbp": y.astype(np.float32),
+                    "mask": M,
+                    "kin": kin_w.astype(np.float32),
+                    "channel_var": session_variance.astype(np.float32),
+                    "session_id": session.session_id,
+                    "w0": int(w0),
+                    "span": (0, window_size), # Entire window is subjected to masking
+                    "day": float(session.day),
+                    "day_from_nearest": float(session.day_from_nearest),
                     
-                    # Scale from 10% to 100% of the maximum allowed masking (50% of total channels)
-                    # Step 0 = 10% of 48 = ~5 channels
-                    # Step 9 = 100% of 48 = 48 channels
-                    fraction = (step + 1) / 10.0
-                    channels_per_bin = int(np.round(max_mask_channels * fraction))
-                    
-                    # Calling this dynamically generates a completely new random mask 
-                    # layout for the selected number of channels.
-                    x, M = apply_random_mask_to_window(y, t0, t1, rng, channels_per_bin=channels_per_bin)
+                    # Save the augmentation metadata for downstream tracking
+                    "mask_idx": mask_idx, 
+                    "mask_fraction": 0.4
+                }
 
-                    sample = {
-                        "x_sbp": x.astype(np.float32),
-                        "y_sbp": y.astype(np.float32),
-                        "mask": M,
-                        "kin": kin_w.astype(np.float32),
-                        "channel_var": session_variance.astype(np.float32),
-                        "session_id": session.session_id,
-                        "w0": int(w0),
-                        "span": (int(t0), int(t1)),
-                        "day": float(session.day),
-                        "day_from_nearest": float(session.day_from_nearest),
-                        
-                        # Save the augmentation metadata for downstream tracking
-                        "set_idx": set_idx, 
-                        "mask_step": step,
-                        "channels_masked_per_bin": channels_per_bin
-                    }
-
-                    # Update filename to prevent overwrites and identify the augmentation
-                    filename = f"{session.session_id}_{w0}_set{set_idx}_step{step}.pkl"
-                    sample_path = os.path.join(out_dir, filename)
-                    
-                    with open(sample_path, "wb") as f:
-                        pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
+                # Update filename to prevent overwrites and identify the augmentation
+                filename = f"{session.session_id}_{w0}_mask{mask_idx}.pkl"
+                sample_path = os.path.join(out_dir, filename)
+                
+                with open(sample_path, "wb") as f:
+                    pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
             
             # Print a status update for the first window to confirm it's working
             if w0 == w0s[0]:  
-                print(f"  Saved 20 augmented variations for window {w0}")
+                tqdm.write(f"  Saved 3 augmented variations (40% masking) for window {w0}")
 
-
-def preprocess(data_path, window_size=128, K=500, seed=0, p_mask_trial=0.03):
-    sessions, max_bin_count = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
-
-    for session in sessions:
-        if session.isTest():
-            print(f"Skipping test session {session.session_id} for now...")
-            continue
-
-        sbp, kin, starts_bins, end_bins = session.load_data(data_path)
-        if sbp is None:
-            continue
-        N = sbp.shape[0]
-        if N < window_size:
-            continue
-
-        seed_sess = seed + zlib.adler32(session.session_id.encode("utf-8"))
-        rng = np.random.default_rng(seed_sess)
-
-        samples = []
-        w0s = []
-
-        for _ in range(K):
-            out = sample_window_start_containing_trial(starts_bins, end_bins, N, window_size, rng)
-            if out is None:
-                continue
-            w0, ti = out
-
-            window_sbp = sbp[w0:w0 + window_size]
-            window_kin = kin[w0:w0 + window_size]
-
-            s_t, e_t = int(starts_bins[ti]), int(end_bins[ti])
-            assert w0 <= s_t and e_t <= w0 + window_size
-
-            a = s_t - w0
-            b = e_t - w0
-
-            x = window_sbp.copy()
-            mask_vec = np.zeros(96, dtype=np.float32)
-
-            if rng.random() < p_mask_trial:
-                masked_channels = rng.choice(96, size=30, replace=False)
-                x[a:b, masked_channels] = 0.0
-                mask_vec[masked_channels] = 1.0
-
-            samples.append((x, window_kin, window_sbp, mask_vec, a, b))
-            w0s.append(w0)
-
-        if w0s:
-            print(f"{session.session_id} | N={N} | samples={len(samples)} | w0[min,max]=({min(w0s)},{max(w0s)})")
 
 def generate_one_masked_window(data_path, window_size=200, seed=0, session_id=None):
     """
@@ -417,14 +286,9 @@ def generate_one_masked_window(data_path, window_size=200, seed=0, session_id=No
     y = sbp[w0:w0 + window_size].copy()
     kin_w = kin[w0:w0 + window_size].copy()
     
-    # Sample masked span parameters
-    L = sample_span_len(rng, W=window_size)
-    t0 = sample_span_start(rng, W=window_size, L=L)
-    t1 = t0 + L
-    
-    x, M = apply_random_mask_to_window(y, t0, t1, rng, channels_per_bin=30)
+    x, M = apply_elementwise_random_mask(y, rng, mask_fraction=0.4)
 
-    print(f"Generated masked window for session {session.session_id}, w0={w0}, masked span=({t0},{t1}), masked positions={int(M.sum())}")
+    print(f"Generated masked window for session {session.session_id}, w0={w0}, masked positions={int(M.sum())}")
     
     return {
         "x_sbp": x.astype(np.float32),
@@ -433,7 +297,7 @@ def generate_one_masked_window(data_path, window_size=200, seed=0, session_id=No
         "kin": kin_w.astype(np.float32),
         "session_id": session.session_id,
         "w0": int(w0),
-        "span": (int(t0), int(t1)),
+        "span": (0, window_size),
     }
 
 
@@ -456,9 +320,9 @@ def visualize_masked_window(sample, save_path=None):
     y_sbp = sample["y_sbp"]
     kin = sample["kin"]
     mask = sample["mask"]  # (W, 96) 2D mask
-    t0, t1 = sample["span"]
     session_id = sample["session_id"]
     w0 = sample["w0"]
+    W, C = y_sbp.shape
     
     # Which channels are masked anywhere in the window
     mask_vec = mask.any(axis=0)  # (96,) boolean - True if channel masked in any bin
@@ -472,7 +336,6 @@ def visualize_masked_window(sample, save_path=None):
     
     # Ground truth SBP
     im0 = axes[0, 0].imshow(y_sbp.T, aspect="auto", interpolation="nearest", origin="lower", cmap='viridis')
-    axes[0, 0].axvspan(t0, t1, color='red', alpha=0.15, linewidth=2, edgecolor='red')
     axes[0, 0].set_title("Ground-truth SBP window")
     axes[0, 0].set_xlabel("Window bin")
     axes[0, 0].set_ylabel("Channel")
@@ -480,7 +343,6 @@ def visualize_masked_window(sample, save_path=None):
     
     # Masked input SBP - NaN values appear white
     im1 = axes[0, 1].imshow(x_sbp_display.T, aspect="auto", interpolation="nearest", origin="lower", cmap='viridis')
-    axes[0, 1].axvspan(t0, t1, color='red', alpha=0.15, linewidth=2, edgecolor='red')
     axes[0, 1].set_title("Masked input SBP window (white = masked)")
     axes[0, 1].set_xlabel("Window bin")
     axes[0, 1].set_ylabel("Channel")
@@ -494,7 +356,6 @@ def visualize_masked_window(sample, save_path=None):
         mean_masked_in = x_sbp[:, masked_channels].mean(axis=1)
         axes[1, 0].plot(mean_masked_true, label="mean masked channels (true)", linewidth=1.7)
         axes[1, 0].plot(mean_masked_in, label="mean masked channels (input)", linewidth=1.7)
-    axes[1, 0].axvspan(t0, t1, color="gray", alpha=0.2)
     axes[1, 0].set_title("SBP time profile in window")
     axes[1, 0].set_xlabel("Window bin")
     axes[1, 0].set_ylabel("Amplitude")
@@ -502,17 +363,17 @@ def visualize_masked_window(sample, save_path=None):
     
     # Kinematics
     axes[1, 1].plot(kin)
-    axes[1, 1].axvspan(t0, t1, color="gray", alpha=0.2)
     axes[1, 1].set_title("Kinematics (4 channels)")
     axes[1, 1].set_xlabel("Window bin")
     axes[1, 1].set_ylabel("Value")
     
     mask_count_positions = int(mask.sum())  # Total masked (bin, channel) positions
-    mask_count_channels = int(mask_vec.sum())  # Unique channels masked
+    mask_pct = (mask_count_positions / (W * C)) * 100
+    
     fig.suptitle(
         (
-            f"session={session_id}  w0={w0}  masked_span=[{t0},{t1})  "
-            f"span_len={t1-t0}  masked_pos={mask_count_positions}  unique_chans={mask_count_channels}"
+            f"session={session_id}  w0={w0} | "
+            f"Total window size={W}x{C} | Masked points={mask_count_positions} ({mask_pct:.1f}%)"
         ),
         fontsize=12,
     )
@@ -527,7 +388,4 @@ def visualize_masked_window(sample, save_path=None):
 
 
 if __name__ == "__main__":
-    #preprocess("kaggle_data")
     preprocess_non_overlapping("kaggle_data", window_size=200, seed=0)
-
-    

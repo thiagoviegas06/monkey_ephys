@@ -8,6 +8,7 @@ import os
 import pickle
 import csv
 import numpy as np
+import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -205,6 +206,11 @@ def main():
     """Main training function."""
     global config
     
+    args = parse_args()
+    config.window_size = args.window_size
+    config.windows_dir = f"kaggle_data/masked_windows_{config.window_size}"
+    config.checkpoint_dir = f"checkpoints_{config.window_size}"
+
     print("=" * 70)
     print("Training Configuration")
     print("=" * 70)
@@ -328,7 +334,7 @@ def main():
             best_epoch = epoch
             epochs_without_improvement = 0
             # Save best model
-            best_model_path = os.path.join(config.checkpoint_dir, f"best_model{config.model_name}.pt")
+            best_model_path = os.path.join(config.checkpoint_dir, f"best_model_{config.model_name}.pt")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -373,6 +379,14 @@ def main():
     print(f"Best model: epoch {best_epoch} with val_loss={best_val_loss:.6f}")
     print("=" * 70)
 
+def parse_args():
+    global config
+    parser = argparse.ArgumentParser(description="Train for augmented windows.")
+    parser.add_argument("--window-size", type=int, default=200, help="Evaluation window size")
+    parser.add_argument("--data-path", type=str, default="kaggle_data", help="Data root path")
+    parser.add_argument("--seed", type=int, default=42, help="Seed for window randomization")
+
+    return parser.parse_args()
 
 if __name__ == "__main__":
     main()
