@@ -7,8 +7,9 @@ class Config:
     """Training configuration - modify these parameters"""
     
     # Data
+    preprocess_type = "overlapping_dynamic"  # Options: "non_overlapping", "overlapping_dynamic"
     data_path = "kaggle_data"
-    window_size = 400
+    window_size = 200
     seed = 42
     
     # Preprocessing

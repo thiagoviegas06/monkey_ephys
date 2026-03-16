@@ -17,14 +17,21 @@ from tqdm import tqdm
 from glob import glob
 
 from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, SBPImputer, SBP_TCN_Transformer
-from dataloader import SBPDataset, get_dataloaders
 from losses import masked_nmse_loss, kaggle_aligned_nmse_loss
-from old_preprocessing import preprocess_non_overlapping
-from config import Config
 
+
+from config import Config
 
 # Create configuration instance as global variable for easy access in functions
 config = Config()
+
+if config.preprocess_type == "non_overlapping":
+    from dataloader import SBPDataset, get_dataloaders
+    from old_preprocessing import preprocess_non_overlapping
+elif config.preprocess_type == "overlapping_dynamic":
+    from dataloader import SBPDatasetDynamic, get_dataloaders_dynamic
+else:
+    raise ValueError(f"Unknown preprocessing option: {config.preprocess_type}")
 
 # ============================================================================
 # Model Builder
@@ -197,6 +204,58 @@ def validate_one_epoch(model, dataloader, config, epoch):
     avg_loss = total_loss / total_samples
     return avg_loss
 
+def preprocess():
+    global config
+    print("\n" + "=" * 70)
+    print("STEP 1: Preprocessing - Generating Windows")
+    print("=" * 70)
+    print(f"Calling preprocess_non_overlapping()...")
+    print(f"  data_path: {config.data_path}")
+    print(f"  window_size: {config.window_size}")
+    print(f"  seed: {config.seed}")
+    print()
+
+    if config.preprocess_type == "non_overlapping":
+        preprocess_non_overlapping(
+            data_path=config.data_path,
+            window_size=config.window_size,
+            seed=config.seed
+        )
+    
+    elif config.preprocess_type == "overlapping_dynamic": 
+        print("This is dynamic preprocessing with random masks applied on-the-fly in the DataLoader. No need to generate windows here.")
+    
+    else:
+        raise ValueError(f"Unknown preprocess_type: {config.preprocess_type}")
+    
+    
+    print(f"\n✓ Preprocessing complete! Windows saved to {config.windows_dir}")
+
+def train_val_loader():
+    global config
+
+    if config.preprocess_type == "non_overlapping":
+        train_loader, val_loader, train_dataset, val_dataset = get_dataloaders(
+            windows_dir=config.windows_dir,
+            batch_size=config.batch_size,
+            val_split=0.2,
+            shuffle=True,
+            num_workers=4,  # Parallel data loading
+            pin_memory=True if config.device == "cuda" else False
+        )
+
+    elif config.preprocess_type == "overlapping_dynamic":
+        train_loader, val_loader, train_dataset, val_dataset = get_dataloaders_dynamic(
+            config, 
+            batch_size=config.batch_size,
+            val_split=0.2,
+            num_workers=4,  # Parallel data loading
+        )
+
+    else:
+        raise ValueError(f"Unknown preprocess_type: {config.preprocess_type}")
+    
+    return train_loader, val_loader, train_dataset, val_dataset
 
 
 # ============================================================================
@@ -225,25 +284,11 @@ def main():
     
     # ===== Step 1: Preprocessing (if needed) =====
     if config.preprocess:
-        print("\n" + "=" * 70)
-        print("STEP 1: Preprocessing - Generating Windows")
-        print("=" * 70)
-        print(f"Calling preprocess_non_overlapping()...")
-        print(f"  data_path: {config.data_path}")
-        print(f"  window_size: {config.window_size}")
-        print(f"  seed: {config.seed}")
-        print()
-        
-        preprocess_non_overlapping(
-            data_path=config.data_path,
-            window_size=config.window_size,
-            seed=config.seed
-        )
-        
-        print(f"\n✓ Preprocessing complete! Windows saved to {config.windows_dir}")
+        preprocess()
     else:
         print(f"\nSkipping preprocessing (config.preprocess=False)")
         print(f"Using existing windows from: {config.windows_dir}")
+
     
     # Create checkpoint directory
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -252,29 +297,10 @@ def main():
     print("\n" + "=" * 70)
     print("STEP 2: Loading Preprocessed Data")
     print("=" * 70)
-    
 
-    train_loader, val_loader, train_dataset, val_dataset = get_dataloaders(
-        windows_dir=config.windows_dir,
-        batch_size=config.batch_size,
-        val_split=0.2,
-        shuffle=True,
-        num_workers=4,  # Parallel data loading
-        pin_memory=True if config.device == "cuda" else False
-    )
-
-    train_dataset = SBPDataset(windows_dir=config.windows_dir)
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=4,  # Parallel data loading
-        pin_memory=True if config.device == "cuda" else False
-    )
+    train_loader, val_loader, train_dataset, val_dataset = train_val_loader()
     
     print(f"\nDataLoader created:")
-    print(f"  Total windows: {len(train_dataset)}")
     print(f"  Train Batches per epoch: {len(train_loader)}")
     print(f"  Train Samples per epoch: {len(train_dataset)}")
     print(f"  Validation Batches per epoch: {len(val_loader)}")
