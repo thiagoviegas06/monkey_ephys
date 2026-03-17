@@ -254,7 +254,7 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
             if len(w0s) <= 5 or w0 == w0s[0]:  # Print first window or if few windows
                 print(f"  Saved: {session.session_id}_{w0}.pkl | spans={spans} | masked={int(M.sum())} positions")
 
-def preprocess_overlapping_dynamic(data_path, window_size=200, step_size=50, lag_bins=5):
+def preprocess_overlapping_dynamic(data_path, window_size=200, step_size=50, lag_bins=0):
     """
     Saves ONLY ground truth overlapping windows. Masking is left to the DataLoader.
     Applies biological kinematic shift.
@@ -274,8 +274,13 @@ def preprocess_overlapping_dynamic(data_path, window_size=200, step_size=50, lag
         if sbp is None: continue
         
         # 1. Apply Kinematic Shift
-        sbp = sbp[:-lag_bins]
-        kin = kin[lag_bins:]
+        kin_aligned = np.zeros_like(kin)
+        if lag_bins > 0:
+            kin_aligned[lag_bins:] = kin[:-lag_bins]
+        else:
+            kin_aligned = kin
+        kin = kin_aligned
+
         N = sbp.shape[0]
         
         if N < window_size: continue

@@ -119,6 +119,7 @@ def build_randomized_windows_from_mask(mask_2d: np.ndarray, window_size: int, rn
 
 
 def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regions=10):
+    global config
     masked_files = os.path.join(data_path, "test/*_sbp_masked.npy")
     session_data = {}
 
@@ -131,6 +132,14 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
         masked_sbp = np.load(file)
         mask = np.load(file.replace("sbp_masked", "mask"))
         kin = np.load(file.replace("sbp_masked", "kinematics"))
+
+        # Apply biological kinematic shift (zero padded) for consistency with training
+        kin_aligned = np.zeros_like(kin)
+        if config.lag_bins > 0:
+            kin_aligned[config.lag_bins:] = kin[:-config.lag_bins]
+        else:
+            kin_aligned = kin
+        kin = kin_aligned
 
         segs = mask_segments(mask)
         windows = build_randomized_windows_from_mask(mask, window_size, rng)
@@ -200,6 +209,7 @@ def load_model(model_path: str, device: torch.device) -> nn.Module:
 
 @torch.no_grad()
 def predict_sessions(model: nn.Module, session_data: dict, device: torch.device):
+    global config
     predictions = {}
 
     for session_id, info in session_data.items():
@@ -211,6 +221,15 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device)
         # NOTE: You will need to ensure 'macro_timestamp' is added to session_data 
         # in your preprocess_test() function. Using a fallback of 0.0 here just in case.
         macro_timestamp = info.get("macro_timestamp", 0.0)
+
+        lag_bins = config.lag_bins
+
+        kin_shifted = np.roll(kinematics, shift=-lag_bins, axis=0)
+
+        if kinematics.shape[0] > lag_bins:
+            kin_shifted[-lag_bins:] = kin_shifted[-lag_bins - 1]
+
+        kinematics = kin_shifted
 
         pred_full = masked_sbp.copy()
         covered = np.zeros_like(mask, dtype=np.bool_)

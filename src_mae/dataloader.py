@@ -79,7 +79,7 @@ class SBPDataset(Dataset):
 from preprocessing import sample_multi_span_lengths_and_starts, apply_multi_span_mask_to_window, compute_session_channel_variance
 
 class SBPDatasetDynamic(Dataset):
-    def __init__(self, sessions_data, is_train=True, samples_per_epoch=10000, window_size=200):
+    def __init__(self, sessions_data, is_train=True, samples_per_epoch=128000, window_size=200):
         self.sessions_data = sessions_data
         self.is_train = is_train
         self.window_size = window_size
@@ -112,7 +112,7 @@ class SBPDatasetDynamic(Dataset):
             
             # 4. Fast inline dynamic masking (bypasses old_preprocessing.py)
             num_spans = torch.randint(2, 4, (1,)).item()
-            # Approx triangular distribution (45 to 85 length)
+            # Approx triangular distribution (45 to 85 length for 400 window, 20, 50 for 200)
             span_lengths = torch.randint(45, 85, (num_spans,)) 
             
             total_len = span_lengths.sum().item() + (num_spans - 1) * 10
@@ -203,8 +203,10 @@ def get_dataloaders_dynamic(config, window_size=200, batch_size=32, val_split=0.
     print("Loading full sessions into RAM for dynamic augmentation...")
     sessions, _ = sessionData(f"{config.data_path}/metadata.csv").generate_session_obj()
     
+    from config import Config
+    config = Config()
     all_sessions_data = []
-    lag_bins = 5  # Biological kinematic shift
+    lag_bins = config.lag_bins  # Biological kinematic shift
     
     for session in sessions:
         if session.isTest():
@@ -215,14 +217,18 @@ def get_dataloaders_dynamic(config, window_size=200, batch_size=32, val_split=0.
             continue
             
         # Apply biological kinematic shift globally
-        sbp_aligned = sbp[:-lag_bins]
-        kin_aligned = kin[lag_bins:]
-        
+        kin_aligned = np.zeros_like(kin)
+        if lag_bins > 0:
+            kin_aligned[lag_bins:] = kin[:-lag_bins]
+        else:
+            kin_aligned = kin
+       
+
         session_dict = {
-            "sbp": sbp_aligned,
+            "sbp": sbp,
             "kin": kin_aligned,
-            "N": sbp_aligned.shape[0],
-            "channel_var": compute_session_channel_variance(sbp_aligned),
+            "N": sbp.shape[0],
+            "channel_var": compute_session_channel_variance(sbp),
             "session_id": session.session_id
         }
         all_sessions_data.append(session_dict)
