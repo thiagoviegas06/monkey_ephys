@@ -37,7 +37,7 @@ class Config:
     weight_decay = 1e-4
     num_epochs = 50
     early_stopping_patience = 5  # Stop if val loss doesn't improve for this many epochs
-    early_stopping_min_delta = 5e-5  # Minimum change in val loss to qualify as an improvement
+    early_stopping_min_delta = 1e-4  # Minimum change in val loss to qualify as an improvement
     
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
