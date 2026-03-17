@@ -13,8 +13,8 @@ class Config:
     seed = 42
     
     # Preprocessing
-    preprocess = False  # Set True to run preprocessing (only needed once)
-    windows_dir = f"kaggle_data/masked_windows_{window_size}"  # Where preprocessed windows are saved
+    preprocess = True  # Set True to run preprocessing (only needed once)
+    windows_dir = f"kaggle_data/masked_windows_{window_size}_adj"  # Where preprocessed windows are saved
     lag_bins = 0
     
     # Model
@@ -26,7 +26,7 @@ class Config:
     # For transformer model
     d_model = 64  # Embedding dimension for transformer
     nhead = 8  # Number of attention heads
-    num_layers = 8 # Number of transformer encoder blocks stacked on top of each other
+    num_layers = 6 # Number of transformer encoder blocks stacked on top of each other
     tcn_levels = 8  # Number of TCN dilation layers
     dropout = 0.1  # Dropout rate in transformer for regularization
     

@@ -269,7 +269,7 @@ def main():
     
     args = parse_args()
     config.window_size = args.window_size
-    config.windows_dir = f"kaggle_data/masked_windows_{config.window_size}"
+    config.windows_dir = f"kaggle_data/masked_windows_{config.window_size}_adj"
     config.checkpoint_dir = f"checkpoints_{config.window_size}"
 
     print("=" * 70)

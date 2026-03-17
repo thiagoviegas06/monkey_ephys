@@ -204,7 +204,7 @@ def compute_session_channel_variance(sbp):
     return session_variance
 
 def preprocess_non_overlapping(data_path, window_size=128, seed=0):
-    out_dir = os.path.join(data_path, "masked_windows")
+    out_dir = os.path.join(data_path, f"masked_windows_{window_size}_adj")
     os.makedirs(out_dir, exist_ok=True)
     sessions, max_bin_count = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
 

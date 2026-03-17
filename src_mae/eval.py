@@ -326,7 +326,7 @@ def build_submission(sample_submission_path: str, predictions: dict, output_csv:
 def run_eval(model_path, data_path, output_csv, window_size, seed, args):
     global config
     config.window_size = args.window_size
-    config.windows_dir = f"kaggle_data/masked_windows_{config.window_size}"
+    config.windows_dir = f"kaggle_data/masked_windows_{config.window_size}_adj"
     config.checkpoint_dir = f"checkpoints_{config.window_size}"
 
 
