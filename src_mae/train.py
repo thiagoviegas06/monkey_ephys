@@ -27,7 +27,7 @@ config = Config()
 
 if config.preprocess_type == "non_overlapping":
     from dataloader import SBPDataset, get_dataloaders
-    from old_preprocessing import preprocess_non_overlapping
+    from preprocessing import preprocess_non_overlapping
 elif config.preprocess_type == "overlapping_dynamic":
     from dataloader import SBPDatasetDynamic, get_dataloaders_dynamic
 else:
