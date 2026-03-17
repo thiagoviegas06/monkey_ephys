@@ -29,8 +29,8 @@ class Config:
     num_layers = 6 # Number of transformer encoder blocks stacked on top of each other
     tcn_levels = 8  # Number of TCN dilation layers
     dropout = 0.1  # Dropout rate in transformer for regularization
-    
-    
+    use_prior = True  # Whether to use the prior in the TCN-Transformer model
+
     # Training
     batch_size = 128
     learning_rate = 1e-3
