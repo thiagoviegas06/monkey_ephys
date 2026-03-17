@@ -208,6 +208,8 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
     os.makedirs(out_dir, exist_ok=True)
     sessions, max_bin_count = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
 
+    base_template = None
+
     for session in sessions:
         if session.isTest():
             continue
@@ -222,9 +224,23 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
         print(f"{session.session_id} | N={N} | windows={len(w0s)}")
 
         session_variance = compute_session_channel_variance(sbp)
+        
+        if base_template is None:
+            base_template = session_variance.copy()
+            np.save(os.path.join(data_path, "base_template.npy"), base_template)
+            optimal_shift = 0
+        else:
+            corr = np.correlate(session_variance, base_template, mode='full')
+            argmax = np.argmax(corr)
+            optimal_shift = int(argmax - (len(base_template) - 1))
+            
+            sbp = np.roll(sbp, shift=optimal_shift, axis=1)
+            session_variance = np.roll(session_variance, shift=optimal_shift)
+
         variance_shape = session_variance.shape
         print(f"  Session channel variance shape: {variance_shape}")
         print(f"  Session channel variance (mean across channels): {session_variance.mean():.4f}")
+        print(f"  Optimal channel shift relative to base template: {optimal_shift}")
 
         for w0 in w0s:
             y = sbp[w0:w0 + window_size]          # (W,96)
@@ -245,6 +261,7 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
                 "spans": spans,
                 "day": float(session.day),
                 "day_from_nearest": float(session.day_from_nearest),
+                "channel_shift": optimal_shift,
             }
 
             sample_path = os.path.join(out_dir, f"{session.session_id}_{w0}.pkl")

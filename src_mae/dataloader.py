@@ -74,6 +74,7 @@ class SBPDataset(Dataset):
             "channel_var": torch.from_numpy(sample["channel_var"]).float(), # (96,) float32
             "session_id": sample["session_id"],
             "macro_timestamp": sample["w0"],  # Using window start position as macro timestamp
+            "channel_shift": torch.tensor(sample.get("channel_shift", 0)).float(),
         }
 
 from preprocessing import sample_multi_span_lengths_and_starts, apply_multi_span_mask_to_window, compute_session_channel_variance
@@ -167,6 +168,7 @@ class SBPDatasetDynamic(Dataset):
             "channel_var": torch.from_numpy(session["channel_var"]).float(),
             "session_id": session["session_id"],
             "macro_timestamp": w0,
+            "channel_shift": torch.tensor(0.0).float(),
         }
 
 

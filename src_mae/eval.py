@@ -125,6 +125,9 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
 
     _ = pd.read_csv(metadata_csv)
 
+    base_template_path = os.path.join(data_path, "base_template.npy")
+    base_template = np.load(base_template_path) if os.path.exists(base_template_path) else None
+
     for file in sorted(glob(masked_files)):
         session_id = Path(file).stem.split("_")[0]
         rng = np.random.default_rng(seed + (hash(session_id) & 0xFFFFFFFF))
@@ -132,6 +135,26 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
         masked_sbp = np.load(file)
         mask = np.load(file.replace("sbp_masked", "mask"))
         kin = np.load(file.replace("sbp_masked", "kinematics"))
+
+        # Channel alignment to handle signal drift
+        optimal_shift = 0
+        if base_template is not None:
+            sbp_nan = np.where(mask, np.nan, masked_sbp)
+            # Ignore RuntimeWarnings when calculating nanvar for all-nan slices (if any)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                session_variance = np.nanvar(sbp_nan, axis=0)
+                # Fill any remaining NaNs with 0 to prevent issues in correlate
+                session_variance = np.nan_to_num(session_variance)
+
+            corr = np.correlate(session_variance, base_template, mode='full')
+            argmax = np.argmax(corr)
+            optimal_shift = int(argmax - (len(base_template) - 1))
+            
+            masked_sbp = np.roll(masked_sbp, shift=optimal_shift, axis=1)
+            mask = np.roll(mask, shift=optimal_shift, axis=1)
+            print(f"Session {session_id} | Channel shift applied: {optimal_shift}")
 
         # Apply biological kinematic shift (zero padded) for consistency with training
         kin_aligned = np.zeros_like(kin)
@@ -168,6 +191,7 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
             "kinematics": kin,
             "windows": windows,
             "n_regions": len(segs),
+            "channel_shift": optimal_shift,
         }
 
     return session_data
@@ -218,10 +242,6 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device)
         kinematics = info["kinematics"]  # Extract kinematics from your preprocessed data
         windows = info["windows"]
         
-        # NOTE: You will need to ensure 'macro_timestamp' is added to session_data 
-        # in your preprocess_test() function. Using a fallback of 0.0 here just in case.
-        macro_timestamp = info.get("macro_timestamp", 0.0)
-
         lag_bins = config.lag_bins
 
         kin_shifted = np.roll(kinematics, shift=-lag_bins, axis=0)
@@ -251,10 +271,14 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device)
             )
             
             # 4. Prepare Macro Timestamp (Shape: B, 1)
-            macro_ts_tensor = torch.tensor([[macro_timestamp]], device=device, dtype=torch.float32)
+            macro_ts_tensor = torch.tensor([[float(w0)]], device=device, dtype=torch.float32)
 
-            # 5. Forward Pass matching your training loop
-            pred_window = model(x_window, kin_window, m_window_float, macro_ts_tensor).squeeze(0).cpu().numpy()
+            # 5. Prepare Channel Shift (Shape: B, 1)
+            optimal_shift = info.get("channel_shift", 0)
+            shift_tensor = torch.tensor([[optimal_shift]], device=device, dtype=torch.float32)
+
+            # 6. Forward Pass matching your training loop
+            pred_window = model(x_window, kin_window, m_window_float, macro_ts_tensor, shift_tensor).squeeze(0).cpu().numpy()
 
             # Blend predictions back into the full array
             m_np = mask[w0:w1]
@@ -268,6 +292,10 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device)
             raise RuntimeError(
                 f"Session {session_id} has {n_missing} masked positions not covered by evaluation windows."
             )
+
+        optimal_shift = info.get("channel_shift", 0)
+        if optimal_shift != 0:
+            pred_full = np.roll(pred_full, shift=-optimal_shift, axis=1)
 
         predictions[session_id] = pred_full
 

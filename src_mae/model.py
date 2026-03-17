@@ -50,7 +50,7 @@ class SBP_Reconstruction_UNet(nn.Module):
         # Output projection
         self.out = nn.Conv2d(base_channels, out_ch, kernel_size=1)
 
-    def forward(self, x_sbp, kin, mask):
+    def forward(self, x_sbp, kin, mask, *args, **kwargs):
         """
         x_sbp: (B, W, C)  - masked SBP input (0s where masked)
         mask:  (B, W, C)  - bool tensor, True where masked, False where observed
@@ -126,7 +126,7 @@ class SimpleCNN(nn.Module):
         
         self.net = nn.Sequential(*layers)
     
-    def forward(self, x_sbp, kin, mask):
+    def forward(self, x_sbp, kin, mask, *args, **kwargs):
         """
         x_sbp: (B, W, C) - masked SBP input
         mask:  (B, W, C) - True where masked
@@ -186,7 +186,7 @@ class ResNetReconstructor(nn.Module):
         # Output projection
         self.output_proj = nn.Conv2d(hidden_channels, 1, 1)
         
-    def forward(self, x_sbp, kin, mask):
+    def forward(self, x_sbp, kin, mask, *args, **kwargs):
         """
         x_sbp: (B, W, C) - masked SBP input
         mask:  (B, W, C) - True where masked
@@ -228,27 +228,6 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1), :].to(x.device)
         return self.dropout(x)
 
-class ContinuousTimeEmbedding(nn.Module):
-    def __init__(self, d_model):
-        super().__init__()
-        # A small network to project a single scalar into the high-dimensional latent space
-        self.mlp = nn.Sequential(
-            nn.Linear(1, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, d_model)
-        )
-
-    def forward(self, macro_time):
-        """
-        Args:
-            macro_time: (batch_size, 1) - Normalized days/sessions since start
-        Returns:
-            time_emb: (batch_size, 1, d_model)
-        """
-        # Pass through MLP and add a sequence dimension for broadcasting
-        time_emb = self.mlp(macro_time)
-        return time_emb.unsqueeze(1)
-
 
 class SBPImputer(nn.Module):
     def __init__(self, sbp_channels=96, kin_channels=4, d_model=256, nhead=8, num_layers=4, dim_feedforward=512, dropout=0.1):
@@ -275,7 +254,7 @@ class SBPImputer(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_proj = nn.Linear(d_model, sbp_channels)
 
-    def forward(self, sbp_masked, kinematics, mask, macro_time):
+    def forward(self, sbp_masked, kinematics, mask, macro_time, *args, **kwargs):
         """
         Args:
             sbp_masked: (batch, seq_len, 96) - Original data with missing values as 0
@@ -373,6 +352,7 @@ class SBP_TCN_Transformer(nn.Module):
         
         # --- 0. Input Normalization ---
         self.macro_bn = nn.BatchNorm1d(1)
+        self.shift_bn = nn.BatchNorm1d(1)
         
         # --- 1. Channel-Independent TCN ---
         in_features = 2 + kin_channels
@@ -386,6 +366,7 @@ class SBP_TCN_Transformer(nn.Module):
         
         # --- 2. Macro-Time Embedding ---
         self.macro_time_encoder = ContinuousTimeEmbedding(d_model)
+        self.shift_encoder = ContinuousTimeEmbedding(d_model)
         
         # --- 3. Spatial / Channel Embeddings ---
         self.channel_embeddings = nn.Parameter(torch.zeros(1, sbp_channels, d_model))
@@ -413,7 +394,7 @@ class SBP_TCN_Transformer(nn.Module):
         nn.init.xavier_uniform_(self.output_proj.weight, gain=0.1)
         nn.init.zeros_(self.output_proj.bias)
 
-    def forward(self, sbp_masked, kinematics, mask, macro_time):
+    def forward(self, sbp_masked, kinematics, mask, macro_time, channel_shift=None):
         B, W, C = sbp_masked.shape
         
         # ==========================================
@@ -452,10 +433,15 @@ class SBP_TCN_Transformer(nn.Module):
         x = tcn_out.view(B, C, self.d_model, W)
         
         # ==========================================
-        # PHASE 2: MACRO TIME EMBEDDINGS
+        # PHASE 2: MACRO TIME & SHIFT EMBEDDINGS
         # ==========================================
         time_emb = self.macro_time_encoder(macro_time_norm).unsqueeze(-1)
         x = x + time_emb
+        
+        if channel_shift is not None:
+            shift_norm = self.shift_bn(channel_shift)
+            shift_emb = self.shift_encoder(shift_norm).unsqueeze(-1)
+            x = x + shift_emb
         
         # ==========================================
         # PHASE 3: SPATIAL PREP & TRANSFORMER
