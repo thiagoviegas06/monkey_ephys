@@ -218,11 +218,7 @@ def preprocess():
     print()
 
     if config.preprocess_type == "non_overlapping":
-        preprocess_non_overlapping(
-            data_path=config.data_path,
-            window_size=config.window_size,
-            seed=config.seed
-        )
+        print("Skipping static preprocessing. The non_overlapping DataLoader is now fully dynamic and runs strictly from RAM.")
     
     elif config.preprocess_type == "overlapping_dynamic": 
         print("This is dynamic preprocessing with random masks applied on-the-fly in the DataLoader. No need to generate windows here.")
@@ -238,7 +234,7 @@ def train_val_loader():
 
     if config.preprocess_type == "non_overlapping":
         train_loader, val_loader, train_dataset, val_dataset = get_dataloaders(
-            windows_dir=config.windows_dir,
+            config=config,
             batch_size=config.batch_size,
             val_split=0.2,
             shuffle=True,
