@@ -13,18 +13,25 @@ import random
 class SBPDataset(Dataset):
     """
     PyTorch Dataset that loads full sessions into RAM and serves non-overlapping 
-    windows dynamically with fast inline masking.
+    windows dynamically with fast inline masking and behavioral priors.
     """
-    def __init__(self, sessions_data, is_train=True, window_size=200):
+    def __init__(self, sessions_data, is_train=True, window_size=200, config=None):
         self.sessions_data = sessions_data
         self.is_train = is_train
         self.window_size = window_size
         self.windows = []
+        self.config = config
+        
+        # Load global signature for behavioral prior
+        self.base_sig = None
+        if config is not None:
+            sig_path = os.path.join(config.data_path, "base_kinematic_signature.npy")
+            if os.path.exists(sig_path):
+                self.base_sig = torch.from_numpy(np.load(sig_path)).float()
         
         # Precompute all non-overlapping windows
         for i, session in enumerate(sessions_data):
             N = session["N"]
-            # non-overlapping windows step by window_size
             for w0 in range(0, N - self.window_size + 1, self.window_size):
                 self.windows.append((i, w0))
                 
@@ -40,6 +47,13 @@ class SBPDataset(Dataset):
         y_sbp = torch.from_numpy(session["sbp"][w0:w0 + self.window_size])
         kin_w = torch.from_numpy(session["kin"][w0:w0 + self.window_size])
         
+        # Compute behavioral prior (intended signature based on movement)
+        if self.base_sig is not None:
+            # kin_w: (W, 4), base_sig: (4, 96) -> prior: (W, 96)
+            sbp_prior = torch.matmul(kin_w.float(), self.base_sig)
+        else:
+            sbp_prior = torch.zeros_like(y_sbp)
+
         if self.is_train:
             x_sbp = y_sbp.clone()
             mask = torch.zeros_like(y_sbp, dtype=torch.bool)
@@ -74,7 +88,6 @@ class SBPDataset(Dataset):
             # Deterministic for validation
             rng = np.random.default_rng(idx + 42)
             y_np = y_sbp.numpy().copy()
-            kin_np = kin_w.numpy().copy()
             
             num_spans = 2
             spans = sample_multi_span_lengths_and_starts(rng, self.window_size, num_spans=num_spans, min_gap=10)
@@ -87,6 +100,7 @@ class SBPDataset(Dataset):
         return {
             "x_sbp": x_sbp.float(),
             "y_sbp": y_sbp.float(),
+            "sbp_prior": sbp_prior.float(),
             "mask": mask.float(),
             "kin": kin_w.float(),
             "channel_var": torch.from_numpy(session["channel_var"]).float(),
@@ -195,22 +209,24 @@ def get_dataloaders(config, batch_size=32, val_split=0.2, shuffle=True, num_work
     """
     Creates Training and Validation DataLoaders directly from RAM.
     Splits sessions 80/20 to prevent data leakage.
+    Uses Kinematic-Neural Signatures for robust channel alignment.
     """
-    from preprocessing import sessionData, compute_session_channel_variance
+    from preprocessing import sessionData, compute_session_channel_variance, compute_kinematic_signature
     
     print("Loading full sessions into RAM for dynamic augmentation...")
     sessions, _ = sessionData(f"{config.data_path}/metadata.csv").generate_session_obj()
     
     all_sessions_data = []
     lag_bins = config.lag_bins  # Biological kinematic shift
-    base_template = None
+    base_sig = None
+    sig_path = os.path.join(config.data_path, "base_kinematic_signature.npy")
     
-    # Check if base_template exists, otherwise calculate it
-    template_path = os.path.join(config.data_path, "base_template.npy")
-    if os.path.exists(template_path):
-        base_template = np.load(template_path)
+    # Pre-load/calculate global kinematic signature template
+    if os.path.exists(sig_path):
+        base_sig = np.load(sig_path)
+        print(f"Loaded base signature from {sig_path}")
     
-    for session in sessions:
+    for session in tqdm(sessions, desc="Processing sessions"):
         if session.isTest():
             continue
             
@@ -218,32 +234,42 @@ def get_dataloaders(config, batch_size=32, val_split=0.2, shuffle=True, num_work
         if sbp is None or sbp.shape[0] < config.window_size:
             continue
             
-        session_variance = compute_session_channel_variance(sbp)
-        
-        if base_template is None:
-            base_template = session_variance.copy()
-            np.save(template_path, base_template)
-            optimal_shift = 0
-        else:
-            corr = np.correlate(session_variance, base_template, mode='full')
-            argmax = np.argmax(corr)
-            optimal_shift = int(argmax - (len(base_template) - 1))
-            
-            sbp = np.roll(sbp, shift=optimal_shift, axis=1)
-            session_variance = np.roll(session_variance, shift=optimal_shift)
-            
         # Apply biological kinematic shift globally
         kin_aligned = np.zeros_like(kin)
         if lag_bins > 0:
             kin_aligned[lag_bins:] = kin[:-lag_bins]
         else:
             kin_aligned = kin
-       
+
+        # Extract current session's kinematic-neural signature
+        sig = compute_kinematic_signature(sbp, kin_aligned)
+        
+        if base_sig is None:
+            # First session defines the coordinate system
+            base_sig = sig.copy()
+            np.save(sig_path, base_sig)
+            optimal_shift = 0
+            print(f"Set base signature from session {session.session_id}")
+        else:
+            # Find the shift that maximizes correlation with the base signature
+            best_corr = -1.0
+            optimal_shift = 0
+            for k in range(96):
+                rolled_sig = np.roll(sig, shift=k, axis=1)
+                # Correlation of the 4x96 maps
+                corr = np.corrcoef(rolled_sig.flatten(), base_sig.flatten())[0, 1]
+                if corr > best_corr:
+                    best_corr = corr
+                    optimal_shift = k
+            
+            # Align the session
+            sbp = np.roll(sbp, shift=optimal_shift, axis=1)
+            
         session_dict = {
             "sbp": sbp,
             "kin": kin_aligned,
             "N": sbp.shape[0],
-            "channel_var": session_variance,
+            "channel_var": compute_session_channel_variance(sbp),
             "session_id": session.session_id,
             "channel_shift": optimal_shift
         }
@@ -259,8 +285,8 @@ def get_dataloaders(config, batch_size=32, val_split=0.2, shuffle=True, num_work
     val_sessions = all_sessions_data[:val_size]
     train_sessions = all_sessions_data[val_size:]
     
-    train_dataset = SBPDataset(train_sessions, is_train=True, window_size=config.window_size)
-    val_dataset = SBPDataset(val_sessions, is_train=False, window_size=config.window_size)
+    train_dataset = SBPDataset(train_sessions, is_train=True, window_size=config.window_size, config=config)
+    val_dataset = SBPDataset(val_sessions, is_train=False, window_size=config.window_size, config=config)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)

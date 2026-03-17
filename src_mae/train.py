@@ -69,9 +69,10 @@ def build_model(config):
             nhead=config.nhead,
             num_layers=config.num_layers,
             tcn_levels=config.tcn_levels,  # Pass the new config variable
-            dropout=config.dropout
+            dropout=config.dropout,
+            use_prior=config.use_prior
         )
-        print("Built Hybrid TCN + Cross-Channel Transformer")
+        print(f"Built Hybrid TCN + Cross-Channel Transformer (use_prior={config.use_prior})")
     else:
         raise ValueError(f"Unknown model: {config.model_name}")
     
@@ -107,6 +108,7 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None)
         # Move batch to device
         x_sbp = batch["x_sbp"].to(config.device)  # (B, W, C)
         y_sbp = batch["y_sbp"].to(config.device)  # (B, W, C)
+        sbp_prior = batch["sbp_prior"].to(config.device) if "sbp_prior" in batch else None
         kin = batch["kin"].to(config.device)      # (B, W, 4)
         macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()  # (B, 1)
         channel_shift = batch["channel_shift"].unsqueeze(-1).to(config.device) # (B, 1)
@@ -121,7 +123,7 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None)
         optimizer.zero_grad()
         
         # ===== Forward pass =====
-        pred = model(x_sbp, kin, mask_float, macro_timestamp, channel_shift)  # (B, W, C)
+        pred = model(x_sbp, kin, mask_float, macro_timestamp, sbp_prior, channel_shift)  # (B, W, C)
         
         # ===== Compute loss =====
         # Loss is computed ONLY on masked positions
@@ -175,6 +177,7 @@ def validate_one_epoch(model, dataloader, config, epoch):
             # Move batch to device
             x_sbp = batch["x_sbp"].to(config.device)  # (B, W, C)
             y_sbp = batch["y_sbp"].to(config.device)  # (B, W, C)
+            sbp_prior = batch["sbp_prior"].to(config.device) if "sbp_prior" in batch else None
             kin = batch["kin"].to(config.device)      # (B, W, 4)
             macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()  # (B, 1)
             channel_shift = batch["channel_shift"].unsqueeze(-1).to(config.device) # (B, 1)
@@ -188,7 +191,7 @@ def validate_one_epoch(model, dataloader, config, epoch):
             batch_size = x_sbp.size(0)
             
             # ===== Forward pass (no grad tracking) =====
-            pred = model(x_sbp, kin, mask_float, macro_timestamp, channel_shift)  # (B, W, C)
+            pred = model(x_sbp, kin, mask_float, macro_timestamp, sbp_prior, channel_shift)  # (B, W, C)
             
             # ===== Compute loss =====
             loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)

@@ -203,6 +203,17 @@ def compute_session_channel_variance(sbp):
     session_variance = np.var(sbp, axis=0)
     return session_variance
 
+def compute_kinematic_signature(sbp, kin):
+    """
+    Computes a linear mapping (template) from kinematics to SBP.
+    W = (Kin^T Kin)^-1 Kin^T SBP
+    Returns W: (4, 96)
+    """
+    # Solve linear least squares: kin @ W = sbp
+    # kin: (N, 4), sbp: (N, 96)
+    W, _, _, _ = np.linalg.lstsq(kin, sbp, rcond=None)
+    return W
+
 def preprocess_non_overlapping(data_path, window_size=128, seed=0):
     out_dir = os.path.join(data_path, f"masked_windows_{window_size}_adj")
     os.makedirs(out_dir, exist_ok=True)

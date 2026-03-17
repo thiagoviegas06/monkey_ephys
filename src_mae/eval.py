@@ -52,9 +52,10 @@ def build_model(config):
             nhead=config.nhead,
             num_layers=config.num_layers,
             tcn_levels=config.tcn_levels,  # Pass the new config variable
-            dropout=config.dropout
+            dropout=config.dropout,
+            use_prior=config.use_prior
         )
-        print("Built Hybrid TCN + Cross-Channel Transformer")
+        print(f"Built Hybrid TCN + Cross-Channel Transformer (use_prior={config.use_prior})")
     else:
         raise ValueError(f"Unknown model: {config.model_name}")
     
@@ -125,8 +126,8 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
 
     _ = pd.read_csv(metadata_csv)
 
-    base_template_path = os.path.join(data_path, "base_template.npy")
-    base_template = np.load(base_template_path) if os.path.exists(base_template_path) else None
+    sig_path = os.path.join(data_path, "base_kinematic_signature.npy")
+    base_sig = np.load(sig_path) if os.path.exists(sig_path) else None
 
     for file in sorted(glob(masked_files)):
         session_id = Path(file).stem.split("_")[0]
@@ -138,23 +139,34 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
 
         # Channel alignment to handle signal drift
         optimal_shift = 0
-        if base_template is not None:
-            sbp_nan = np.where(mask, np.nan, masked_sbp)
-            # Ignore RuntimeWarnings when calculating nanvar for all-nan slices (if any)
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                session_variance = np.nanvar(sbp_nan, axis=0)
-                # Fill any remaining NaNs with 0 to prevent issues in correlate
-                session_variance = np.nan_to_num(session_variance)
-
-            corr = np.correlate(session_variance, base_template, mode='full')
-            argmax = np.argmax(corr)
-            optimal_shift = int(argmax - (len(base_template) - 1))
+        if base_sig is not None:
+            # Apply biological kinematic shift for consistency
+            kin_aligned_for_sig = np.zeros_like(kin)
+            if config.lag_bins > 0:
+                kin_aligned_for_sig[config.lag_bins:] = kin[:-config.lag_bins]
+            else:
+                kin_aligned_for_sig = kin
+            
+            # Compute signature per channel, ignoring masked bins
+            sig = np.zeros((4, 96))
+            for c in range(96):
+                visible = ~mask[:, c]
+                if visible.sum() > 10:
+                    sig[:, c], _, _, _ = np.linalg.lstsq(kin_aligned_for_sig[visible], masked_sbp[visible, c], rcond=None)
+            
+            # Find the shift that maximizes correlation with the base signature
+            best_corr = -1.0
+            optimal_shift = 0
+            for k in range(96):
+                rolled_sig = np.roll(sig, shift=k, axis=1)
+                corr = np.corrcoef(rolled_sig.flatten(), base_sig.flatten())[0, 1]
+                if corr > best_corr:
+                    best_corr = corr
+                    optimal_shift = k
             
             masked_sbp = np.roll(masked_sbp, shift=optimal_shift, axis=1)
             mask = np.roll(mask, shift=optimal_shift, axis=1)
-            print(f"Session {session_id} | Channel shift applied: {optimal_shift}")
+            print(f"Session {session_id} | Channel shift applied via kinematic signature: {optimal_shift}")
 
         # Apply biological kinematic shift (zero padded) for consistency with training
         kin_aligned = np.zeros_like(kin)
@@ -235,6 +247,9 @@ def load_model(model_path: str, device: torch.device) -> nn.Module:
 def predict_sessions(model: nn.Module, session_data: dict, device: torch.device):
     global config
     predictions = {}
+    
+    base_sig_path = os.path.join(config.data_path, "base_kinematic_signature.npy")
+    base_sig = torch.from_numpy(np.load(base_sig_path)).to(device).float() if os.path.exists(base_sig_path) else None
 
     for session_id, info in session_data.items():
         masked_sbp = info["masked_sbp"]
@@ -270,6 +285,9 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device)
                 device=device, dtype=torch.float32
             )
             
+            # 3b. Prepare SBP Prior
+            sbp_prior_window = torch.matmul(kin_window, base_sig) if base_sig is not None else None
+            
             # 4. Prepare Macro Timestamp (Shape: B, 1)
             macro_ts_tensor = torch.tensor([[float(w0)]], device=device, dtype=torch.float32)
 
@@ -278,7 +296,7 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device)
             shift_tensor = torch.tensor([[optimal_shift]], device=device, dtype=torch.float32)
 
             # 6. Forward Pass matching your training loop
-            pred_window = model(x_window, kin_window, m_window_float, macro_ts_tensor, shift_tensor).squeeze(0).cpu().numpy()
+            pred_window = model(x_window, kin_window, m_window_float, macro_ts_tensor, sbp_prior_window, shift_tensor).squeeze(0).cpu().numpy()
 
             # Blend predictions back into the full array
             m_np = mask[w0:w1]
