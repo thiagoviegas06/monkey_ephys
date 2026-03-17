@@ -6,6 +6,7 @@ from glob import glob
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataset import random_split
 import random
+from tqdm import tqdm
 
 # ============================================================================
 # Dataset Class
