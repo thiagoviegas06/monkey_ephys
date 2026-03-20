@@ -1,0 +1,12 @@
+checkpoints/best_model.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/model_epoch_10.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/model_epoch_20.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/model_epoch_25.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/model_epoch_30.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/model_epoch_35.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/model_epoch_45.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/best_model_tcn_transformer.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/best_modeltcn_transformer.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/model_epoch_15.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/model_epoch_40.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/model_epoch_5.pt filter=lfs diff=lfs merge=lfs -text
