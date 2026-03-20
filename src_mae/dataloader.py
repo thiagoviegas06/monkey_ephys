@@ -206,7 +206,7 @@ class SBPDatasetDynamic(Dataset):
 
 
 
-def get_dataloaders(config, batch_size=32, val_split=0.2, shuffle=True, num_workers=4, pin_memory=False):
+def get_dataloaders(config, batch_size=32, val_split=0.2, shuffle=True, num_workers=8, pin_memory=False):
     """
     Creates Training and Validation DataLoaders directly from RAM.
     Splits sessions 80/20 to prevent data leakage.

@@ -24,20 +24,20 @@ class Config:
     kin_channels = 4
     
     # For transformer model
-    d_model = 64  # Embedding dimension for transformer
+    d_model = 128  # Embedding dimension for transformer
     nhead = 8  # Number of attention heads
     num_layers = 6 # Number of transformer encoder blocks stacked on top of each other
     tcn_levels = 8  # Number of TCN dilation layers
-    dropout = 0.1  # Dropout rate in transformer for regularization
+    dropout = 0.05  # Dropout rate in transformer for regularization
     use_prior = True  # Whether to use the prior in the TCN-Transformer model
 
     # Training
-    batch_size = 128
+    batch_size = 64
     learning_rate = 1e-3
-    weight_decay = 1e-4
-    num_epochs = 50
-    early_stopping_patience = 5  # Stop if val loss doesn't improve for this many epochs
-    early_stopping_min_delta = 5e-5  # Minimum change in val loss to qualify as an improvement
+    weight_decay = 1e-5
+    num_epochs = 80
+    early_stopping_patience = 10  # Stop if val loss doesn't improve for this many epochs
+    early_stopping_min_delta = 1e-4  # Minimum change in val loss to qualify as an improvement
     
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"
