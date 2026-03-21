@@ -131,15 +131,6 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
 
         masked_sbp = np.load(file)
         mask = np.load(file.replace("sbp_masked", "mask"))
-        kin = np.load(file.replace("sbp_masked", "kinematics"))
-
-        # Apply biological kinematic shift (zero padded) for consistency with training
-        kin_aligned = np.zeros_like(kin)
-        if config.lag_bins > 0:
-            kin_aligned[config.lag_bins:] = kin[:-config.lag_bins]
-        else:
-            kin_aligned = kin
-        kin = kin_aligned
 
         segs = mask_segments(mask)
         windows = build_randomized_windows_from_mask(mask, window_size, rng)
@@ -165,7 +156,6 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
         session_data[session_id] = {
             "masked_sbp": masked_sbp,
             "mask": mask,
-            "kinematics": kin,
             "windows": windows,
             "n_regions": len(segs),
         }
@@ -215,21 +205,11 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device)
     for session_id, info in session_data.items():
         masked_sbp = info["masked_sbp"]
         mask = info["mask"]
-        kinematics = info["kinematics"]  # Extract kinematics from your preprocessed data
         windows = info["windows"]
-        
-        # NOTE: You will need to ensure 'macro_timestamp' is added to session_data 
+
+        # NOTE: You will need to ensure 'macro_timestamp' is added to session_data
         # in your preprocess_test() function. Using a fallback of 0.0 here just in case.
         macro_timestamp = info.get("macro_timestamp", 0.0)
-
-        lag_bins = config.lag_bins
-
-        kin_shifted = np.roll(kinematics, shift=-lag_bins, axis=0)
-
-        if kinematics.shape[0] > lag_bins:
-            kin_shifted[-lag_bins:] = kin_shifted[-lag_bins - 1]
-
-        kinematics = kin_shifted
 
         pred_full = masked_sbp.copy()
         covered = np.zeros_like(mask, dtype=np.bool_)
@@ -239,22 +219,17 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device)
             x_window = torch.from_numpy(masked_sbp[w0:w1]).unsqueeze(0).to(
                 device=device, dtype=torch.float32
             )
-            
-            # 2. Prepare Mask (Need both bool for tracking and float for the model)
-            m_window = torch.from_numpy(mask[w0:w1]).unsqueeze(0)
-            m_window_bool = m_window.to(device=device, dtype=torch.bool)
-            m_window_float = m_window.to(device=device, dtype=torch.float32)
-            
-            # 3. Prepare Kinematics input
-            kin_window = torch.from_numpy(kinematics[w0:w1]).unsqueeze(0).to(
+
+            # 2. Prepare Mask (float for the model)
+            m_window = torch.from_numpy(mask[w0:w1]).unsqueeze(0).to(
                 device=device, dtype=torch.float32
             )
-            
-            # 4. Prepare Macro Timestamp (Shape: B, 1)
+
+            # 3. Prepare Macro Timestamp (Shape: B, 1)
             macro_ts_tensor = torch.tensor([[macro_timestamp]], device=device, dtype=torch.float32)
 
-            # 5. Forward Pass matching your training loop
-            pred_window = model(x_window, kin_window, m_window_float, macro_ts_tensor).squeeze(0).cpu().numpy()
+            # 4. Forward Pass
+            pred_window = model(x_window, m_window, macro_ts_tensor).squeeze(0).cpu().numpy()
 
             # Blend predictions back into the full array
             m_np = mask[w0:w1]

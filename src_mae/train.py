@@ -107,7 +107,6 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None)
         # Move batch to device
         x_sbp = batch["x_sbp"].to(config.device)  # (B, W, C)
         y_sbp = batch["y_sbp"].to(config.device)  # (B, W, C)
-        kin = batch["kin"].to(config.device)      # (B, W, 4)
         macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()  # (B, 1)
         
         # The model's concat step needs floats, but the inverse logic in the loss (~mask) needs bools
@@ -120,7 +119,7 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None)
         optimizer.zero_grad()
         
         # ===== Forward pass =====
-        pred = model(x_sbp, kin, mask_float, macro_timestamp)  # (B, W, C)
+        pred = model(x_sbp, mask_float, macro_timestamp)  # (B, W, C)
         
         # ===== Compute loss =====
         # Loss is computed ONLY on masked positions
@@ -174,7 +173,6 @@ def validate_one_epoch(model, dataloader, config, epoch):
             # Move batch to device
             x_sbp = batch["x_sbp"].to(config.device)  # (B, W, C)
             y_sbp = batch["y_sbp"].to(config.device)  # (B, W, C)
-            kin = batch["kin"].to(config.device)      # (B, W, 4)
             macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()  # (B, 1)
             
             # The model's concat step needs floats, but the inverse logic in the loss (~mask) needs bools
@@ -186,7 +184,7 @@ def validate_one_epoch(model, dataloader, config, epoch):
             batch_size = x_sbp.size(0)
             
             # ===== Forward pass (no grad tracking) =====
-            pred = model(x_sbp, kin, mask_float, macro_timestamp)  # (B, W, C)
+            pred = model(x_sbp, mask_float, macro_timestamp)  # (B, W, C)
             
             # ===== Compute loss =====
             loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)

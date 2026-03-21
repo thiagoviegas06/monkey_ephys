@@ -370,12 +370,12 @@ class SBP_TCN_Transformer(nn.Module):
         super().__init__()
         self.sbp_channels = sbp_channels
         self.d_model = d_model
-        
+
         # --- 0. Input Normalization ---
         self.macro_bn = nn.BatchNorm1d(1)
-        
+
         # --- 1. Channel-Independent TCN ---
-        in_features = 2 + kin_channels
+        in_features = 2  # Only SBP + mask, no kinematics
         
         tcn_layers = []
         for i in range(tcn_levels):
@@ -413,39 +413,33 @@ class SBP_TCN_Transformer(nn.Module):
         nn.init.xavier_uniform_(self.output_proj.weight, gain=0.1)
         nn.init.zeros_(self.output_proj.bias)
 
-    def forward(self, sbp_masked, kinematics, mask, macro_time):
+    def forward(self, sbp_masked, mask, macro_time):
         B, W, C = sbp_masked.shape
-        
+
         # ==========================================
         # PHASE 0: REVERSIBLE INSTANCE NORMALIZATION
         # ==========================================
         # A. Normalize SBP (Only compute stats on VISIBLE values so 0s don't skew it)
         visible_mask = (~mask.bool()).float()  # 1.0 if visible, 0.0 if masked
         num_visible = visible_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
-        
+
         sbp_mean = (sbp_masked * visible_mask).sum(dim=1, keepdim=True) / num_visible
         sbp_var = (((sbp_masked - sbp_mean) * visible_mask) ** 2).sum(dim=1, keepdim=True) / num_visible
         sbp_std = torch.sqrt(sbp_var + 1e-5)
-        
+
         # Normalize SBP, keeping masked values safely at exactly 0
         sbp_norm = ((sbp_masked - sbp_mean) / sbp_std) * visible_mask
-        
-        # B. Normalize Kinematics (Fully visible, so standard instance norm over time)
-        kin_mean = kinematics.mean(dim=1, keepdim=True)
-        kin_std = kinematics.std(dim=1, keepdim=True) + 1e-5
-        kin_norm = (kinematics - kin_mean) / kin_std
-        
-        # C. Normalize Macro Time across the batch
+
+        # B. Normalize Macro Time across the batch
         macro_time_norm = self.macro_bn(macro_time)
-        
+
         # ==========================================
         # PHASE 1: INDEPENDENT TCN
         # ==========================================
-        kin_exp = kin_norm.unsqueeze(1).expand(B, C, W, -1)
         sbp_exp = sbp_norm.transpose(1, 2).unsqueeze(-1)
-        mask_exp = mask.transpose(1, 2).unsqueeze(-1)       
-        
-        x_tcn = torch.cat([sbp_exp, mask_exp, kin_exp], dim=-1)
+        mask_exp = mask.transpose(1, 2).unsqueeze(-1)
+
+        x_tcn = torch.cat([sbp_exp, mask_exp], dim=-1)
         x_tcn = x_tcn.reshape(B * C, W, -1).transpose(1, 2)
         
         tcn_out = self.tcn(x_tcn) 
@@ -481,39 +475,100 @@ class SBP_TCN_Transformer(nn.Module):
         
         return final_output
 
+class SBPtoKinematicsModel(nn.Module):
+    """
+    Transfer learning model: Use frozen SBP encoder to predict kinematics.
+
+    Architecture:
+    - SBP_TCN_Transformer (frozen) → d_model features
+    - Add lightweight kinematics head → 4D output
+    """
+    def __init__(self, sbp_model, freeze_sbp=True, hidden_dim=128, dropout=0.1):
+        super().__init__()
+        self.sbp_model = sbp_model
+
+        # Freeze SBP model weights
+        if freeze_sbp:
+            for param in self.sbp_model.parameters():
+                param.requires_grad = False
+
+        # Kinematics prediction head
+        # Input: SBP model outputs (B, W, 96) reconstructed SBP
+        # But we want features from the encoder, not final output
+        # For now, we'll use a simple approach: learn from the reconstructed SBP
+        self.kin_head = nn.Sequential(
+            nn.Linear(96, hidden_dim),  # Project from 96 channels
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 4)  # 4 kinematic channels
+        )
+
+    def forward(self, sbp_masked, mask, macro_time):
+        """
+        Args:
+            sbp_masked: (B, W, 96) - masked SBP input
+            mask: (B, W, 96) - boolean mask
+            macro_time: (B, 1) - macro timestamp
+
+        Returns:
+            kin_pred: (B, W, 4) - predicted kinematics
+        """
+        # Get SBP features (no gradients flow back if frozen)
+        if self.sbp_model.training:
+            sbp_features = self.sbp_model(sbp_masked, mask, macro_time)  # (B, W, 96)
+        else:
+            with torch.no_grad():
+                sbp_features = self.sbp_model(sbp_masked, mask, macro_time)  # (B, W, 96)
+
+        # Predict kinematics from SBP features
+        B, W, C = sbp_features.shape
+        sbp_flat = sbp_features.reshape(B * W, C)  # (B*W, 96)
+        kin_flat = self.kin_head(sbp_flat)  # (B*W, 4)
+        kin_pred = kin_flat.reshape(B, W, 4)  # (B, W, 4)
+
+        return kin_pred
+
+
 """
 Usage Example:
 --------------
 
-from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor
+from model import SBP_Reconstruction_UNet, SimpleCNN, ResNetReconstructor, SBP_TCN_Transformer, SBPtoKinematicsModel
 from losses import masked_nmse_loss
 
-# Choose a model
-model = SBP_Reconstruction_UNet(base_channels=64)  # Best overall
-# model = SimpleCNN(hidden_channels=128, num_layers=6)  # Fastest
-# model = ResNetReconstructor(hidden_channels=128, num_blocks=8)  # Good middle ground
+# SBP Reconstruction:
+sbp_model = SBP_TCN_Transformer(sbp_channels=96, kin_channels=4, d_model=64, nhead=8, num_layers=4, tcn_levels=8)
 
-# In training loop:
+# Kinematics Prediction (transfer learning):
+kin_model = SBPtoKinematicsModel(sbp_model, freeze_sbp=True, hidden_dim=128)
+
+# Training:
 for batch in dataloader:
-    x_sbp = batch['x_sbp']  # (B, 200, 96) - zeros where masked
-    y_sbp = batch['y_sbp']  # (B, 200, 96) - ground truth
-    mask = batch['mask']     # (B, 200, 96) - True where masked
-    
+    x_sbp = batch['x_sbp']    # (B, 200, 96)
+    kin_true = batch['kin']   # (B, 200, 4)
+    mask = batch['mask']       # (B, 200, 96)
+    macro_ts = batch['macro_timestamp']  # (B, 1)
+
     # Forward pass
-    pred = model(x_sbp, mask)
-    
-    # Compute loss only on masked positions
-    loss = masked_nmse_loss(pred, y_sbp, mask)
-    
+    kin_pred = kin_model(x_sbp, mask, macro_ts)
+
+    # Compute loss
+    loss = F.mse_loss(kin_pred, kin_true)
+
     # Backward pass
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
 Model Comparison:
-- SBP_Reconstruction_UNet: Best performance, captures multi-scale patterns
+- SBP_Reconstruction_UNet: Best SBP performance, captures multi-scale patterns
 - SimpleCNN: Fastest training, good baseline
 - ResNetReconstructor: Better gradient flow than SimpleCNN, competitive with U-Net
+- SBP_TCN_Transformer: Best SBP with temporal modeling
+- SBPtoKinematicsModel: Transfer learning for kinematics from frozen SBP encoder
 
 All models handle (200, 96) shape and use the convention: mask=True means masked.
 """

@@ -47,3 +47,6 @@ class Config:
     
     # Logging
     log_every = 10  # Log every N batches
+
+    # Kinematics prediction (downstream task)
+    kin_hidden_dim = 128  # Hidden dimension for kinematics head
