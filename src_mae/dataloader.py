@@ -13,67 +13,129 @@ import random
 class SBPDataset(Dataset):
     """
     PyTorch Dataset that loads pre-generated windows from preprocessing.
-    
+    Applies per-session z-score normalization to combat drift.
+
     Each .pkl file contains:
         - x_sbp: (W, 96) masked SBP (zeros where masked)
         - y_sbp: (W, 96) ground truth SBP
         - mask: (W, 96) boolean, True where masked
-        - kin: (W, 4) kinematics (not used in current model)
+        - kin: (W, 4) kinematics
         - session_id: str
         - w0: int, window start position
         - span: (t0, t1) masked time span
         - day: float
         - day_from_nearest: float
     """
-    
+
     def __init__(self, windows_dir):
         """
         Args:
             windows_dir: Directory containing preprocessed .pkl files
         """
         self.windows_dir = windows_dir
-        
+
         # Find all .pkl files
         pkl_pattern = os.path.join(windows_dir, "*.pkl")
-        # self.sample_files = sorted(glob(pkl_pattern))
-        self.sample_files = glob(pkl_pattern) 
+        self.sample_files = glob(pkl_pattern)
         random.shuffle(self.sample_files)
-        
+
         if len(self.sample_files) == 0:
             raise ValueError(
                 f"No .pkl files found in {windows_dir}. "
                 f"Run with Config.preprocess=True first!"
             )
-        
+
         print(f"Found {len(self.sample_files)} preprocessed windows")
+
+        # Build per-session normalization stats (mean, std)
+        self.session_stats = {}  # {session_id: (mean, std)}
+        self._compute_session_stats()
     
+    def _compute_session_stats(self):
+        """Compute per-session mean and std from all windows in that session."""
+        print("Computing per-session normalization statistics...")
+        session_data = {}  # {session_id: list of (x_sbp, y_sbp) arrays}
+
+        # First pass: collect all samples per session
+        for file_path in self.sample_files:
+            with open(file_path, 'rb') as f:
+                sample = pickle.load(f)
+            session_id = sample["session_id"]
+            if session_id not in session_data:
+                session_data[session_id] = []
+            # Store observed values (where mask=False)
+            x_sbp = sample["x_sbp"]  # (W, 96)
+            y_sbp = sample["y_sbp"]  # (W, 96)
+            mask = sample["mask"]    # (W, 96) bool
+            # Only use observed (non-masked) values for statistics
+            observed_sbp = y_sbp[~mask]
+            session_data[session_id].append(observed_sbp)
+
+        # Second pass: compute mean and std per session
+        for session_id, observed_list in session_data.items():
+            # Concatenate all observed values for this session
+            all_observed = np.concatenate(observed_list, axis=0)  # (num_obs, 96)
+            # Compute per-channel statistics
+            mean = all_observed.mean(axis=0)  # (96,)
+            std = all_observed.std(axis=0) + 1e-5  # (96,) add epsilon for numerical stability
+            self.session_stats[session_id] = (mean, std)
+
+        print(f"✓ Computed stats for {len(self.session_stats)} sessions")
+
     def __len__(self):
         return len(self.sample_files)
-    
+
     def __getitem__(self, idx):
         """
-        Load one preprocessed window.
-        
+        Load one preprocessed window with per-session z-score normalization.
+
         Returns:
             dict with keys:
-                - x_sbp: (W, C) tensor, masked input
-                - y_sbp: (W, C) tensor, ground truth
-                - mask: (W, C) boolean tensor, True=masked
+                - x_sbp: (W, 96) z-normalized masked input
+                - y_sbp: (W, 96) z-normalized ground truth
+                - mask: (W, 96) boolean tensor, True=masked
+                - kin: (W, 4) kinematics
                 - session_id: str
+                - session_mean: (96,) for denormalization
+                - session_std: (96,) for denormalization
         """
         # Load pickle file
         with open(self.sample_files[idx], 'rb') as f:
             sample = pickle.load(f)
 
-        # Convert to tensors (data already in correct format from preprocessing)
+        session_id = sample["session_id"]
+        x_sbp = sample["x_sbp"].astype(np.float32)  # (W, 96)
+        y_sbp = sample["y_sbp"].astype(np.float32)  # (W, 96)
+        mask = sample["mask"]  # (W, 96) bool
+
+        # Get per-session normalization stats
+        if session_id in self.session_stats:
+            mean, std = self.session_stats[session_id]
+        else:
+            # Fallback: use window-level statistics
+            visible_mask = ~mask
+            if visible_mask.sum() > 0:
+                mean = y_sbp[visible_mask].mean(axis=0)
+                std = y_sbp[visible_mask].std(axis=0) + 1e-5
+            else:
+                mean = y_sbp.mean(axis=0)
+                std = y_sbp.std(axis=0) + 1e-5
+
+        # Apply per-session z-score normalization
+        x_sbp_norm = (x_sbp - mean) / std
+        y_sbp_norm = (y_sbp - mean) / std
+
+        # Convert to tensors
         return {
-            "x_sbp": torch.from_numpy(sample["x_sbp"]).float(),  # (W, 96) float32
-            "y_sbp": torch.from_numpy(sample["y_sbp"]).float(),  # (W, 96) float32
-            "mask": torch.from_numpy(sample["mask"]).float(),    # (W, 96) bool
-            "kin": torch.from_numpy(sample["kin"]).float(),      # (W, 4) float32
-            "channel_var": torch.from_numpy(sample["channel_var"]).float(), # (96,) float32
-            "session_id": sample["session_id"],
-            "macro_timestamp": sample["w0"],  # Using window start position as macro timestamp
+            "x_sbp": torch.from_numpy(x_sbp_norm).float(),  # (W, 96) z-normalized
+            "y_sbp": torch.from_numpy(y_sbp_norm).float(),  # (W, 96) z-normalized
+            "mask": torch.from_numpy(mask).float(),  # (W, 96)
+            "kin": torch.from_numpy(sample["kin"].astype(np.float32)).float(),  # (W, 4)
+            "channel_var": torch.from_numpy(sample["channel_var"].astype(np.float32)).float(),  # (96,)
+            "session_id": session_id,
+            "session_mean": torch.from_numpy(mean).float(),  # (96,) for denormalization
+            "session_std": torch.from_numpy(std).float(),  # (96,) for denormalization
+            "macro_timestamp": sample["w0"],
         }
 
 from preprocessing import sample_multi_span_lengths_and_starts, apply_multi_span_mask_to_window, compute_session_channel_variance

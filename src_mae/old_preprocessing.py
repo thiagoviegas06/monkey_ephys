@@ -199,8 +199,25 @@ def apply_multi_span_mask_to_window(sbp, spans, num_spans=2, rng=None, min_gap=1
     return x, mask
 
 def compute_session_channel_variance(sbp):
+    """Compute per-channel variance for a session."""
     session_variance = np.var(sbp, axis=0)
     return session_variance
+
+
+def compute_session_normalization_stats(sbp):
+    """
+    Compute per-session z-score normalization statistics.
+
+    Args:
+        sbp: (N, 96) session SBP data
+
+    Returns:
+        mean: (96,) per-channel mean
+        std: (96,) per-channel standard deviation (clipped at 1e-5)
+    """
+    mean = sbp.mean(axis=0)  # (96,)
+    std = sbp.std(axis=0) + 1e-5  # (96,) add epsilon for stability
+    return mean, std
 
 def preprocess_non_overlapping(data_path, window_size=128, seed=0):
     out_dir = os.path.join(data_path, "masked_windows")
@@ -225,6 +242,10 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
         print(f"  Session channel variance shape: {variance_shape}")
         print(f"  Session channel variance (mean across channels): {session_variance.mean():.4f}")
 
+        # Compute per-session normalization statistics (for drift correction)
+        session_mean, session_std = compute_session_normalization_stats(sbp)
+        print(f"  Session z-score stats: mean={session_mean.mean():.4f}, std={session_std.mean():.4f}")
+
         for w0 in w0s:
             y = sbp[w0:w0 + window_size]          # (W,96)
             kin_w = kin[w0:w0 + window_size]      # (W,4)
@@ -239,6 +260,8 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
                 "mask": M,
                 "kin": kin_w.astype(np.float32),
                 "channel_var": session_variance.astype(np.float32),  # (96,) per-channel variance from full session
+                "session_mean": session_mean.astype(np.float32),  # (96,) per-channel mean for z-score norm
+                "session_std": session_std.astype(np.float32),    # (96,) per-channel std for z-score norm
                 "session_id": session.session_id,
                 "w0": int(w0),
                 "spans": spans,

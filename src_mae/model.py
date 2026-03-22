@@ -480,24 +480,28 @@ class SBPtoKinematicsModel(nn.Module):
     Transfer learning model: Use frozen SBP encoder to predict kinematics.
 
     Architecture:
-    - SBP_TCN_Transformer (frozen) → d_model features
-    - Add lightweight kinematics head → 4D output
+    - SBP_TCN_Transformer (frozen) → reconstructed SBP (96 channels)
+    - Lightweight kinematics head with output constraints → 4D output
+
+    Output channels:
+    - [0]: index_pos (finger position, range [0, 1])
+    - [1]: mrp_pos (movement-related position, range [0, 1])
+    - [2]: index_vel (finger velocity, range [0, 1])
+    - [3]: mrp_vel (movement-related velocity, range [0, 1])
     """
     def __init__(self, sbp_model, freeze_sbp=True, hidden_dim=128, dropout=0.1):
         super().__init__()
         self.sbp_model = sbp_model
+        self.freeze_sbp = freeze_sbp
 
         # Freeze SBP model weights
         if freeze_sbp:
             for param in self.sbp_model.parameters():
                 param.requires_grad = False
 
-        # Kinematics prediction head
-        # Input: SBP model outputs (B, W, 96) reconstructed SBP
-        # But we want features from the encoder, not final output
-        # For now, we'll use a simple approach: learn from the reconstructed SBP
+        # Kinematics prediction head with position/velocity distinction
         self.kin_head = nn.Sequential(
-            nn.Linear(96, hidden_dim),  # Project from 96 channels
+            nn.Linear(96, hidden_dim),  # Project from 96 SBP channels
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -510,23 +514,27 @@ class SBPtoKinematicsModel(nn.Module):
         """
         Args:
             sbp_masked: (B, W, 96) - masked SBP input
-            mask: (B, W, 96) - boolean mask
+            mask: (B, W, 96) - boolean mask, True where data is masked
             macro_time: (B, 1) - macro timestamp
 
         Returns:
-            kin_pred: (B, W, 4) - predicted kinematics
+            kin_pred: (B, W, 4) - predicted kinematics, sigmoid-clamped to [0, 1]
         """
-        # Get SBP features (no gradients flow back if frozen)
-        if self.sbp_model.training:
-            sbp_features = self.sbp_model(sbp_masked, mask, macro_time)  # (B, W, 96)
-        else:
+        # Get SBP features (frozen or trainable)
+        if self.freeze_sbp:
             with torch.no_grad():
                 sbp_features = self.sbp_model(sbp_masked, mask, macro_time)  # (B, W, 96)
+        else:
+            sbp_features = self.sbp_model(sbp_masked, mask, macro_time)  # (B, W, 96)
 
         # Predict kinematics from SBP features
         B, W, C = sbp_features.shape
         sbp_flat = sbp_features.reshape(B * W, C)  # (B*W, 96)
         kin_flat = self.kin_head(sbp_flat)  # (B*W, 4)
+
+        # Apply sigmoid to constrain to [0, 1] range (kinematics are normalized to [0, 1])
+        kin_flat = torch.sigmoid(kin_flat)
+
         kin_pred = kin_flat.reshape(B, W, 4)  # (B, W, 4)
 
         return kin_pred
