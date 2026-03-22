@@ -28,8 +28,15 @@ class LFADSKinematicDecoder(nn.Module):
     def forward(self, x):
         batch_size, seq_len, _ = x.size()
         
+        # --- NORMALIZATION ---
+        # Calculate mean and std per sample and channel for stability across sessions
+        # x shape: (batch, seq_len, channels)
+        mean = x.mean(dim=1, keepdim=True) # (batch, 1, channels)
+        std = x.std(dim=1, keepdim=True) + 1e-5 # (batch, 1, channels)
+        x_norm = (x - mean) / std
+        
         # --- ENCODER ---
-        _, h_n = self.encoder(x)
+        _, h_n = self.encoder(x_norm)
         # Concatenate final forward and backward hidden states
         h_n_concat = torch.cat((h_n[0], h_n[1]), dim=1) 
         
@@ -60,7 +67,11 @@ class LFADSKinematicDecoder(nn.Module):
             
             # Map to SBP
             sbp_t = self.fc_sbp(f_t)
-            sbp_preds.append(sbp_t.unsqueeze(1))
+            
+            # Un-normalize SBP prediction back to original scale 
+            # (matches sbp_imputed in loss calculation)
+            sbp_t_unnorm = (sbp_t * std.squeeze(1)) + mean.squeeze(1)
+            sbp_preds.append(sbp_t_unnorm.unsqueeze(1))
             
         kinematic_preds = torch.cat(kinematic_preds, dim=1)
         sbp_preds = torch.cat(sbp_preds, dim=1)

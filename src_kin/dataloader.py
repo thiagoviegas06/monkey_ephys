@@ -46,7 +46,7 @@ class KinematicsDataset(Dataset):
             "macro_timestamp": torch.tensor(w0, dtype=torch.float32) # required by MAE
         }
         
-        if self.is_train and "kin" in session and session["kin"] is not None:
+        if "kin" in session and session["kin"] is not None:
             kin_w = torch.from_numpy(session["kin"][w0:w0 + self.window_size])
             item["kin"] = kin_w.float()
             
