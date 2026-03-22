@@ -33,7 +33,7 @@ set -euo pipefail
 source /ext3/env.sh
 
 python src_mae/train.py --window-size 200
-python src_mae/eval.py --window-size 200 --model-path ./checkpoints_200/best_model_tcn_transformer.pth
+python src_mae/eval.py --window-size 200
 
 
 EOF
