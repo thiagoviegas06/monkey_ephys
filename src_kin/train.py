@@ -10,7 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src_kin.config import Config
 from src_kin.dataloader import get_dataloaders
 from src_kin.model import LFADSKinematicDecoder
-from src_kin.losses import lfads_loss
+from src_kin.losses import lfads_loss, calculate_r2
 from src_mae.model import SBP_TCN_Transformer
 
 def build_mae_model(config):
@@ -47,6 +47,7 @@ def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch
     
     total_loss = 0.0
     total_recon = 0.0
+    total_r2 = 0.0
     total_samples = 0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{config.num_epochs}")
@@ -77,24 +78,31 @@ def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch
         torch.nn.utils.clip_grad_norm_(lfads_model.parameters(), max_norm=5.0)
         optimizer.step()
         
+        # Metrics (not for backprop)
+        with torch.no_grad():
+            r2_score = calculate_r2(kin_pred, kin_target)
+        
         step += 1
         total_loss += loss.item() * batch_size
         total_recon += recon_loss.item() * batch_size
+        total_r2 += r2_score * batch_size
         total_samples += batch_size
         
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
             'recon(MSE)': f"{recon_loss.item():.4f}",
+            'R2': f"{r2_score:.4f}",
             'beta': f"{beta:.4f}"
         })
         
-    return total_loss / total_samples, total_recon / total_samples, step
+    return total_loss / total_samples, total_recon / total_samples, total_r2 / total_samples, step
 
 def validate_one_epoch(mae_model, lfads_model, dataloader, config, epoch, step):
     lfads_model.eval()
     
     total_loss = 0.0
     total_recon = 0.0
+    total_r2 = 0.0
     total_samples = 0
     
     pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}/{config.num_epochs}")
@@ -114,16 +122,21 @@ def validate_one_epoch(mae_model, lfads_model, dataloader, config, epoch, step):
                 kin_pred, kin_target, mu, logvar, step, config, sbp_pred, sbp_imputed
             )
             
+            # Metrics
+            r2_score = calculate_r2(kin_pred, kin_target)
+            
             total_loss += loss.item() * batch_size
             total_recon += recon_loss.item() * batch_size
+            total_r2 += r2_score * batch_size
             total_samples += batch_size
             
             pbar.set_postfix({
                 'val_loss': f"{loss.item():.4f}",
-                'val_recon': f"{recon_loss.item():.4f}"
+                'val_recon': f"{recon_loss.item():.4f}",
+                'val_R2': f"{r2_score:.4f}"
             })
             
-    return total_loss / total_samples, total_recon / total_samples
+    return total_loss / total_samples, total_recon / total_samples, total_r2 / total_samples
 
 def main():
     config = Config()
@@ -143,11 +156,11 @@ def main():
     step = 0
     
     for epoch in range(1, config.num_epochs + 1):
-        train_loss, train_recon, step = train_one_epoch(mae_model, lfads_model, train_loader, optimizer, config, epoch, step)
-        print(f"Epoch {epoch} Train: Loss={train_loss:.4f} Recon(MSE)={train_recon:.4f}")
+        train_loss, train_recon, train_r2, step = train_one_epoch(mae_model, lfads_model, train_loader, optimizer, config, epoch, step)
+        print(f"Epoch {epoch} Train: Loss={train_loss:.4f} Recon(MSE)={train_recon:.4f} R2={train_r2:.4f}")
         
-        val_loss, val_recon = validate_one_epoch(mae_model, lfads_model, val_loader, config, epoch, step)
-        print(f"Epoch {epoch} Val:   Loss={val_loss:.4f} Recon(MSE)={val_recon:.4f}")
+        val_loss, val_recon, val_r2 = validate_one_epoch(mae_model, lfads_model, val_loader, config, epoch, step)
+        print(f"Epoch {epoch} Val:   Loss={val_loss:.4f} Recon(MSE)={val_recon:.4f} R2={val_r2:.4f}")
         
         if val_loss < best_val_loss - config.early_stopping_min_delta:
             best_val_loss = val_loss

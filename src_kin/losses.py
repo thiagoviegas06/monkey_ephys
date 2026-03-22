@@ -25,3 +25,25 @@ def lfads_loss(kin_pred, kin_target, mu, logvar, step, config, sbp_pred=None, sb
         loss = loss + config.sbp_recon_weight * sbp_loss
         
     return loss, recon_loss, kl_loss, sbp_loss, beta
+
+def calculate_r2(y_pred, y_true):
+    """
+    Calculates the R^2 (Coefficient of Determination) score for the first 2 position channels.
+    y_pred, y_true: (Batch, Time, Channels)
+    """
+    # Extract only the first 2 channels (index_pos, mrp_pos)
+    y_pred = y_pred[..., :2]
+    y_true = y_true[..., :2]
+    
+    # Flatten Batch and Time dimensions
+    y_pred_flat = y_pred.reshape(-1, 2)
+    y_true_flat = y_true.reshape(-1, 2)
+    
+    ss_res = torch.sum((y_true_flat - y_pred_flat) ** 2, dim=0)
+    
+    # Calculate mean per channel across all samples in the flattened array
+    mean_true = torch.mean(y_true_flat, dim=0)
+    ss_tot = torch.sum((y_true_flat - mean_true) ** 2, dim=0)
+    
+    r2 = 1 - (ss_res / (ss_tot + 1e-8))
+    return r2.mean().item()
