@@ -57,7 +57,6 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None)
     
     # Progress bar
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{config.num_epochs}")
-    tqdm.write("\n")
     
     for batch_idx, batch in enumerate(pbar):
         # Move batch to device
@@ -111,7 +110,7 @@ def validate_one_epoch(model, dataloader, config, epoch):
     
     # Progress bar
     pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}/{config.num_epochs}")
-    tqdm.write("\n")
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(pbar):
             x_sbp = batch["x_sbp"].to(config.device)  # (B, W, C)
@@ -233,7 +232,7 @@ def main():
         print(f"\nEpoch {epoch}/{config.num_epochs}")
         
         train_loss = train_one_epoch(model, train_loader, optimizer, config, epoch, scheduler=scheduler)
-        print(f"\n\tTrain NMSE Loss: {train_loss:.6f}")
+        print(f"\tTrain NMSE Loss: {train_loss:.6f}")
         val_loss = validate_one_epoch(model, val_loader, config, epoch)
         print(f"\tVal NMSE Loss: {val_loss:.6f}")
 

@@ -8,7 +8,7 @@ from torch.utils.data.dataset import random_split
 import random
 from tqdm import tqdm
 
-from preprocessing import sessionData, sample_multi_span_lengths_and_starts, apply_multi_span_mask_to_window, compute_session_channel_variance
+from preprocessing import sessionData, compute_session_channel_variance
 
 # ============================================================================
 # Dataset Class
@@ -46,44 +46,24 @@ class SBPDataset(Dataset):
         if self.is_train:
             x_sbp = y_sbp.clone()
             mask = torch.zeros_like(y_sbp, dtype=torch.bool)
-            C = y_sbp.shape[1]
             
-            # 4. Fast inline dynamic masking
-            num_spans = torch.randint(2, 4, (1,)).item()
-            # Approx triangular distribution
-            span_lengths = torch.randint(45, 85, (num_spans,)) 
+            # Select one of the 3 fixed mask sets
+            mask_idx = random.randint(0, 2)
+            channels = self.config.fixed_mask_sets[mask_idx]
             
-            total_len = span_lengths.sum().item() + (num_spans - 1) * 10
-            if total_len < self.window_size:
-                available_starts = self.window_size - total_len
-                offsets = torch.rand(num_spans)
-                offsets = (offsets / (offsets.sum() + 1e-6) * available_starts).int()
-                
-                curr_t = 0
-                for i in range(num_spans):
-                    curr_t += offsets[i].item()
-                    t0 = curr_t
-                    t1 = t0 + span_lengths[i].item()
-                    
-                    num_channels = torch.randint(20, 40, (1,)).item()
-                    channels = torch.randperm(C)[:num_channels]
-                    
-                    x_sbp[t0:t1, channels] = 0.0
-                    mask[t0:t1, channels] = True
-                    
-                    curr_t = t1 + 10
+            x_sbp[:, channels] = 0.0
+            mask[:, channels] = True
 
         else:
-            # Deterministic for validation
-            rng = np.random.default_rng(idx + 42)
-            y_np = y_sbp.numpy().copy()
+            # Deterministic for validation: round-robin through the sets
+            x_sbp = y_sbp.clone()
+            mask = torch.zeros_like(y_sbp, dtype=torch.bool)
             
-            num_spans = 2
-            spans = sample_multi_span_lengths_and_starts(rng, self.window_size, num_spans=num_spans, min_gap=10)
-            x_np, m_np = apply_multi_span_mask_to_window(y_np, spans, num_spans=num_spans, rng=rng)
+            mask_idx = idx % 3
+            channels = self.config.fixed_mask_sets[mask_idx]
             
-            x_sbp = torch.from_numpy(x_np)
-            mask = torch.from_numpy(m_np)
+            x_sbp[:, channels] = 0.0
+            mask[:, channels] = True
 
         return {
             "x_sbp": x_sbp.float(),

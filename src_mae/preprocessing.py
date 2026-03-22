@@ -3,6 +3,7 @@ import numpy as np
 import pickle
 import os
 from tqdm import tqdm
+from config import Config
 
 # paste your rows here once; or load from csv
 STATS = [
@@ -192,10 +193,12 @@ def apply_multi_span_mask_to_window(sbp, spans, num_spans=2, rng=None, min_gap=1
     x = sbp.copy()
     mask = np.zeros((W, C), dtype=bool)
 
-    for t0, t1 in spans:
-        channels = rng.choice(C, size=rng.integers(20, 40), replace=False)
-        x[t0:t1, channels] = 0.0
-        mask[t0:t1, channels] = True
+    # Use one of 3 fixed mask sets (30% channels masked)
+    mask_idx = rng.integers(0, 3)
+    channels = Config.fixed_mask_sets[mask_idx]
+    
+    x[:, channels] = 0.0
+    mask[:, channels] = True
 
     return x, mask
 
