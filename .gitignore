@@ -1,21 +1,30 @@
-/kaggle_data
-/kaggle_data_phase2
-submission.csv
-*.csv
-analyze_predictions.ipynb
-*.zip
-/checkpoints*
-/logs
+# Data
+/kaggle_data/
+/kaggle_data_phase2/
+
+# Model Checkpoints & Logs
+/checkpoints*/
+/logs/
 *.pth
+
+# Submissions & Results
+submission.csv
+submission_*.csv
+*.csv
+*.zip
+
+# Python & Development
+**/__pycache__/
 src_mae/drift_estimation.py
-helpers
-GEMINI.md
+analyze_predictions.ipynb
+helpers/
 
-
-/src/__pycache__
-/src_mae/__pycache__
-/.vscode
+# Editor & System Files
+/.vscode/
 *.~
 *.un~
 *~
 *.out
+
+# Project Specific
+GEMINI.md
