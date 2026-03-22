@@ -47,12 +47,32 @@ class SBPDataset(Dataset):
             x_sbp = y_sbp.clone()
             mask = torch.zeros_like(y_sbp, dtype=torch.bool)
             
-            # Select one of the 3 fixed mask sets
-            mask_idx = random.randint(0, 2)
-            channels = self.config.fixed_mask_sets[mask_idx]
+            # Fast inline dynamic masking (bypasses old_preprocessing.py)
+            num_spans = torch.randint(2, 4, (1,)).item()
+            # Approx triangular distribution (45 to 85 length for 400 window, 20, 50 for 200)
+            span_lengths = torch.randint(45, 85, (num_spans,)) 
             
-            x_sbp[:, channels] = 0.0
-            mask[:, channels] = True
+            total_len = span_lengths.sum().item() + (num_spans - 1) * 10
+            if total_len < self.window_size:
+                available_starts = self.window_size - total_len
+                # Distribute the remaining gap space randomly
+                offsets = torch.rand(num_spans)
+                offsets = (offsets / (offsets.sum() + 1e-6) * available_starts).int()
+                
+                curr_t = 0
+                for i in range(num_spans):
+                    curr_t += offsets[i].item()
+                    t0 = curr_t
+                    t1 = t0 + span_lengths[i].item()
+                    
+                    # Fast channel selection using randperm
+                    num_channels = torch.randint(20, 40, (1,)).item()
+                    channels = torch.randperm(C)[:num_channels]
+                    
+                    x_sbp[t0:t1, channels] = 0.0
+                    mask[t0:t1, channels] = True
+                    
+                    curr_t = t1 + 10 # Enforce minimum gap
 
         else:
             # Deterministic for validation: round-robin through the sets
