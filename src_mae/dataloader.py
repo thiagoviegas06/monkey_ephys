@@ -9,6 +9,7 @@ import random
 from tqdm import tqdm
 
 from preprocessing import sessionData, compute_session_channel_variance
+from preprocessing import sample_multi_span_lengths_and_starts, apply_multi_span_mask_to_window
 
 # ============================================================================
 # Dataset Class
@@ -77,14 +78,23 @@ class SBPDataset(Dataset):
 
         else:
             # Deterministic for validation: round-robin through the sets
-            x_sbp = y_sbp.clone()
-            mask = torch.zeros_like(y_sbp, dtype=torch.bool)
+            rng = np.random.default_rng(idx + 42) 
+            session = rng.choice(self.sessions_data)
             
-            mask_idx = idx % 3
-            channels = self.config.fixed_mask_sets[mask_idx]
+            max_start = session["N"] - self.window_size
+            w0 = rng.integers(0, max_start + 1)
             
-            x_sbp[:, channels] = 0.0
-            mask[:, channels] = True
+            y_np = session["sbp"][w0:w0 + self.window_size].copy()
+            kin_np = session["kin"][w0:w0 + self.window_size].copy()
+            
+            num_spans = 2
+            spans = sample_multi_span_lengths_and_starts(rng, self.window_size, num_spans=num_spans, min_gap=10)
+            x_np, m_np = apply_multi_span_mask_to_window(y_np, spans, num_spans=num_spans, rng=rng)
+            
+            x_sbp = torch.from_numpy(x_np)
+            y_sbp = torch.from_numpy(y_np)
+            mask = torch.from_numpy(m_np)
+            kin_w = torch.from_numpy(kin_np)
 
         return {
             "x_sbp": x_sbp.float(),
