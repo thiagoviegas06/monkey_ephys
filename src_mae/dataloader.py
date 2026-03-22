@@ -42,6 +42,7 @@ class SBPDataset(Dataset):
         
         y_sbp = torch.from_numpy(session["sbp"][w0:w0 + self.window_size])
         kin_w = torch.from_numpy(session["kin"][w0:w0 + self.window_size])
+        C = y_sbp.shape[1]
 
         if self.is_train:
             x_sbp = y_sbp.clone()
