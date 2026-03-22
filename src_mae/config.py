@@ -13,17 +13,15 @@ class Config:
     seed = 42
     
     # Preprocessing
-    preprocess = False  # Set True to run preprocessing (only needed once)
+    preprocess = False  # Data is now loaded dynamically to improve training times. Same proces and seed are utilzied for reproducibility.
     windows_dir = f"kaggle_data/masked_windows_{window_size}"  # Where preprocessed windows are saved
     lag_bins = 0
     
     # Model
-    model_name = "tcn_transformer"   # Options: "unet", "simple_cnn", "resnet", "transformer", "tcn_transformer"
-    base_channels = 64   # For UNet/ResNet
+    model_name = "tcn_transformer"
     sbp_channels = 96
-    kin_channels = 4
     
-    # For transformer model
+    # SBP_TCN_Transformer Hyperparameters
     d_model = 64  # Embedding dimension for transformer
     nhead = 8  # Number of attention heads
     num_layers = 8 # Number of transformer encoder blocks stacked on top of each other

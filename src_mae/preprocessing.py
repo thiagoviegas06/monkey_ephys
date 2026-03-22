@@ -257,7 +257,6 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
 def preprocess_overlapping_dynamic(data_path, window_size=200, step_size=50, lag_bins=0):
     """
     Saves ONLY ground truth overlapping windows. Masking is left to the DataLoader.
-    Applies biological kinematic shift.
     """
     out_dir = os.path.join(data_path, f"unmasked_windows_{window_size}")
     os.makedirs(out_dir, exist_ok=True)
@@ -272,14 +271,6 @@ def preprocess_overlapping_dynamic(data_path, window_size=200, step_size=50, lag
             
         sbp, kin, starts_bins, end_bins = session.load_data(data_path)
         if sbp is None: continue
-        
-        # 1. Apply Kinematic Shift
-        kin_aligned = np.zeros_like(kin)
-        if lag_bins > 0:
-            kin_aligned[lag_bins:] = kin[:-lag_bins]
-        else:
-            kin_aligned = kin
-        kin = kin_aligned
 
         N = sbp.shape[0]
         

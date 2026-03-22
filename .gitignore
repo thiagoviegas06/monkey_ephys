@@ -11,3 +11,10 @@ analyze_predictions.ipynb
 *.pth
 src_mae/drift_estimation.py
 helpers
+GEMINI.md
+
+
+*.~
+*.un~
+*~
+*.out
