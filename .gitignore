@@ -1,11 +1,9 @@
 /kaggle_data
+/kaggle_data_phase2
 submission.csv
-/src/__pycache__
 *.csv
 analyze_predictions.ipynb
-/src_mae/__pycache__
 *.zip
-/.vscode
 /checkpoints*
 /logs
 *.pth
@@ -14,6 +12,9 @@ helpers
 GEMINI.md
 
 
+/src/__pycache__
+/src_mae/__pycache__
+/.vscode
 *.~
 *.un~
 *~
