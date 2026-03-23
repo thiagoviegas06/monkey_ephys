@@ -210,7 +210,7 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
     for session in sessions:
         if session.isTest():
             continue
-        sbp, kin, starts_bins, end_bins = session.load_data(data_path)
+        sbp, kin, _, _ = session.load_data(data_path)
         if sbp is None:
             continue
         N = sbp.shape[0]

@@ -153,7 +153,7 @@ def get_dataloaders(config, batch_size=32, val_split=0.2, shuffle=True, num_work
             "sbp": sbp_norm,  # Normalized!
             "kin": kin_norm,  # Normalized!
             "N": sbp.shape[0],
-            "channel_var": compute_session_channel_variance(sbp),  # Compute from raw for loss weighting
+            "channel_var": compute_session_channel_variance(sbp_norm),  # Compute from normalized data
             "session_id": session.session_id,
             "sbp_mean": sbp_mean,  # Store for denormalization
             "sbp_std": sbp_std,
