@@ -13,7 +13,7 @@ class Config:
     seed = 42
     
     # Preprocessing
-    preprocess = False  # Set True to run preprocessing (only needed once)
+    preprocess = True  # Set True to run preprocessing (only needed once)
     windows_dir = f"kaggle_data/masked_windows_{window_size}"  # Where preprocessed windows are saved
     lag_bins = 0
     

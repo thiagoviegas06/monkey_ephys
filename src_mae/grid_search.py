@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument("--early-min-delta", type=str, default="1e-4", help="Comma-separated early stopping min delta")
 
     parser.add_argument("--model-name", type=str, default="unet", help="Model name (unet/simple_cnn/resnet)")
-    parser.add_argument("--windows-dir", type=str, default="kaggle_data/masked_windows", help="Windows directory")
+    parser.add_argument("--windows-dir", type=str, default="kaggle_data/masked_windows_200", help="Windows directory")
     parser.add_argument("--data-path", type=str, default="kaggle_data", help="Data root path")
     parser.add_argument("--save-every", type=int, default=5, help="Checkpoint cadence")
 
