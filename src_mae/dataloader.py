@@ -112,14 +112,19 @@ class SBPDataset(Dataset):
         if session_id in self.session_stats:
             mean, std = self.session_stats[session_id]
         else:
-            # Fallback: use window-level statistics
-            visible_mask = ~mask
-            if visible_mask.sum() > 0:
-                mean = y_sbp[visible_mask].mean(axis=0)
-                std = y_sbp[visible_mask].std(axis=0) + 1e-5
-            else:
-                mean = y_sbp.mean(axis=0)
-                std = y_sbp.std(axis=0) + 1e-5
+            # Fallback: use window-level statistics (compute per-channel)
+            # Compute mean/std for each channel independently
+            mean = np.zeros(y_sbp.shape[1], dtype=np.float32)
+            std = np.zeros(y_sbp.shape[1], dtype=np.float32)
+            for c in range(y_sbp.shape[1]):
+                channel_vals = y_sbp[~mask[:, c], c]
+                if len(channel_vals) > 0:
+                    mean[c] = channel_vals.mean()
+                    std[c] = channel_vals.std() + 1e-5
+                else:
+                    # If no visible values, use full channel
+                    mean[c] = y_sbp[:, c].mean()
+                    std[c] = y_sbp[:, c].std() + 1e-5
 
         # Apply per-session z-score normalization
         x_sbp_norm = (x_sbp - mean) / std
