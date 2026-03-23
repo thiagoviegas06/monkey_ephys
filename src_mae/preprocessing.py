@@ -204,8 +204,8 @@ def compute_session_channel_variance(sbp):
     session_variance = np.var(sbp, axis=0)
     return session_variance
 
-def preprocess_non_overlapping(data_path, window_size=128, seed=0):
-    out_dir = os.path.join(data_path, "masked_windows")
+def preprocess_non_overlapping(data_path, window_size=200, seed=0):
+    out_dir = os.path.join(data_path, f"masked_windows_{window_size}")  # Include window_size for consistency
     os.makedirs(out_dir, exist_ok=True)
     sessions, max_bin_count = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
 
@@ -222,14 +222,28 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
         w0s = non_overlapping_windows(N, window_size)
         print(f"{session.session_id} | N={N} | windows={len(w0s)}")
 
+        # ===== PER-SESSION Z-SCORE NORMALIZATION =====
+        # Compute statistics from FULL session (not window-level)
+        sbp_mean = sbp.mean(axis=0)  # (96,)
+        sbp_std = sbp.std(axis=0) + 1e-5  # (96,) add epsilon for stability
+        kin_mean = kin.mean(axis=0)  # (4,)
+        kin_std = kin.std(axis=0) + 1e-5  # (4,)
+
+        # Normalize full session
+        sbp_norm = (sbp - sbp_mean) / sbp_std  # (N, 96) z-normalized
+        kin_norm = (kin - kin_mean) / kin_std  # (N, 4) z-normalized
+
+        # Compute variance from RAW (unnormalized) data for loss weighting
         session_variance = compute_session_channel_variance(sbp)
         variance_shape = session_variance.shape
         print(f"  Session channel variance shape: {variance_shape}")
         print(f"  Session channel variance (mean across channels): {session_variance.mean():.4f}")
+        print(f"  SBP z-norm: mean={sbp_norm.mean():.6f}, std={sbp_norm.std():.6f}")
+        print(f"  Kin z-norm: mean={kin_norm.mean():.6f}, std={kin_norm.std():.6f}")
 
         for w0 in w0s:
-            y = sbp[w0:w0 + window_size]          # (W,96)
-            kin_w = kin[w0:w0 + window_size]      # (W,4)
+            y = sbp_norm[w0:w0 + window_size]    # (W,96) - FROM NORMALIZED
+            kin_w = kin_norm[w0:w0 + window_size]  # (W,4) - FROM NORMALIZED
 
             random_two_three = rng.integers(2, 4)  # 2 or 3 spans
             spans = sample_multi_span_lengths_and_starts(rng, window_size, num_spans=random_two_three, min_gap=10)
@@ -240,12 +254,17 @@ def preprocess_non_overlapping(data_path, window_size=128, seed=0):
                 "y_sbp": y.astype(np.float32),
                 "mask": M,
                 "kin": kin_w.astype(np.float32),
-                "channel_var": session_variance.astype(np.float32),  # (96,) per-channel variance from full session
+                "channel_var": session_variance.astype(np.float32),  # (96,) per-channel variance from RAW data
                 "session_id": session.session_id,
                 "w0": int(w0),
                 "spans": spans,
                 "day": float(session.day),
                 "day_from_nearest": float(session.day_from_nearest),
+                # ===== NORMALIZATION STATISTICS FOR DENORMALIZATION =====
+                "sbp_mean": sbp_mean.astype(np.float32),  # (96,) per-session mean
+                "sbp_std": sbp_std.astype(np.float32),    # (96,) per-session std
+                "kin_mean": kin_mean.astype(np.float32),  # (4,) per-session mean
+                "kin_std": kin_std.astype(np.float32),    # (4,) per-session std
             }
 
             sample_path = os.path.join(out_dir, f"{session.session_id}_{w0}.pkl")

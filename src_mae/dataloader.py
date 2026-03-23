@@ -112,29 +112,53 @@ def get_dataloaders(config, batch_size=32, val_split=0.2, shuffle=True, num_work
     """
     Creates Training and Validation DataLoaders directly from RAM.
     Splits sessions 80/20 to prevent data leakage.
-    Uses Kinematic-Neural Signatures for robust channel alignment.
+    APPLIES PER-SESSION Z-SCORE NORMALIZATION (project requirement for drift handling).
     """
-    
+
     print("Loading full sessions into RAM for dynamic augmentation...")
     sessions, _ = sessionData(f"{config.data_path}/metadata.csv").generate_session_obj()
-    
+
     all_sessions_data = []
-    base_sig = None
-    
+
+    # First pass: load sessions and compute per-session normalization statistics
+    print("Computing per-session normalization statistics...")
+    session_norm_stats = {}  # {session_id: {'sbp_mean': (96,), 'sbp_std': (96,), 'kin_mean': (4,), 'kin_std': (4,)}}
+
     for session in tqdm(sessions, desc="Processing sessions"):
         if session.isTest():
             continue
-            
+
         sbp, kin, _, _ = session.load_data(config.data_path)
         if sbp is None or sbp.shape[0] < config.window_size:
             continue
-            
+
+        # Compute per-session statistics
+        sbp_mean = sbp.mean(axis=0)  # (96,)
+        sbp_std = sbp.std(axis=0) + 1e-5  # (96,)
+        kin_mean = kin.mean(axis=0)  # (4,)
+        kin_std = kin.std(axis=0) + 1e-5  # (4,)
+
+        # Normalize session data
+        sbp_norm = (sbp - sbp_mean) / sbp_std  # (N, 96) z-normalized
+        kin_norm = (kin - kin_mean) / kin_std  # (N, 4) z-normalized
+
+        session_norm_stats[session.session_id] = {
+            'sbp_mean': sbp_mean,
+            'sbp_std': sbp_std,
+            'kin_mean': kin_mean,
+            'kin_std': kin_std,
+        }
+
         session_dict = {
-            "sbp": sbp,
-            "kin": kin,
+            "sbp": sbp_norm,  # Normalized!
+            "kin": kin_norm,  # Normalized!
             "N": sbp.shape[0],
-            "channel_var": compute_session_channel_variance(sbp),
+            "channel_var": compute_session_channel_variance(sbp),  # Compute from raw for loss weighting
             "session_id": session.session_id,
+            "sbp_mean": sbp_mean,  # Store for denormalization
+            "sbp_std": sbp_std,
+            "kin_mean": kin_mean,
+            "kin_std": kin_std,
         }
         all_sessions_data.append(session_dict)
         

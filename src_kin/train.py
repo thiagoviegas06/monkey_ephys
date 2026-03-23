@@ -12,7 +12,7 @@ from src_kin.dataloader import get_dataloaders
 from src_kin.model import LFADSKinematicDecoder
 from src_kin.losses import lfads_loss, calculate_r2
 from src_mae.model import SBP_TCN_Transformer
-from src_kin.compute_kin_stats import compute_kin_stats
+from src_kin.compute_kin_stats import compute_per_session_kin_stats
 
 def build_mae_model(config):
     # Builds the SBP_TCN_Transformer with Phase 1 config
@@ -43,29 +43,33 @@ def build_lfads_model(config):
     )
     return model.to(config.device)
 
-def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch, step, kin_mean=None, kin_std=None):
+def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch, step, session_kin_stats=None):
     lfads_model.train()
-    
+
     total_loss = 0.0
     total_recon = 0.0
     total_r2 = 0.0
     total_samples = 0
-    
-    # Ensure stats are on the correct device
-    if kin_mean is not None:
-        kin_mean = kin_mean.to(config.device)
-        kin_std = kin_std.to(config.device)
-    
+
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{config.num_epochs}")
     for batch in pbar:
         sbp_masked = batch["sbp_masked"].to(config.device) # (B, W, C)
         mask = batch["mask"].to(config.device) # (B, W, C)
         macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float() # (B, 1)
         kin_target = batch["kin"].to(config.device) # (B, W, 4)
-        
-        # Normalize targets (Global Z-Score)
-        if kin_mean is not None:
-            kin_target = (kin_target - kin_mean) / kin_std
+        session_ids = batch["session_id"]  # List of session IDs
+
+        # Normalize targets per-session (Z-Score Normalization)
+        if session_kin_stats is not None:
+            kin_target_norm = torch.zeros_like(kin_target)
+            for i, sid in enumerate(session_ids):
+                if sid in session_kin_stats:
+                    mean = session_kin_stats[sid]['mean'].to(config.device)
+                    std = session_kin_stats[sid]['std'].to(config.device)
+                    kin_target_norm[i] = (kin_target[i] - mean) / std
+                else:
+                    kin_target_norm[i] = kin_target[i]  # Fallback: no normalization
+            kin_target = kin_target_norm
         
         batch_size = sbp_masked.size(0)
         optimizer.zero_grad()
@@ -110,19 +114,14 @@ def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch
         
     return total_loss / total_samples, total_recon / total_samples, total_r2 / total_samples, step
 
-def validate_one_epoch(mae_model, lfads_model, dataloader, config, epoch, step, kin_mean=None, kin_std=None):
+def validate_one_epoch(mae_model, lfads_model, dataloader, config, epoch, step, session_kin_stats=None):
     lfads_model.eval()
-    
+
     total_loss = 0.0
     total_recon = 0.0
     total_r2 = 0.0
     total_samples = 0
-    
-    # Ensure stats are on the correct device
-    if kin_mean is not None:
-        kin_mean = kin_mean.to(config.device)
-        kin_std = kin_std.to(config.device)
-    
+
     pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}/{config.num_epochs}")
     with torch.no_grad():
         for batch in pbar:
@@ -130,10 +129,19 @@ def validate_one_epoch(mae_model, lfads_model, dataloader, config, epoch, step, 
             mask = batch["mask"].to(config.device)
             macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()
             kin_target = batch["kin"].to(config.device)
-            
-            # Normalize targets
-            if kin_mean is not None:
-                kin_target = (kin_target - kin_mean) / kin_std
+            session_ids = batch["session_id"]  # List of session IDs
+
+            # Normalize targets per-session (Z-Score Normalization)
+            if session_kin_stats is not None:
+                kin_target_norm = torch.zeros_like(kin_target)
+                for i, sid in enumerate(session_ids):
+                    if sid in session_kin_stats:
+                        mean = session_kin_stats[sid]['mean'].to(config.device)
+                        std = session_kin_stats[sid]['std'].to(config.device)
+                        kin_target_norm[i] = (kin_target[i] - mean) / std
+                    else:
+                        kin_target_norm[i] = kin_target[i]  # Fallback: no normalization
+                kin_target = kin_target_norm
             
             batch_size = sbp_masked.size(0)
             
@@ -173,20 +181,21 @@ def main():
     
     print("Loading data...")
     train_loader, val_loader, _, _ = get_dataloaders(config, num_workers=4)
-    
-    # Compute global statistics for kinematics
-    print("Computing kinematics statistics...")
-    kin_mean, kin_std = compute_kin_stats(config.data_path)
-    
+
+    # Compute PER-SESSION kinematics statistics (Z-score normalization)
+    print("Computing per-session kinematics statistics...")
+    print("  (Project requirement: 'per-session z-score normalization is THE key ingredient for drift handling')")
+    session_kin_stats = compute_per_session_kin_stats(config.data_path)
+
     best_val_loss = float('inf')
     epochs_without_improvement = 0
     step = 0
-    
+
     for epoch in range(1, config.num_epochs + 1):
-        train_loss, train_recon, train_r2, step = train_one_epoch(mae_model, lfads_model, train_loader, optimizer, config, epoch, step, kin_mean, kin_std)
+        train_loss, train_recon, train_r2, step = train_one_epoch(mae_model, lfads_model, train_loader, optimizer, config, epoch, step, session_kin_stats)
         print(f"Epoch {epoch} Train: Loss={train_loss:.4f} Recon(MSE)={train_recon:.4f} R2={train_r2:.4f}")
-        
-        val_loss, val_recon, val_r2 = validate_one_epoch(mae_model, lfads_model, val_loader, config, epoch, step, kin_mean, kin_std)
+
+        val_loss, val_recon, val_r2 = validate_one_epoch(mae_model, lfads_model, val_loader, config, epoch, step, session_kin_stats)
         print(f"Epoch {epoch} Val:   Loss={val_loss:.4f} Recon(MSE)={val_recon:.4f} R2={val_r2:.4f}")
         
         if val_loss < best_val_loss - config.early_stopping_min_delta:

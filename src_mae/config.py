@@ -13,7 +13,7 @@ class Config:
     seed = 42
     
     # Preprocessing
-    preprocess = False  # Data is now loaded dynamically to improve training times. Same proces and seed are utilzied for reproducibility.
+    preprocess = True  # Data is now loaded dynamically to improve training times. Same proces and seed are utilzied for reproducibility.
     windows_dir = f"kaggle_data/masked_windows_{window_size}"  # Where preprocessed windows are saved
     lag_bins = 0
     
