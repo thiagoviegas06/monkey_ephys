@@ -40,8 +40,14 @@ class Config:
     
     # LFADS Loss Hyperparameters
     beta_anneal_steps = 2000 # Number of batches to linearly anneal beta
-    max_beta = 0.1 # Maximum weight for the KL divergence penalty
-    sbp_recon_weight = 1.0 # Weight for the multi-task SBP reconstruction
+    max_beta = 0.01 # Maximum weight for the KL divergence penalty
+    kin_recon_weight = 50.0 # Weight for the kinematic reconstruction loss
+    correlation_weight = 10.0 # Weight for the Pearson correlation loss
+    acceleration_weight = 1.0 # Weight for the acceleration penalty (smoothing)
+    sbp_recon_weight = 0.0 # Weight for the multi-task SBP reconstruction (disabled as requested)
+    
+    # Smoothing
+    smoothing_kernel_size = 5 # Kernel size for moving average smoothing
     
     # Device
     device = "cuda" if torch.cuda.is_available() else "cpu"

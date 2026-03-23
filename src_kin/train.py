@@ -70,9 +70,10 @@ def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch
         kin_pred, sbp_pred, mu, logvar = lfads_model(sbp_imputed)
         
         # Loss
-        loss, recon_loss, kl_loss, sbp_loss, beta = lfads_loss(
+        loss_dict = lfads_loss(
             kin_pred, kin_target, mu, logvar, step, config, sbp_pred, sbp_imputed
         )
+        loss = loss_dict["loss"]
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(lfads_model.parameters(), max_norm=5.0)
@@ -84,15 +85,17 @@ def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch
         
         step += 1
         total_loss += loss.item() * batch_size
-        total_recon += recon_loss.item() * batch_size
+        total_recon += loss_dict["recon_mse"].item() * batch_size
         total_r2 += r2_score * batch_size
         total_samples += batch_size
         
         pbar.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'recon(MSE)': f"{recon_loss.item():.4f}",
+            'loss': f"{loss.item():.2f}",
+            'mse': f"{loss_dict['recon_mse'].item():.4f}",
+            'corr': f"{loss_dict['corr_loss'].item():.4f}",
+            'accel': f"{loss_dict['accel_loss'].item():.4f}",
             'R2': f"{r2_score:.4f}",
-            'beta': f"{beta:.4f}"
+            'beta': f"{loss_dict['beta']:.4f}"
         })
         
     return total_loss / total_samples, total_recon / total_samples, total_r2 / total_samples, step
@@ -118,21 +121,22 @@ def validate_one_epoch(mae_model, lfads_model, dataloader, config, epoch, step):
             sbp_imputed = mae_model(sbp_masked, mask, macro_timestamp)
             kin_pred, sbp_pred, mu, logvar = lfads_model(sbp_imputed)
             
-            loss, recon_loss, kl_loss, sbp_loss, beta = lfads_loss(
+            loss_dict = lfads_loss(
                 kin_pred, kin_target, mu, logvar, step, config, sbp_pred, sbp_imputed
             )
+            loss = loss_dict["loss"]
             
             # Metrics
             r2_score = calculate_r2(kin_pred, kin_target)
             
             total_loss += loss.item() * batch_size
-            total_recon += recon_loss.item() * batch_size
+            total_recon += loss_dict["recon_mse"].item() * batch_size
             total_r2 += r2_score * batch_size
             total_samples += batch_size
             
             pbar.set_postfix({
-                'val_loss': f"{loss.item():.4f}",
-                'val_recon': f"{recon_loss.item():.4f}",
+                'val_loss': f"{loss.item():.2f}",
+                'val_mse': f"{loss_dict['recon_mse'].item():.4f}",
                 'val_R2': f"{r2_score:.4f}"
             })
             

@@ -39,6 +39,24 @@ def build_models(config):
 
     return mae, lfads
 
+def smooth_predictions(preds, kernel_size=5):
+    """
+    Applies a simple moving average filter to the predictions.
+    preds: (N, C) numpy array
+    """
+    if kernel_size <= 1:
+        return preds
+    
+    smoothed = np.zeros_like(preds)
+    for c in range(preds.shape[1]):
+        # Pad to handle edge effects
+        pad_size = kernel_size // 2
+        padded = np.pad(preds[:, c], (pad_size, pad_size), mode='edge')
+        conv = np.convolve(padded, np.ones(kernel_size)/kernel_size, mode='valid')
+        # Handle case where conv might be slightly different length due to rounding
+        smoothed[:, c] = conv[:preds.shape[0]]
+    return smoothed
+
 @torch.no_grad()
 def predict_session(mae, lfads, sbp, config):
     N = sbp.shape[0]
@@ -86,13 +104,16 @@ def run_eval():
         sbp, _ = session.load_data()
         if sbp is None: continue
         preds = predict_session(mae, lfads, sbp, config)
+        
+        # Apply smoothing
+        preds = smooth_predictions(preds, kernel_size=config.smoothing_kernel_size)
+        
         predictions[session.session_id] = preds
         
     print("Constructing submission...")
     sub_path = os.path.join(config.data_path, "sample_submission.csv")
     sub = pd.read_csv(sub_path)
     
-    # Assuming first two columns predicted are index_pos and mrp_pos
     # Positions are physically bounded to [0, 1]
     for session_id, preds in predictions.items():
         idx = sub["session_id"] == session_id
@@ -100,6 +121,7 @@ def run_eval():
         
         time_bins = sub.loc[idx, "time_bin"].to_numpy(dtype=np.int64)
         
+        # Clip to [0, 1] after smoothing
         sub.loc[idx, "index_pos"] = np.clip(preds[time_bins, 0], 0, 1)
         sub.loc[idx, "mrp_pos"] = np.clip(preds[time_bins, 1], 0, 1)
         
