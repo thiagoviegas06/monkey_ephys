@@ -54,30 +54,39 @@ class SBPDataset(Dataset):
     def _compute_session_stats(self):
         """Compute per-session mean and std from all windows in that session."""
         print("Computing per-session normalization statistics...")
-        session_data = {}  # {session_id: list of (x_sbp, y_sbp) arrays}
+        session_data = {}  # {session_id: list of observed channels}
 
-        # First pass: collect all samples per session
+        # First pass: collect all observed values per session and channel
         for file_path in self.sample_files:
             with open(file_path, 'rb') as f:
                 sample = pickle.load(f)
             session_id = sample["session_id"]
             if session_id not in session_data:
-                session_data[session_id] = []
-            # Store observed values (where mask=False)
-            x_sbp = sample["x_sbp"]  # (W, 96)
-            y_sbp = sample["y_sbp"]  # (W, 96)
-            mask = sample["mask"]    # (W, 96) bool
-            # Only use observed (non-masked) values for statistics
-            observed_sbp = y_sbp[~mask]
-            session_data[session_id].append(observed_sbp)
+                session_data[session_id] = [[] for _ in range(96)]  # 96 channels
 
-        # Second pass: compute mean and std per session
-        for session_id, observed_list in session_data.items():
-            # Concatenate all observed values for this session
-            all_observed = np.concatenate(observed_list, axis=0)  # (num_obs, 96)
-            # Compute per-channel statistics
-            mean = all_observed.mean(axis=0)  # (96,)
-            std = all_observed.std(axis=0) + 1e-5  # (96,) add epsilon for numerical stability
+            y_sbp = sample["y_sbp"].astype(np.float32)  # (W, 96)
+            mask = sample["mask"]    # (W, 96) bool
+
+            # Collect observed values per channel
+            for c in range(96):
+                observed_vals = y_sbp[~mask[:, c], c]
+                session_data[session_id][c].append(observed_vals)
+
+        # Second pass: compute mean and std per session and channel
+        for session_id, channel_lists in session_data.items():
+            mean = np.zeros(96, dtype=np.float32)
+            std = np.zeros(96, dtype=np.float32)
+
+            for c in range(96):
+                if channel_lists[c]:  # If we have observed values for this channel
+                    all_observed_c = np.concatenate(channel_lists[c])
+                    mean[c] = all_observed_c.mean()
+                    std[c] = all_observed_c.std() + 1e-5
+                else:
+                    # Fallback: use 0 mean and 1 std if no observed values
+                    mean[c] = 0.0
+                    std[c] = 1.0
+
             self.session_stats[session_id] = (mean, std)
 
         print(f"✓ Computed stats for {len(self.session_stats)} sessions")
@@ -170,39 +179,58 @@ class SBPDatasetDynamic(Dataset):
             w0 = torch.randint(0, max_start + 1, (1,)).item()
             
             # 3. Zero-Copy Tensor Creation: View the array, clone once for x_sbp
-            y_sbp = torch.from_numpy(session["sbp"][w0:w0 + self.window_size])
+            y_sbp_raw = session["sbp"][w0:w0 + self.window_size].astype(np.float32)
             kin_w = torch.from_numpy(session["kin"][w0:w0 + self.window_size])
-            
+
+            # Apply z-score normalization for consistency with static dataset
+            mean = session["mean"]  # (96,)
+            std = session["std"]    # (96,)
+            y_sbp_norm = (y_sbp_raw - mean) / std
+
+            y_sbp = torch.from_numpy(y_sbp_norm).float()
             x_sbp = y_sbp.clone()
             mask = torch.zeros_like(y_sbp, dtype=torch.bool)
             C = y_sbp.shape[1]
             
             # 4. Fast inline dynamic masking (bypasses old_preprocessing.py)
             num_spans = torch.randint(2, 4, (1,)).item()
-            # Approx triangular distribution (45 to 85 length for 400 window, 20, 50 for 200)
-            span_lengths = torch.randint(45, 85, (num_spans,)) 
-            
-            total_len = span_lengths.sum().item() + (num_spans - 1) * 10
+            # Iteratively sample spans until they fit in the window
+            max_attempts = 10
+            for attempt in range(max_attempts):
+                span_lengths = torch.randint(30, 60, (num_spans,))  # Reduce max length for better fit
+                total_len = span_lengths.sum().item() + (num_spans - 1) * 10
+                if total_len < self.window_size:
+                    break
+
+            # Apply masking only if spans fit
             if total_len < self.window_size:
                 available_starts = self.window_size - total_len
                 # Distribute the remaining gap space randomly
                 offsets = torch.rand(num_spans)
                 offsets = (offsets / (offsets.sum() + 1e-6) * available_starts).int()
-                
+
                 curr_t = 0
                 for i in range(num_spans):
                     curr_t += offsets[i].item()
                     t0 = curr_t
                     t1 = t0 + span_lengths[i].item()
-                    
+
                     # Fast channel selection using randperm
                     num_channels = torch.randint(20, 40, (1,)).item()
                     channels = torch.randperm(C)[:num_channels]
-                    
+
                     x_sbp[t0:t1, channels] = 0.0
                     mask[t0:t1, channels] = True
-                    
+
                     curr_t = t1 + 10 # Enforce minimum gap
+            else:
+                # Fallback: simple single-span masking if random spans don't fit
+                t0 = torch.randint(0, self.window_size // 2, (1,)).item()
+                t1 = min(t0 + 50, self.window_size)
+                num_channels = torch.randint(20, 40, (1,)).item()
+                channels = torch.randperm(C)[:num_channels]
+                x_sbp[t0:t1, channels] = 0.0
+                mask[t0:t1, channels] = True
         else:
             # ==========================================================
             # DETERMINISTIC PATH: Validation 
@@ -214,15 +242,21 @@ class SBPDatasetDynamic(Dataset):
             max_start = session["N"] - self.window_size
             w0 = rng.integers(0, max_start + 1)
             
-            y_np = session["sbp"][w0:w0 + self.window_size].copy()
+            y_np = session["sbp"][w0:w0 + self.window_size].copy().astype(np.float32)
             kin_np = session["kin"][w0:w0 + self.window_size].copy()
-            
+
             num_spans = 2
             spans = sample_multi_span_lengths_and_starts(rng, self.window_size, num_spans=num_spans, min_gap=10)
             x_np, m_np = apply_multi_span_mask_to_window(y_np, spans, num_spans=num_spans, rng=rng)
-            
-            x_sbp = torch.from_numpy(x_np)
-            y_sbp = torch.from_numpy(y_np)
+
+            # Apply z-score normalization for consistency with training
+            mean = session["mean"]  # (96,)
+            std = session["std"]    # (96,)
+            x_np_norm = (x_np - mean) / std
+            y_np_norm = (y_np - mean) / std
+
+            x_sbp = torch.from_numpy(x_np_norm).float()
+            y_sbp = torch.from_numpy(y_np_norm).float()
             mask = torch.from_numpy(m_np)
             kin_w = torch.from_numpy(kin_np)
 
@@ -291,12 +325,18 @@ def get_dataloaders_dynamic(config, window_size=200, batch_size=32, val_split=0.
             kin_aligned = kin
        
 
+        # Compute per-channel statistics for normalization
+        mean = sbp.mean(axis=0, keepdims=False).astype(np.float32)  # (96,)
+        std = sbp.std(axis=0, keepdims=False).astype(np.float32) + 1e-5  # (96,)
+
         session_dict = {
             "sbp": sbp,
             "kin": kin_aligned,
             "N": sbp.shape[0],
             "channel_var": compute_session_channel_variance(sbp),
-            "session_id": session.session_id
+            "session_id": session.session_id,
+            "mean": mean,  # (96,) for z-score normalization
+            "std": std     # (96,) for z-score normalization
         }
         all_sessions_data.append(session_dict)
         
