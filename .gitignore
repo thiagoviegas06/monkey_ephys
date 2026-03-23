@@ -5,6 +5,7 @@
 # Model Checkpoints & Logs
 /checkpoints*/
 /logs/
+/kin_logs/
 *.pth
 
 # Submissions & Results
