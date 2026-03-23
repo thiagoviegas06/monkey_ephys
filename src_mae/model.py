@@ -143,12 +143,14 @@ class SBP_TCN_Transformer(nn.Module):
         # ==========================================
         # PHASE 0: REVERSIBLE INSTANCE NORMALIZATION
         # ==========================================
-        # A. Normalize SBP (Only compute stats on VISIBLE values so 0s don't skew it)
+        # A. Normalize SBP (Only compute stats on VISIBLE values across ALL channels/time)
         visible_mask = (~mask.bool()).float()  # 1.0 if visible, 0.0 if masked
-        num_visible = visible_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        # num_visible: (B, 1, 1) - total unmasked pixels in the window
+        num_visible = visible_mask.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
         
-        sbp_mean = (sbp_masked * visible_mask).sum(dim=1, keepdim=True) / num_visible
-        sbp_var = (((sbp_masked - sbp_mean) * visible_mask) ** 2).sum(dim=1, keepdim=True) / num_visible
+        # Spatial-Temporal Global Mean/Std
+        sbp_mean = (sbp_masked * visible_mask).sum(dim=(1, 2), keepdim=True) / num_visible
+        sbp_var = (((sbp_masked - sbp_mean) * visible_mask) ** 2).sum(dim=(1, 2), keepdim=True) / num_visible
         sbp_std = torch.sqrt(sbp_var + 1e-5)
         
         # Normalize SBP, keeping masked values safely at exactly 0

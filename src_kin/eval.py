@@ -11,6 +11,7 @@ from src_kin.config import Config
 from src_kin.model import LFADSKinematicDecoder
 from src_mae.model import SBP_TCN_Transformer
 from src_kin.preprocessing import SessionDataPhase2
+from src_kin.compute_kin_stats import compute_kin_stats
 
 def build_models(config):
     # MAE
@@ -34,10 +35,22 @@ def build_models(config):
         output_dim=config.output_dim
     ).to(config.device)
     best_lfads_path = os.path.join(config.checkpoint_dir, "best_model_lfads.pt")
-    lfads.load_state_dict(torch.load(best_lfads_path, map_location=config.device)['model_state_dict'])
+    checkpoint = torch.load(best_lfads_path, map_location=config.device)
+    lfads.load_state_dict(checkpoint['model_state_dict'])
     lfads.eval()
 
-    return mae, lfads
+    # Get kinematics stats from checkpoint or recompute
+    kin_mean = checkpoint.get('kin_mean', None)
+    kin_std = checkpoint.get('kin_std', None)
+    
+    if kin_mean is None or kin_std is None:
+        print("Kinematics stats not found in checkpoint. Recomputing from training data...")
+        kin_mean, kin_std = compute_kin_stats(config.data_path)
+    
+    kin_mean = kin_mean.to(config.device)
+    kin_std = kin_std.to(config.device)
+
+    return mae, lfads, kin_mean, kin_std
 
 def smooth_predictions(preds, kernel_size=5):
     """
@@ -58,7 +71,7 @@ def smooth_predictions(preds, kernel_size=5):
     return smoothed
 
 @torch.no_grad()
-def predict_session(mae, lfads, sbp, config):
+def predict_session(mae, lfads, sbp, config, kin_mean, kin_std):
     N = sbp.shape[0]
     W = config.window_size
     preds = np.zeros((N, config.output_dim), dtype=np.float32)
@@ -81,7 +94,11 @@ def predict_session(mae, lfads, sbp, config):
         sbp_imputed = mae(sbp_w, mask, macro_timestamp)
         
         # Decode kinematics
-        kin_pred, _, _, _ = lfads(sbp_imputed)
+        kin_pred, _, _, _ = lfads(sbp_imputed, mask=mask)
+        
+        # Un-normalize kinematics (Global Z-Score)
+        kin_pred = kin_pred * kin_std + kin_mean
+        
         kin_pred = kin_pred.cpu().numpy()[0]
         
         # Store non-padded segment
@@ -93,7 +110,7 @@ def predict_session(mae, lfads, sbp, config):
 def run_eval():
     config = Config()
     print("Building models...")
-    mae, lfads = build_models(config)
+    mae, lfads, kin_mean, kin_std = build_models(config)
     
     print("Loading test data...")
     session_manager = SessionDataPhase2(config.data_path, is_train=False)
@@ -103,7 +120,7 @@ def run_eval():
     for session in tqdm(sessions, desc="Predicting Test Sessions"):
         sbp, _ = session.load_data()
         if sbp is None: continue
-        preds = predict_session(mae, lfads, sbp, config)
+        preds = predict_session(mae, lfads, sbp, config, kin_mean, kin_std)
         
         # Apply smoothing
         preds = smooth_predictions(preds, kernel_size=config.smoothing_kernel_size)
@@ -121,7 +138,7 @@ def run_eval():
         
         time_bins = sub.loc[idx, "time_bin"].to_numpy(dtype=np.int64)
         
-        # Clip to [0, 1] after smoothing
+        # Clip to [0, 1] after smoothing and un-normalization
         sub.loc[idx, "index_pos"] = np.clip(preds[time_bins, 0], 0, 1)
         sub.loc[idx, "mrp_pos"] = np.clip(preds[time_bins, 1], 0, 1)
         

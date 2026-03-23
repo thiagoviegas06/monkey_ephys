@@ -25,15 +25,26 @@ class LFADSKinematicDecoder(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         batch_size, seq_len, _ = x.size()
         
         # --- NORMALIZATION ---
-        # Calculate mean and std per sample and channel for stability across sessions
-        # x shape: (batch, seq_len, channels)
-        mean = x.mean(dim=1, keepdim=True) # (batch, 1, channels)
-        std = x.std(dim=1, keepdim=True) + 1e-5 # (batch, 1, channels)
-        x_norm = (x - mean) / std
+        # Spatial-Temporal Mask-Aware Normalization
+        # In Phase 2, certain channels are zeroed out for the whole session.
+        # We calculate global stats for the window across active channels only.
+        if mask is None:
+            # If no mask provided, assume values that are exactly 0 are masked
+            mask = (x == 0.0).float()
+            
+        visible_mask = (~mask.bool()).float()  # 1.0 if visible, 0.0 if masked
+        num_visible = visible_mask.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
+        
+        # Calculate global mean and std across ALL active channels in this window
+        mean = (x * visible_mask).sum(dim=(1, 2), keepdim=True) / num_visible
+        var = (((x - mean) * visible_mask) ** 2).sum(dim=(1, 2), keepdim=True) / num_visible
+        std = torch.sqrt(var + 1e-5)
+        
+        x_norm = ((x - mean) / std) * visible_mask
         
         # --- ENCODER ---
         _, h_n = self.encoder(x_norm)
@@ -70,7 +81,8 @@ class LFADSKinematicDecoder(nn.Module):
             
             # Un-normalize SBP prediction back to original scale 
             # (matches sbp_imputed in loss calculation)
-            sbp_t_unnorm = (sbp_t * std.squeeze(1)) + mean.squeeze(1)
+            # mean and std are (B, 1, 1), so they broadcast correctly across (B, C)
+            sbp_t_unnorm = (sbp_t * std.squeeze(-1)) + mean.squeeze(-1)
             sbp_preds.append(sbp_t_unnorm.unsqueeze(1))
             
         kinematic_preds = torch.cat(kinematic_preds, dim=1)
