@@ -5,22 +5,28 @@ import torch.nn as nn
 class LSTMKinematicDecoder(nn.Module):
     """
     LSTM-based kinematics decoder using MAE encoder features.
-    Input: (B, W, d_model) learned representations from MAE encoder
+    Input: (B, W, C, d_model) learned representations from MAE encoder
     Output: (B, W, 4) predicted kinematics
 
-    Uses frozen MAE as feature extractor - robust to masking patterns.
-    Direct supervised learning - optimized for R² metric.
+    Spatial pooling: (B, W, C*d_model) → (B, W, 256) via learnable linear layer
+    This preserves per-channel information instead of averaging.
     """
-    def __init__(self, encoder_dim=64, hidden_dim=128, num_layers=2, output_dim=4, dropout=0.1):
+    def __init__(self, num_channels=96, encoder_dim=64, spatial_dim=256, hidden_dim=128, num_layers=2, output_dim=4, dropout=0.1):
         super(LSTMKinematicDecoder, self).__init__()
 
-        self.encoder_dim = encoder_dim  # d_model from MAE
+        self.num_channels = num_channels
+        self.encoder_dim = encoder_dim
+        self.spatial_dim = spatial_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
 
+        # Spatial pooling: (B, W, C*d_model) → (B, W, spatial_dim)
+        # Learns weighted combination of all channel features
+        self.spatial_pool = nn.Linear(num_channels * encoder_dim, spatial_dim)
+
         # Bidirectional LSTM for temporal modeling
         self.lstm = nn.LSTM(
-            input_size=encoder_dim,
+            input_size=spatial_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
@@ -34,7 +40,7 @@ class LSTMKinematicDecoder(nn.Module):
     def forward(self, encoder_features, mask=None):
         """
         Args:
-            encoder_features: (B, W, d_model) learned features from MAE encoder
+            encoder_features: (B, W, C, d_model) learned features from MAE encoder
             mask: unused, kept for compatibility
 
         Returns:
@@ -43,11 +49,16 @@ class LSTMKinematicDecoder(nn.Module):
             mu: dummy (unused, for compatibility)
             logvar: dummy (unused, for compatibility)
         """
-        batch_size, seq_len, _ = encoder_features.size()
+        # Flatten channels and d_model: (B, W, C, d_model) → (B, W, C*d_model)
+        batch_size, seq_len, num_channels, d_model = encoder_features.size()
+        encoder_features_flat = encoder_features.reshape(batch_size, seq_len, num_channels * d_model)
 
-        # LSTM forward pass on encoder features
+        # Spatial pooling: (B, W, C*d_model) → (B, W, spatial_dim)
+        spatial_features = self.spatial_pool(encoder_features_flat)
+
+        # LSTM forward pass on spatially pooled features
         # lstm_out: (B, W, hidden_dim*2)
-        lstm_out, _ = self.lstm(encoder_features)
+        lstm_out, _ = self.lstm(spatial_features)
 
         # Project to kinematics
         # (B, W, hidden_dim*2) → (B, W, 4)

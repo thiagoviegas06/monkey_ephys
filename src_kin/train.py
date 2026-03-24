@@ -63,7 +63,9 @@ def compute_per_session_sbp_stats(data_path):
 
 def build_lstm_model(config):
     model = LSTMKinematicDecoder(
-        encoder_dim=config.encoder_dim,  # MAE encoder feature dimension
+        num_channels=config.sbp_channels,  # 96
+        encoder_dim=config.encoder_dim,  # MAE encoder feature dimension (64)
+        spatial_dim=config.spatial_dim,  # 256 - learnable pooling dimension
         hidden_dim=config.hidden_dim,
         num_layers=config.num_lstm_layers,
         output_dim=config.output_dim,
@@ -112,12 +114,14 @@ def train_one_epoch(mae_model, lstm_model, dataloader, optimizer, config, epoch,
         optimizer.zero_grad()
 
         # Phase 1: Extract learned representations from MAE encoder
+        # Use full (unmasked) SBP since kinematics shouldn't depend on masking patterns
+        # Create zero mask (all visible) for encoder
+        zero_mask = torch.zeros_like(sbp_normalized, dtype=torch.bool)
+
         with torch.no_grad():
-            encoder_features = mae_model.extract_encoder_features(sbp_normalized, mask, macro_timestamp)
-            # encoder_features: (B, W, C, d_model)
-            # Average across channels to get (B, W, d_model)
-            encoder_features = encoder_features.mean(dim=2)
-            encoder_features = encoder_features.detach()
+            encoder_features = mae_model.extract_encoder_features(sbp_normalized, zero_mask, macro_timestamp)
+            # encoder_features: (B, W, C, d_model) - keep per-channel features
+            # Don't average - let spatial_pool layer learn per-channel importance
 
         # Phase 2: LSTM Kinematics Decoder (uses encoder features, not SBP)
         kin_pred, sbp_pred, mu, logvar = lstm_model(encoder_features, mask=mask)
@@ -193,9 +197,10 @@ def validate_one_epoch(mae_model, lstm_model, dataloader, config, epoch, step, s
 
             batch_size = sbp_masked.size(0)
 
-            # Extract encoder features from MAE
-            encoder_features = mae_model.extract_encoder_features(sbp_normalized, mask, macro_timestamp)
-            encoder_features = encoder_features.mean(dim=2)
+            # Extract encoder features from MAE using full (unmasked) SBP
+            zero_mask = torch.zeros_like(sbp_normalized, dtype=torch.bool)
+            encoder_features = mae_model.extract_encoder_features(sbp_normalized, zero_mask, macro_timestamp)
+            # encoder_features: (B, W, C, d_model) - keep per-channel features
             kin_pred, sbp_pred, mu, logvar = lstm_model(encoder_features, mask=mask)
             
             loss_dict = lfads_loss(
@@ -245,7 +250,14 @@ def main():
     epochs_without_improvement = 0
     step = 0
 
-    for epoch in range(1, config.num_epochs + 1):
+    # =========================================================================
+    # STAGE 1: Frozen MAE (Train LSTM only) - 20 epochs
+    # =========================================================================
+    print("\n" + "="*70)
+    print("STAGE 1: Frozen MAE - Training LSTM only")
+    print("="*70)
+
+    for epoch in range(1, config.frozen_epochs + 1):
         train_loss, train_recon, train_r2, step = train_one_epoch(
             mae_model, lstm_model, train_loader, optimizer, config, epoch, step,
             session_kin_stats=session_kin_stats, session_sbp_stats=session_sbp_stats
@@ -268,13 +280,67 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'session_kin_stats': session_kin_stats,
+                'stage': 'frozen'
             }, best_path)
             print(f"✓ Saved best model to {best_path}")
         else:
             epochs_without_improvement += 1
-            if epochs_without_improvement >= config.early_stopping_patience:
-                print(f"Early stopping triggered at epoch {epoch}.")
-                break
+
+    # =========================================================================
+    # STAGE 2: Unfreeze MAE + LSTM (Fine-tuning) - 10 epochs
+    # =========================================================================
+    print("\n" + "="*70)
+    print("STAGE 2: Fine-tuning - Training MAE + LSTM")
+    print("="*70)
+
+    # Unfreeze MAE
+    for param in mae_model.parameters():
+        param.requires_grad = True
+    print("✓ Unfroze MAE model")
+
+    # Create new optimizer for both models with lower learning rate
+    optimizer_finetune = torch.optim.AdamW(
+        list(mae_model.parameters()) + list(lstm_model.parameters()),
+        lr=config.finetune_lr,
+        weight_decay=config.weight_decay
+    )
+    print(f"✓ Created new optimizer with lr={config.finetune_lr}")
+
+    epochs_without_improvement = 0  # Reset counter for finetuning stage
+
+    for epoch in range(config.frozen_epochs + 1, config.frozen_epochs + config.finetune_epochs + 1):
+        train_loss, train_recon, train_r2, step = train_one_epoch(
+            mae_model, lstm_model, train_loader, optimizer_finetune, config, epoch, step,
+            session_kin_stats=session_kin_stats, session_sbp_stats=session_sbp_stats
+        )
+        print(f"Epoch {epoch} Train: Loss={train_loss:.4f} Recon(MSE)={train_recon:.4f} R2={train_r2:.4f}")
+
+        val_loss, val_recon, val_r2 = validate_one_epoch(
+            mae_model, lstm_model, val_loader, config, epoch, step,
+            session_kin_stats=session_kin_stats, session_sbp_stats=session_sbp_stats
+        )
+        print(f"Epoch {epoch} Val:   Loss={val_loss:.4f} Recon(MSE)={val_recon:.4f} R2={val_r2:.4f}")
+
+        if val_loss < best_val_loss - config.early_stopping_min_delta:
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+            best_path = os.path.join(config.checkpoint_dir, "best_model_lstm.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': lstm_model.state_dict(),
+                'mae_state_dict': mae_model.state_dict(),
+                'optimizer_state_dict': optimizer_finetune.state_dict(),
+                'val_loss': val_loss,
+                'session_kin_stats': session_kin_stats,
+                'stage': 'finetuned'
+            }, best_path)
+            print(f"✓ Saved best model to {best_path}")
+        else:
+            epochs_without_improvement += 1
+
+    print("\n" + "="*70)
+    print("Training complete!")
+    print("="*70)
 
 if __name__ == "__main__":
     main()

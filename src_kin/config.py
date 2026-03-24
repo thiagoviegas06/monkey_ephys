@@ -26,6 +26,7 @@ class Config:
     
     # LSTM Model Hyperparameters (uses MAE encoder features, not raw SBP)
     encoder_dim = d_model  # Match MAE's d_model (64) - encoder feature dimension
+    spatial_dim = 256  # Learnable spatial pooling dimension (96*64 → 256)
     hidden_dim = 128  # LSTM hidden size
     num_lstm_layers = 2  # Number of stacked LSTM layers
     output_dim = 4  # Outputs 4 kinematics channels (though only 2 are evaluated)
@@ -35,8 +36,14 @@ class Config:
     batch_size = 128
     learning_rate = 1e-3
     weight_decay = 1e-4
-    num_epochs = 50
-    early_stopping_patience = 7  
+    num_epochs = 30  # Total: 20 frozen + 10 unfrozen
+
+    # Two-Stage Training
+    frozen_epochs = 20  # Train LSTM only (MAE frozen)
+    finetune_epochs = 10  # Train both LSTM + MAE
+    finetune_lr = 5e-5  # Lower learning rate for finetuning MAE
+
+    early_stopping_patience = 7
     early_stopping_min_delta = 1e-5  
     
     # LFADS Loss Hyperparameters (Simplified for R² optimization)

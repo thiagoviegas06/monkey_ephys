@@ -204,8 +204,9 @@ def compute_session_channel_variance(sbp):
     session_variance = np.var(sbp, axis=0)
     return session_variance
 
-def preprocess_non_overlapping(data_path, window_size=200, seed=0):
-    out_dir = os.path.join(data_path, f"masked_windows_{window_size}")  # Include window_size for consistency
+def preprocess_non_overlapping(data_path, window_size=200, seed=0, out_dir=None):
+    if out_dir is None:
+        out_dir = os.path.join(data_path, f"masked_windows_{window_size}")
     os.makedirs(out_dir, exist_ok=True)
     sessions, max_bin_count = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
 
@@ -274,11 +275,12 @@ def preprocess_non_overlapping(data_path, window_size=200, seed=0):
             if len(w0s) <= 5 or w0 == w0s[0]:  # Print first window or if few windows
                 print(f"  Saved: {session.session_id}_{w0}.pkl | spans={spans} | masked={int(M.sum())} positions")
 
-def preprocess_overlapping_dynamic(data_path, window_size=200, step_size=50, lag_bins=0):
+def preprocess_overlapping_dynamic(data_path, window_size=200, step_size=50, lag_bins=0, out_dir=None):
     """
     Saves ONLY ground truth overlapping windows. Masking is left to the DataLoader.
     """
-    out_dir = os.path.join(data_path, f"unmasked_windows_{window_size}")
+    if out_dir is None:
+        out_dir = os.path.join(data_path, f"unmasked_windows_{window_size}")
     os.makedirs(out_dir, exist_ok=True)
     sessions, _ = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
 
@@ -321,5 +323,101 @@ def preprocess_overlapping_dynamic(data_path, window_size=200, step_size=50, lag
             with open(sample_path, "wb") as f:
                 pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
 
+def preprocess_channel_level_masking(data_path, window_size=200, step_size=50, mask_ratio=0.3, out_dir=None):
+    """
+    Preprocesses data by applying channel-level masking to entire channels across all time bins in a window.
+    """
+    if out_dir is None:
+        out_dir = os.path.join(data_path, f"masked_window_p2")
+    os.makedirs(out_dir, exist_ok=True)
+    sessions, _ = sessionData(f"{data_path}/metadata.csv").generate_session_obj()
+
+    for session in sessions:
+        if session.isTest():
+            continue
+            
+        sbp, kin, starts_bins, end_bins = session.load_data(data_path)
+        if sbp is None: continue
+
+        sbp_mean = sbp.mean(axis=0)  # (96,)
+        sbp_std = sbp.std(axis=0) + 1e-5  # (96,) add epsilon for stability
+        kin_mean = kin.mean(axis=0)  # (4,)
+        kin_std = kin.std(axis=0) + 1e-5  # (4,)
+
+        # Normalize SBP only (kinematics kept raw 0-1 range)
+        sbp_norm = (sbp - sbp_mean) / sbp_std  # (N, 96) z-normalized
+
+        N = sbp.shape[0]
+
+        if N < window_size: continue
+
+        w0s = []
+        for w0 in range(0, N - window_size + 1, step_size):
+            w0s.append(w0)
+
+        session_variance = compute_session_channel_variance(sbp_norm)
+
+        for w0 in w0s:
+            y = sbp_norm[w0:w0 + window_size]      # (W,96)
+            kin_w = kin[w0:w0 + window_size]  # (W,4) - raw, no normalization
+
+            # Apply channel-level masking
+            C = y.shape[1]
+            num_masked_channels = int(C * mask_ratio)
+            masked_channels = np.random.choice(C, size=num_masked_channels, replace=False)
+            x = y.copy()
+            x[:, masked_channels] = 0.0  # Mask entire channels
+
+            sample = {
+                "x_sbp": x.astype(np.float32),
+                "y_sbp": y.astype(np.float32),
+                "kin": kin_w.astype(np.float32),
+                "channel_var": session_variance.astype(np.float32),
+                "session_id": session.session_id,
+                "w0": int(w0),
+                "day": float(session.day),
+                "masked_channels": masked_channels.astype(np.int32),  # Store which channels were masked
+
+                 # ===== NORMALIZATION STATISTICS FOR DENORMALIZATION =====
+                "sbp_mean": sbp_mean.astype(np.float32),  # (96,) per-session mean
+                "sbp_std": sbp_std.astype(np.float32),    # (96,) per-session std
+                "kin_mean": kin_mean.astype(np.float32),  # (4,) per-session mean
+                "kin_std": kin_std.astype(np.float32),    # (4,) per-session std
+            }
+
+            sample_path = os.path.join(out_dir, f"{session.session_id}_{w0}.pkl")
+            with open(sample_path, "wb") as f:
+                pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
+
 if __name__ == "__main__":
-    preprocess_overlapping_dynamic(data_path="kaggle_data", window_size=200, step_size=50, lag_bins=5)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Preprocessing for SBP masked reconstruction")
+    parser.add_argument('--preprocess_type', type=str, default='overlapping_dynamic',
+                        choices=['overlapping_dynamic', 'channel_level_masking'],
+                        help='Type of preprocessing to apply')
+    parser.add_argument('--data_path', type=str, default='kaggle_data', help='Path to data directory')
+    parser.add_argument('--window_size', type=int, default=200, help='Window size')
+    parser.add_argument('--step_size', type=int, default=50, help='Step size for sliding windows')
+    parser.add_argument('--lag_bins', type=int, default=5, help='Lag bins (for overlapping_dynamic)')
+    parser.add_argument('--mask_ratio', type=float, default=0.3, help='Masking ratio (for channel_level_masking)')
+    parser.add_argument('--out_dir', type=str, default=None, help='Output directory (if None, uses default based on preprocess_type)')
+
+    args = parser.parse_args()
+
+    if args.preprocess_type == 'channel_level_masking':
+        preprocess_channel_level_masking(
+            data_path=args.data_path,
+            window_size=args.window_size,
+            step_size=args.step_size,
+            mask_ratio=args.mask_ratio,
+            out_dir=args.out_dir
+        )
+    else:  # overlapping_dynamic
+        preprocess_overlapping_dynamic(
+            data_path=args.data_path,
+            window_size=args.window_size,
+            step_size=args.step_size,
+            lag_bins=args.lag_bins,
+            out_dir=args.out_dir
+        )
