@@ -1,6 +1,6 @@
 """
 Finetuning script: Load best checkpoint (0.71 NMSE) and finetune on 30% masked channels per session.
-Uses the restored preprocessing setup.
+Uses SBP_TCN_Transformer model with macro_timestamp inputs.
 """
 import os
 import numpy as np
@@ -9,10 +9,9 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from model import SBP_Reconstruction_UNet
+from model import SBP_TCN_Transformer
 from losses import kaggle_aligned_nmse_loss
 from config import Config
-from preprocessing import preprocess_non_overlapping
 from dataloader import get_dataloaders
 
 # Configuration
@@ -44,19 +43,22 @@ def finetune_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=No
     pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch}")
 
     for batch_idx, batch in enumerate(pbar):
-        x_sbp = batch["x_sbp"].to(config.device)      # (B, W, C)
-        y_sbp = batch["y_sbp"].to(config.device)      # (B, W, C)
-        mask = batch["mask"].to(config.device)        # (B, W, C)
+        x_sbp = batch["x_sbp"].to(config.device)              # (B, W, C)
+        y_sbp = batch["y_sbp"].to(config.device)              # (B, W, C)
+        mask = batch["mask"].to(config.device)                # (B, W, C)
+        mask_float = mask.float()
+        macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()  # (B, 1)
         channel_var = batch["channel_var"].to(config.device)  # (B, C)
+        session_ids = batch["session_id"]
 
         # Forward pass
-        pred = model(x_sbp, mask)  # (B, W, C)
+        pred = model(x_sbp, mask_float, macro_timestamp)  # (B, W, C)
 
         # Loss: only on masked positions
         loss = kaggle_aligned_nmse_loss(
             pred, y_sbp, mask,
             channel_variance=channel_var,
-            reduction='mean'
+            session_ids=session_ids
         )
 
         # Backward pass
@@ -68,7 +70,7 @@ def finetune_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=No
         total_loss += loss.item() * x_sbp.size(0)
         total_samples += x_sbp.size(0)
 
-        pbar.set_postfix({'loss': loss.item()})
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
     avg_loss = total_loss / max(total_samples, 1)
     return avg_loss
@@ -85,13 +87,16 @@ def validate(model, dataloader, config):
             x_sbp = batch["x_sbp"].to(config.device)
             y_sbp = batch["y_sbp"].to(config.device)
             mask = batch["mask"].to(config.device)
+            mask_float = mask.float()
+            macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()
             channel_var = batch["channel_var"].to(config.device)
+            session_ids = batch["session_id"]
 
-            pred = model(x_sbp, mask)
+            pred = model(x_sbp, mask_float, macro_timestamp)
             loss = kaggle_aligned_nmse_loss(
                 pred, y_sbp, mask,
                 channel_variance=channel_var,
-                reduction='mean'
+                session_ids=session_ids
             )
 
             total_loss += loss.item() * x_sbp.size(0)
@@ -117,17 +122,11 @@ def main():
     print("FINETUNING: Loading checkpoint and preparing data")
     print("="*70)
 
-    # Ensure preprocessed data exists
+    # Load dataloaders
     data_dir = config.windows_dir
     if not os.path.exists(data_dir) or len(os.listdir(data_dir)) == 0:
-        print(f"\nPreprocessing data to: {data_dir}")
-        preprocess_non_overlapping(
-            data_path=config.data_path,
-            window_size=config.window_size,
-            seed=42
-        )
+        raise FileNotFoundError(f"Preprocessed data not found at: {data_dir}")
 
-    # Load dataloaders
     train_loader, val_loader = get_dataloaders(
         data_dir,
         batch_size=args.batch_size,
@@ -137,7 +136,14 @@ def main():
     print(f"✓ Data loaded: {len(train_loader)} train batches, {len(val_loader)} val batches")
 
     # Build and load model
-    model = SBP_Reconstruction_UNet(base_channels=64)
+    model = SBP_TCN_Transformer(
+        sbp_channels=config.sbp_channels,
+        d_model=config.d_model,
+        nhead=config.nhead,
+        num_layers=config.num_layers,
+        tcn_levels=config.tcn_levels,
+        dropout=config.dropout
+    )
     model = load_checkpoint(args.checkpoint, model, config.device)
 
     # Optimizer: lower learning rate for finetuning
