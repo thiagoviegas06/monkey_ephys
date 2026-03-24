@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Finetuning script for SBP masked reconstruction.
-Masks entire channels instead of time-spans to improve robustness to channel dropout.
-"""
-
 import os
 import torch
 import numpy as np
@@ -15,22 +9,29 @@ from tqdm import tqdm
 from model import SBP_TCN_Transformer
 from losses import kaggle_aligned_nmse_loss
 from config import Config
-from preprocessing import sessionData, compute_session_channel_variance
+from preprocessing import (
+    sessionData, 
+    compute_session_channel_variance,
+    sample_multi_span_lengths_and_starts,
+    apply_multi_span_mask_to_window
+)
 
 # ============================================================================
 # New Dataset Class for Finetuning
 # ============================================================================
 class SBPChannelMaskDataset(Dataset):
     """
-    Dataset that masks ENTIRE channels for the whole window.
-    This mimics the channel dropout seen in Phase 2.
+    Dataset that mixes ENTIRE channel masking (Phase 2 style) 
+    with temporal span masking (Phase 1 style).
+    This prevents catastrophic forgetting of temporal features.
     """
-    def __init__(self, sessions_data, is_train=True, window_size=200, config=None):
+    def __init__(self, sessions_data, is_train=True, window_size=200, config=None, channel_mask_prob=0.7):
         self.sessions_data = sessions_data
         self.is_train = is_train
         self.window_size = window_size
         self.windows = []
         self.config = config
+        self.channel_mask_prob = channel_mask_prob
 
         # Precompute all non-overlapping windows
         for i, session in enumerate(sessions_data):
@@ -38,70 +39,62 @@ class SBPChannelMaskDataset(Dataset):
             for w0 in range(0, N - self.window_size + 1, self.window_size):
                 self.windows.append((i, w0))
                 
-        print(f"Prepared {len(self.windows)} windows for channel-mask finetuning (is_train={is_train})")
+        print(f"Prepared {len(self.windows)} windows for mixed-mask finetuning (is_train={is_train})")
         
     def __len__(self):
         return len(self.windows)
     
     def __getitem__(self, idx):
+        # Use deterministic RNG for validation, dynamic for training
         if self.is_train:
+            rng = np.random.default_rng(random.getrandbits(32))
             sess_idx, w0 = self.windows[idx]
-            session = self.sessions_data[sess_idx]
-            
-            y_sbp = torch.from_numpy(session["sbp"][w0:w0 + self.window_size])
-            kin_w = torch.from_numpy(session["kin"][w0:w0 + self.window_size])
-            C = y_sbp.shape[1]
-
-            x_sbp = y_sbp.clone()
-            mask = torch.zeros_like(y_sbp, dtype=torch.bool)
-            
-            # Mask entire channels: 20 to 40 channels zeroed out for the WHOLE window
-            num_channels = torch.randint(20, 40, (1,)).item()
-            channels = torch.randperm(C)[:num_channels]
-            
-            x_sbp[:, channels] = 0.0
-            mask[:, channels] = True
-            
         else:
-            # Deterministic for validation
             rng = np.random.default_rng(idx + 42) 
             sess_idx, w0 = self.windows[idx % len(self.windows)]
-            session = self.sessions_data[sess_idx]
             
-            y_np = session["sbp"][w0:w0 + self.window_size].copy()
-            kin_np = session["kin"][w0:w0 + self.window_size].copy()
-            C = y_np.shape[1]
-            
-            x_np = y_np.copy()
-            mask_np = np.zeros_like(y_np, dtype=bool)
-            
-            # Use deterministic channel selection for validation
+        session = self.sessions_data[sess_idx]
+        
+        y_np = session["sbp"][w0:w0 + self.window_size].copy()
+        kin_np = session["kin"][w0:w0 + self.window_size].copy()
+        C = y_np.shape[1]
+        
+        x_np = y_np.copy()
+        mask_np = np.zeros_like(y_np, dtype=bool)
+        
+        # Determine masking strategy
+        strategy_roll = rng.random()
+        
+        if strategy_roll < self.channel_mask_prob:
+            # --- CHANNEL MASKING (Phase 2 Style) ---
             num_channels = rng.integers(20, 40)
             channels = rng.choice(C, size=num_channels, replace=False)
-            
             x_np[:, channels] = 0.0
             mask_np[:, channels] = True
-            
-            x_sbp = torch.from_numpy(x_np)
-            y_sbp = torch.from_numpy(y_np)
-            mask = torch.from_numpy(mask_np)
-            kin_w = torch.from_numpy(kin_np)
+            mask_type = 0 # 0 for Channel
+        else:
+            # --- SPAN MASKING (Phase 1 Style) ---
+            num_spans = rng.integers(2, 4)
+            spans = sample_multi_span_lengths_and_starts(rng, self.window_size, num_spans=num_spans, min_gap=10)
+            x_np, mask_np = apply_multi_span_mask_to_window(y_np, spans, num_spans=num_spans, rng=rng)
+            mask_type = 1 # 1 for Span
 
         return {
-            "x_sbp": x_sbp.float(),
-            "y_sbp": y_sbp.float(),
-            "mask": mask.float(),
-            "kin": kin_w.float(),
+            "x_sbp": torch.from_numpy(x_np).float(),
+            "y_sbp": torch.from_numpy(y_np).float(),
+            "mask": torch.from_numpy(mask_np).float(),
+            "kin": torch.from_numpy(kin_np).float(),
             "channel_var": torch.from_numpy(session["channel_var"]).float(),
             "session_id": session["session_id"],
             "macro_timestamp": w0,
+            "mask_type": mask_type
         }
 
 # ============================================================================
 # Dataloader Helper
 # ============================================================================
 def get_finetune_dataloaders(config, val_split=0.2, shuffle=True, num_workers=8):
-    print("Loading full sessions into RAM for channel-mask finetuning...")
+    print("Loading full sessions into RAM for mixed-mask finetuning...")
     sessions, _ = sessionData(f"{config.data_path}/metadata.csv").generate_session_obj()
     
     all_sessions_data = []
@@ -140,6 +133,10 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
     model.train()
     total_loss = 0.0
     total_samples = 0
+    
+    # Track losses by type
+    type_losses = {0: [], 1: []} # 0: Channel, 1: Span
+    
     pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch}/{config.num_epochs}")
     
     for batch in pbar:
@@ -150,6 +147,7 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         mask = batch["mask"].to(config.device)
         channel_var = batch["channel_var"].to(config.device)
         session_ids = batch["session_id"]
+        mask_types = batch["mask_type"]
         
         batch_size = x_sbp.size(0)
         optimizer.zero_grad()
@@ -163,7 +161,20 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         
         total_loss += loss.item() * batch_size
         total_samples += batch_size
-        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'avg_loss': f'{total_loss / total_samples:.4f}'})
+        
+        # Track by type (unweighted for logging)
+        with torch.no_grad():
+            for i, m_type in enumerate(mask_types.tolist()):
+                # Individual sample loss is hard with kaggle_aligned, so we just log the batch average
+                # into the bucket that matches the majority of the batch or just append the batch loss
+                type_losses[m_type].append(loss.item())
+
+        pbar.set_postfix({
+            'L': f'{loss.item():.3f}', 
+            'avg': f'{total_loss / total_samples:.3f}',
+            'ch': f'{np.mean(type_losses[0]):.3f}' if type_losses[0] else 'N/A',
+            'sp': f'{np.mean(type_losses[1]):.3f}' if type_losses[1] else 'N/A'
+        })
     
     return total_loss / total_samples
 
@@ -171,6 +182,8 @@ def validate_one_epoch(model, dataloader, config, epoch):
     model.eval()
     total_loss = 0.0
     total_samples = 0
+    type_losses = {0: [], 1: []}
+
     pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}/{config.num_epochs}")
 
     with torch.no_grad():
@@ -182,6 +195,7 @@ def validate_one_epoch(model, dataloader, config, epoch):
             mask = batch["mask"].to(config.device)
             channel_var = batch["channel_var"].to(config.device)
             session_ids = batch["session_id"]
+            mask_types = batch["mask_type"]
             
             batch_size = x_sbp.size(0)
             pred = model(x_sbp, mask_float, macro_timestamp)
@@ -189,19 +203,29 @@ def validate_one_epoch(model, dataloader, config, epoch):
             
             total_loss += loss.item() * batch_size
             total_samples += batch_size
-            pbar.set_postfix({'val_loss': f'{loss.item():.4f}', 'avg_val_loss': f'{total_loss / total_samples:.4f}'})
+            
+            for i, m_type in enumerate(mask_types.tolist()):
+                type_losses[m_type].append(loss.item())
+
+            pbar.set_postfix({
+                'val_L': f'{loss.item():.3f}', 
+                'ch': f'{np.mean(type_losses[0]):.3f}' if type_losses[0] else 'N/A',
+                'sp': f'{np.mean(type_losses[1]):.3f}' if type_losses[1] else 'N/A'
+            })
     
-    return total_loss / total_samples
+    avg_val = total_loss / total_samples
+    print(f"\t[Breakdown] Channel NMSE: {np.mean(type_losses[0]):.4f} | Span NMSE: {np.mean(type_losses[1]):.4f}")
+    return avg_val
 
 # ============================================================================
 # Main Loop
 # ============================================================================
 def main():
     config = Config()
-    parser = argparse.ArgumentParser(description="Finetune SBP reconstruction with channel masking.")
+    parser = argparse.ArgumentParser(description="Finetune SBP reconstruction with mixed masking.")
     parser.add_argument("--window-size", type=int, default=config.window_size, help="Window size")
-    parser.add_argument("--epochs", type=int, default=15, help="Number of finetuning epochs")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for finetuning")
+    parser.add_argument("--epochs", type=int, default=30, help="Number of finetuning epochs")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate for finetuning")
     args = parser.parse_args()
 
     config.window_size = args.window_size
@@ -210,7 +234,7 @@ def main():
     config.checkpoint_dir = f"checkpoints_{config.window_size}"
 
     print("=" * 70)
-    print(f"Starting Channel-Mask Finetuning")
+    print(f"Starting Mixed-Mask Finetuning (70% Channel, 30% Span)")
     print(f"Window size: {config.window_size}")
     print(f"Learning rate: {config.learning_rate}")
     print(f"Epochs: {config.num_epochs}")
@@ -273,3 +297,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
