@@ -80,10 +80,87 @@ def build_randomized_windows_from_mask(mask_2d: np.ndarray, window_size: int, rn
     return windows
 
 
-def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regions=10):
+def load_training_session_stats(data_path):
+    """Load sbp_mean/std from 5 nearest training sessions for each day."""
+    import pickle
+
+    train_pickle_dir = os.path.join(data_path, "masked_windows_200")
+    if not os.path.exists(train_pickle_dir):
+        print(f"Warning: Training pickle directory not found at {train_pickle_dir}")
+        return {}
+
+    train_sessions = {}  # day -> [(session_id, sbp_mean, sbp_std), ...]
+
+    for pkl_file in glob(os.path.join(train_pickle_dir, "*.pkl")):
+        try:
+            with open(pkl_file, "rb") as f:
+                sample = pickle.load(f)
+
+            session_id = sample["session_id"]
+            day = sample.get("day", 0.0)
+
+            # Only load once per session (first window is representative)
+            if session_id not in train_sessions:
+                sbp_mean = sample.get("sbp_mean")
+                sbp_std = sample.get("sbp_std")
+
+                if sbp_mean is not None and sbp_std is not None:
+                    if day not in train_sessions:
+                        train_sessions[day] = []
+                    train_sessions[day].append({
+                        "session_id": session_id,
+                        "sbp_mean": sbp_mean,
+                        "sbp_std": sbp_std,
+                    })
+        except Exception as e:
+            print(f"Error loading {pkl_file}: {e}")
+
+    return train_sessions
+
+
+def get_nearest_session_stats(test_day, train_sessions, k=5):
+    """Get sbp stats from k nearest training sessions by day distance, weighted by inverse distance."""
+    if not train_sessions:
+        return None, None
+
+    # Find distances to all training days
+    days = sorted(train_sessions.keys())
+    distances = [(abs(d - test_day), d) for d in days]
+    distances.sort()
+
+    # Collect stats from k nearest days with inverse distance weighting
+    all_stats = []
+    for dist, day in distances[:k]:
+        for session_info in train_sessions[day]:
+            # Inverse distance weighting: closer sessions get higher weight
+            weight = 1.0 / (dist + 1e-8)  # Add epsilon to avoid division by zero
+            all_stats.append({
+                "sbp_mean": session_info["sbp_mean"],
+                "sbp_std": session_info["sbp_std"],
+                "weight": weight,
+                "day_dist": dist,
+            })
+
+    if not all_stats:
+        return None, None
+
+    # Weighted average of stats
+    total_weight = np.sum([s["weight"] for s in all_stats])
+    sbp_mean_avg = np.sum([s["sbp_mean"] * s["weight"] for s in all_stats]) / total_weight
+    sbp_std_avg = np.sum([s["sbp_std"] * s["weight"] for s in all_stats]) / total_weight
+
+    return np.float32(sbp_mean_avg), np.float32(sbp_std_avg)
+
+
+def preprocess_test(data_path, window_size, seed=42, expected_regions=10):
     global config
     masked_files = os.path.join(data_path, "test/*_sbp_masked.npy")
     session_data = {}
+    session_sbp_stats = {}
+
+    # Load training session stats for nearby day matching
+    print("Loading training session statistics...")
+    train_sessions = load_training_session_stats(data_path)
 
     for file in sorted(glob(masked_files)):
         session_id = Path(file).stem.split("_")[0]
@@ -91,6 +168,21 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
 
         masked_sbp = np.load(file)
         mask = np.load(file.replace("sbp_masked", "mask"))
+
+        # Extract day from session ID (e.g., "008" -> day 8)
+        try:
+            test_day = float(session_id)
+        except:
+            test_day = 0.0
+
+        # Get stats from 5 nearest training sessions
+        sbp_mean, sbp_std = get_nearest_session_stats(test_day, train_sessions, k=5)
+        print(f"  Session {session_id} (day {test_day}): Using stats from 5 nearest training sessions")
+
+        session_sbp_stats[session_id] = {
+            "mean": sbp_mean,
+            "std": sbp_std,
+        }
 
         segs = mask_segments(mask)
         windows = build_randomized_windows_from_mask(mask, window_size, rng)
@@ -104,7 +196,7 @@ def preprocess_test(data_path, window_size, metadata_csv, seed=42, expected_regi
             "windows": windows,
         }
 
-    return session_data
+    return session_data, session_sbp_stats
 
 
 def natural_keys(text):
@@ -130,7 +222,7 @@ def load_model(model_path: str, device: torch.device) -> nn.Module:
 
 
 @torch.no_grad()
-def predict_sessions(model: nn.Module, session_data: dict, device: torch.device):
+def predict_sessions(model: nn.Module, session_data: dict, device: torch.device, session_sbp_stats: dict = None, denormalize: bool = False):
     predictions = {}
     for session_id, info in session_data.items():
         masked_sbp = info["masked_sbp"]
@@ -158,6 +250,12 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device)
         if n_missing > 0:
             raise RuntimeError(f"Session {session_id}: {n_missing} positions not covered.")
 
+        # Denormalize if requested
+        if denormalize and session_sbp_stats and session_id in session_sbp_stats:
+            sbp_mean = session_sbp_stats[session_id]["mean"]
+            sbp_std = session_sbp_stats[session_id]["std"]
+            pred_full = pred_full * sbp_std + sbp_mean
+
         predictions[session_id] = pred_full
     return predictions
 
@@ -176,23 +274,24 @@ def build_submission(sample_submission_path: str, predictions: dict, output_csv:
     print(f"Saved submission: {output_csv}")
 
 
-def run_eval(model_path, data_path, output_csv, window_size, seed, args):
+def run_eval(model_path, data_path, output_csv, window_size, seed, denormalize):
     global config
     config.window_size = window_size
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     print(f"Loading model: {model_path}")
     model = load_model(model_path, device)
 
-    session_data = preprocess_test(
+    session_data, session_sbp_stats = preprocess_test(
         data_path=data_path,
         window_size=window_size,
-        metadata_csv=os.path.join(data_path, "metadata.csv"),
         seed=seed
     )
 
     print("Running inference...")
-    predictions = predict_sessions(model, session_data, device)
+    if denormalize:
+        print("  → Denormalizing predictions using per-session statistics")
+    predictions = predict_sessions(model, session_data, device, session_sbp_stats, denormalize=denormalize)
 
     print("Constructing submission CSV...")
     build_submission(os.path.join(data_path, "sample_submission.csv"), predictions, output_csv)
@@ -203,6 +302,7 @@ def parse_args():
     parser.add_argument("--window-size", type=int, default=200, help="Evaluation window size")
     parser.add_argument("--data-path", type=str, default="kaggle_data", help="Data root path")
     parser.add_argument("--seed", type=int, default=42, help="Seed for window randomization")
+    parser.add_argument("--denormalize", action="store_true", help="Denormalize predictions using per-session statistics")
     return parser.parse_args()
 
 
@@ -212,6 +312,6 @@ if __name__ == "__main__":
     model_path = os.path.join(checkpoint_dir, f"best_model_{config.model_name}.pt")
     if not os.path.exists(model_path):
         model_path = find_latest_checkpoint(checkpoint_dir)
-    
+
     output_csv = f"submission_eval_{args.window_size}.csv"
-    run_eval(model_path, args.data_path, output_csv, args.window_size, args.seed, args)
+    run_eval(model_path, args.data_path, output_csv, args.window_size, args.seed, args.denormalize)
