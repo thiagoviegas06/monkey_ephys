@@ -25,8 +25,8 @@ class Config:
     seed = 42
     
     # LFADS Model Hyperparameters
-    hidden_dim = 128
-    gen_dim = 128
+    hidden_dim = 64
+    gen_dim = 64
     factor_dim = 40
     output_dim = 4 # Outputs 4 kinematics channels (though only 2 are evaluated)
     lfads_dropout = 0.3 # Dropout for LFADS Decoder

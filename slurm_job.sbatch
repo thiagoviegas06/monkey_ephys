@@ -33,7 +33,7 @@ set -euo pipefail
 source /ext3/env.sh
 
 python src_mae/train.py --window-size 200
-python src_mae/finetune.py 
+python src_mae/finetuning.py 
 python src_mae/eval.py --window-size 200
 
 

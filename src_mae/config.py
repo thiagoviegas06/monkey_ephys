@@ -32,7 +32,7 @@ class Config:
     batch_size = 128
     learning_rate = 1e-3
     weight_decay = 1e-4
-    num_epochs = 50
+    num_epochs = 80
     early_stopping_patience = 5  # Stop if val loss doesn't improve for this many epochs
     early_stopping_min_delta = 5e-5  # Minimum change in val loss to qualify as an improvement
     
