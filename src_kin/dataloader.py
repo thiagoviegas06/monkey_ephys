@@ -30,26 +30,42 @@ class KinematicsDataset(Dataset):
         return len(self.windows)
         
     def __getitem__(self, idx):
+        import numpy as np
+
         sess_idx, w0 = self.windows[idx]
         session = self.sessions_data[sess_idx]
-        
-        sbp_w = torch.from_numpy(session["sbp"][w0:w0 + self.window_size])
-        
-        # Calculate mask: True where channels are fully 0.
-        # Since Phase 2 0s out channels completely for the session:
-        mask = (sbp_w == 0.0)
-        
+
+        sbp_w = torch.from_numpy(session["sbp"][w0:w0 + self.window_size]).float()
+
+        # Apply 30% channel masking consistent per session (matches test distribution)
+        mask = torch.zeros_like(sbp_w, dtype=torch.bool)
+        if self.is_train:
+            # Use session_id to deterministically select which channels to mask
+            # Same channels masked throughout the entire session (like real test data)
+            session_id = session["session_id"]
+            rng = np.random.RandomState(hash(session_id) & 0xFFFFFFFF)
+
+            num_channels = sbp_w.shape[1]  # 96
+            num_to_mask = max(1, int(num_channels * 0.3))
+            channels_to_mask = rng.choice(num_channels, size=num_to_mask, replace=False)
+
+            sbp_w[:, channels_to_mask] = 0.0
+            mask[:, channels_to_mask] = True
+        else:
+            # Validation: no masking
+            mask = (sbp_w == 0.0)
+
         item = {
-            "sbp_masked": sbp_w.float(),
+            "sbp_masked": sbp_w,
             "mask": mask.float(),
             "session_id": session["session_id"],
-            "macro_timestamp": torch.tensor(w0, dtype=torch.float32) # required by MAE
+            "macro_timestamp": torch.tensor(w0, dtype=torch.float32)
         }
-        
+
         if "kin" in session and session["kin"] is not None:
             kin_w = torch.from_numpy(session["kin"][w0:w0 + self.window_size])
             item["kin"] = kin_w.float()
-            
+
         return item
 
 def get_dataloaders(config, val_split=0.2, shuffle=True, num_workers=4, pin_memory=False):

@@ -48,9 +48,9 @@ def build_models(config):
     mae.load_state_dict(torch.load(config.mae_checkpoint_path, map_location=config.device)['model_state_dict'])
     mae.eval()
 
-    # LSTM Kinematics Decoder
+    # LSTM Kinematics Decoder (uses MAE encoder features)
     lstm = LSTMKinematicDecoder(
-        input_dim=config.sbp_channels,
+        encoder_dim=config.encoder_dim,  # MAE encoder feature dimension (64)
         hidden_dim=config.hidden_dim,
         num_layers=config.num_lstm_layers,
         output_dim=config.output_dim,
@@ -144,11 +144,13 @@ def predict_session(mae, lstm, sbp, config, session_id, session_kin_stats, sessi
         mask = (sbp_w == 0.0).float().to(config.device)
         macro_timestamp = torch.tensor([[w0]], dtype=torch.float32, device=config.device)
 
-        # Impute missing neural activity (on normalized SBP)
-        sbp_imputed = mae(sbp_w_norm, mask, macro_timestamp)
+        # Extract encoder features from MAE (frozen feature extractor)
+        encoder_features = mae.extract_encoder_features(sbp_w_norm, mask, macro_timestamp)
+        # encoder_features: (1, W, C, d_model) → average across channels
+        encoder_features = encoder_features.mean(dim=2)
 
-        # Decode kinematics
-        kin_pred, _, _, _ = lstm(sbp_imputed, mask=mask)
+        # Decode kinematics from encoder features
+        kin_pred, _, _, _ = lstm(encoder_features, mask=mask)
 
         # Denormalize kinematics (Per-Session Z-Score)
         kin_pred = kin_pred * torch.tensor(kin_std, dtype=torch.float32, device=config.device) + torch.tensor(kin_mean, dtype=torch.float32, device=config.device)

@@ -132,6 +132,45 @@ class SBP_TCN_Transformer(nn.Module):
         nn.init.xavier_uniform_(self.output_proj.weight, gain=0.1)
         nn.init.zeros_(self.output_proj.bias)
 
+    def extract_encoder_features(self, sbp_masked, mask, macro_time):
+        """
+        Extract learned representations from MAE encoder (without reconstruction).
+        Returns: (B, W, C, d_model) learned features for kinematics prediction
+        """
+        B, W, C = sbp_masked.shape
+
+        # Normalization
+        visible_mask = (~mask.bool()).float()
+        num_visible = visible_mask.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
+        sbp_mean = (sbp_masked * visible_mask).sum(dim=(1, 2), keepdim=True) / num_visible
+        sbp_var = (((sbp_masked - sbp_mean) * visible_mask) ** 2).sum(dim=(1, 2), keepdim=True) / num_visible
+        sbp_std = torch.sqrt(sbp_var + 1e-5)
+        sbp_norm = ((sbp_masked - sbp_mean) / sbp_std) * visible_mask
+        macro_time_norm = self.macro_bn(macro_time)
+
+        # TCN
+        sbp_exp = sbp_norm.transpose(1, 2).unsqueeze(-1)
+        mask_exp = mask.transpose(1, 2).unsqueeze(-1)
+        x_tcn = torch.cat([sbp_exp, mask_exp], dim=-1)
+        x_tcn = x_tcn.reshape(B * C, W, -1).transpose(1, 2)
+        tcn_out = self.tcn(x_tcn)
+        x = tcn_out.view(B, C, self.d_model, W)
+
+        # Time embeddings
+        time_emb = self.macro_time_encoder(macro_time_norm).unsqueeze(-1)
+        x = x + time_emb
+
+        # Transformer encoder
+        x = x.permute(0, 3, 1, 2)  # (B, W, C, d_model)
+        x = x.reshape(B * W, C, self.d_model)
+        x = x + self.channel_embeddings
+        x = self.pre_transformer_norm(x)
+        x = self.transformer_encoder(x)  # Encoder features
+
+        # Reshape back to (B, W, C, d_model)
+        x = x.view(B, W, C, self.d_model)
+        return x
+
     def forward(self, sbp_masked, mask, macro_time):
         """
         sbp_masked: (B, W, C)

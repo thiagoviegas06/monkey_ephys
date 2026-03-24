@@ -63,7 +63,7 @@ def compute_per_session_sbp_stats(data_path):
 
 def build_lstm_model(config):
     model = LSTMKinematicDecoder(
-        input_dim=config.sbp_channels,
+        encoder_dim=config.encoder_dim,  # MAE encoder feature dimension
         hidden_dim=config.hidden_dim,
         num_layers=config.num_lstm_layers,
         output_dim=config.output_dim,
@@ -111,14 +111,16 @@ def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch
         batch_size = sbp_masked.size(0)
         optimizer.zero_grad()
 
-        # Phase 1: Impute missing channels (on normalized SBP)
+        # Phase 1: Extract learned representations from MAE encoder
         with torch.no_grad():
-            sbp_imputed = mae_model(sbp_normalized, mask, macro_timestamp)
-            # The imputed signal shouldn't have gradients flowing back to MAE
-            sbp_imputed = sbp_imputed.detach()
-            
-        # Phase 2: LFADS Decoder
-        kin_pred, sbp_pred, mu, logvar = lfads_model(sbp_imputed, mask=mask)
+            encoder_features = mae_model.extract_encoder_features(sbp_normalized, mask, macro_timestamp)
+            # encoder_features: (B, W, C, d_model)
+            # Average across channels to get (B, W, d_model)
+            encoder_features = encoder_features.mean(dim=2)
+            encoder_features = encoder_features.detach()
+
+        # Phase 2: LSTM Kinematics Decoder (uses encoder features, not SBP)
+        kin_pred, sbp_pred, mu, logvar = lstm_model(encoder_features, mask=mask)
         
         # Loss
         loss_dict = lfads_loss(
@@ -191,8 +193,10 @@ def validate_one_epoch(mae_model, lfads_model, dataloader, config, epoch, step, 
 
             batch_size = sbp_masked.size(0)
 
-            sbp_imputed = mae_model(sbp_normalized, mask, macro_timestamp)
-            kin_pred, sbp_pred, mu, logvar = lfads_model(sbp_imputed, mask=mask)
+            # Extract encoder features from MAE
+            encoder_features = mae_model.extract_encoder_features(sbp_normalized, mask, macro_timestamp)
+            encoder_features = encoder_features.mean(dim=2)
+            kin_pred, sbp_pred, mu, logvar = lstm_model(encoder_features, mask=mask)
             
             loss_dict = lfads_loss(
                 kin_pred, kin_target, mu, logvar, step, config, sbp_pred, sbp_imputed

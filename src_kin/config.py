@@ -7,7 +7,7 @@ class Config:
     """Training configuration - modify these parameters as needed"""
     
     # Data Paths
-    data_path = "kaggle_data_phase2"
+    data_path = "phase2_v2_kaggle_data"  # Contains D001, D007, etc. with full kinematics
     
     # Pre-trained MAE Model for imputation
     mae_checkpoint_path = "checkpoints_200/best_model_tcn_transformer.pt"
@@ -24,7 +24,8 @@ class Config:
     # Seed
     seed = 42
     
-    # LSTM Model Hyperparameters (simple, R²-focused)
+    # LSTM Model Hyperparameters (uses MAE encoder features, not raw SBP)
+    encoder_dim = d_model  # Match MAE's d_model (64) - encoder feature dimension
     hidden_dim = 128  # LSTM hidden size
     num_lstm_layers = 2  # Number of stacked LSTM layers
     output_dim = 4  # Outputs 4 kinematics channels (though only 2 are evaluated)
