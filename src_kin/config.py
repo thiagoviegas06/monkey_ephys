@@ -11,9 +11,9 @@ class Config:
     
     # Pre-trained MAE Model for imputation
     mae_checkpoint_path = "checkpoints_200/best_model_tcn_transformer.pt"
-    
+
     # SBP_TCN_Transformer Hyperparameters (must match the saved checkpoint)
-    window_size = 200
+    window_size = 300  # Middle ground: captures ~1.5 movement cycles, better temporal context than 200
     sbp_channels = 96
     d_model = 64  
     nhead = 8  
@@ -24,11 +24,11 @@ class Config:
     # Seed
     seed = 42
     
-    # LFADS Model Hyperparameters
-    hidden_dim = 128
-    gen_dim = 128
-    factor_dim = 40
-    output_dim = 4 # Outputs 4 kinematics channels (though only 2 are evaluated)
+    # LSTM Model Hyperparameters (simple, R²-focused)
+    hidden_dim = 128  # LSTM hidden size
+    num_lstm_layers = 2  # Number of stacked LSTM layers
+    output_dim = 4  # Outputs 4 kinematics channels (though only 2 are evaluated)
+    lstm_dropout = 0.1  # Dropout between LSTM layers
     
     # Training
     batch_size = 128
@@ -38,14 +38,13 @@ class Config:
     early_stopping_patience = 7  
     early_stopping_min_delta = 1e-5  
     
-    # LFADS Loss Hyperparameters
-    beta_anneal_steps = 2000 # Number of batches to linearly anneal beta
-    max_beta = 0.01 # Maximum weight for the KL divergence penalty
-    kin_recon_weight = 50.0 # Weight for the kinematic reconstruction loss
-    correlation_weight = 10.0 # Weight for the Pearson correlation loss
-    acceleration_weight = 1.0 # Weight for the acceleration penalty (smoothing)
-    sbp_recon_weight = 0.0 # Weight for the multi-task SBP reconstruction (disabled as requested)
+    # LFADS Loss Hyperparameters (Simplified for R² optimization)
+    # Loss = MSE(kin) + acceleration_weight * Acceleration_Penalty
+    acceleration_weight = 0.1 # Light smoothing penalty (prevents jitter, doesn't over-constrain)
     
+    # Window stride for training (sliding window step size)
+    window_step_size = 75  # 25% overlap, proportional to window_size=300
+
     # Smoothing
     smoothing_kernel_size = 5 # Kernel size for moving average smoothing
     

@@ -81,7 +81,7 @@ def get_dataloaders(config, val_split=0.2, shuffle=True, num_workers=4, pin_memo
     val_sessions = all_sessions_data[:val_size]
     train_sessions = all_sessions_data[val_size:]
     
-    train_dataset = KinematicsDataset(train_sessions, window_size=config.window_size, step_size=50, is_train=True)
+    train_dataset = KinematicsDataset(train_sessions, window_size=config.window_size, step_size=config.window_step_size, is_train=True)
     val_dataset = KinematicsDataset(val_sessions, window_size=config.window_size, step_size=config.window_size, is_train=False)
     
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory)

@@ -303,15 +303,22 @@ def parse_args():
     parser.add_argument("--data-path", type=str, default="kaggle_data", help="Data root path")
     parser.add_argument("--seed", type=int, default=42, help="Seed for window randomization")
     parser.add_argument("--denormalize", action="store_true", help="Denormalize predictions using per-session statistics")
+    parser.add_argument("--model-path", type=str, default=None, help="Path to model checkpoint (optional, auto-detects best model if not provided)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    checkpoint_dir = f"checkpoints_{args.window_size}"
-    model_path = os.path.join(checkpoint_dir, f"best_model_{config.model_name}.pt")
-    if not os.path.exists(model_path):
-        model_path = find_latest_checkpoint(checkpoint_dir)
+
+    # Determine model path
+    if args.model_path:
+        model_path = args.model_path
+    else:
+        # Auto-detect best model or latest checkpoint
+        checkpoint_dir = f"checkpoints_{args.window_size}"
+        model_path = os.path.join(checkpoint_dir, f"best_model_{config.model_name}.pt")
+        if not os.path.exists(model_path):
+            model_path = find_latest_checkpoint(checkpoint_dir)
 
     output_csv = f"submission_eval_{args.window_size}.csv"
     run_eval(model_path, args.data_path, output_csv, args.window_size, args.seed, args.denormalize)

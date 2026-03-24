@@ -43,40 +43,26 @@ def acceleration_penalty(y_pred):
 
 def lfads_loss(kin_pred, kin_target, mu, logvar, step, config, sbp_pred=None, sbp_target=None):
     """
-    Computes the enhanced loss for the LFADS Kinematic Decoder.
-    Loss = kin_recon_weight * MSE(Kinematics) 
-           + correlation_weight * Pearson_Loss
-           + acceleration_weight * Acceleration_Penalty
-           + beta * KL_Divergence
+    Simplified loss for LFADS Kinematic Decoder, optimized for R² metric.
+    Loss = MSE(Kinematics) + acceleration_weight * Acceleration_Penalty
+
+    Focuses on fitting data well rather than learning a VAE prior.
     """
-    # 1. Kinematic Reconstruction (MSE)
-    # Scaled up to focus gradients on trajectory
+    # 1. Kinematic Reconstruction (MSE) - PRIMARY LOSS
     recon_loss = F.mse_loss(kin_pred, kin_target)
-    
-    # 2. Pearson Correlation Loss
-    corr_loss = pearson_correlation_loss(kin_pred, kin_target)
-    
-    # 3. Acceleration Penalty (In-network smoothing)
+
+    # 2. Light Acceleration Penalty (In-network smoothing)
+    # Prevents jitter but doesn't constrain dynamics too much
     accel_loss = acceleration_penalty(kin_pred)
-    
-    # 4. KL Divergence (Latent Regularization)
-    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    
-    # 5. Beta Annealing
-    beta = min(config.max_beta, config.max_beta * (step / max(1, config.beta_anneal_steps)))
-    
-    # Total weighted loss
-    loss = (config.kin_recon_weight * recon_loss) + \
-           (config.correlation_weight * corr_loss) + \
-           (config.acceleration_weight * accel_loss) + \
-           (beta * kl_loss)
-    
-    # 6. Optional Multi-Task SBP Regularization (usually set to 0.0)
+
+    # Total weighted loss (MSE + light smoothing)
+    loss = recon_loss + config.acceleration_weight * accel_loss
+
+    # Return dict for logging (KL and correlation removed for simplicity)
+    corr_loss = torch.tensor(0.0, device=kin_pred.device)
+    kl_loss = torch.tensor(0.0, device=kin_pred.device)
     sbp_loss = torch.tensor(0.0, device=kin_pred.device)
-    if sbp_pred is not None and sbp_target is not None and config.sbp_recon_weight > 0:
-        sbp_loss = F.mse_loss(sbp_pred, sbp_target)
-        loss = loss + config.sbp_recon_weight * sbp_loss
-        
+
     return {
         "loss": loss,
         "recon_mse": recon_loss,
@@ -84,7 +70,7 @@ def lfads_loss(kin_pred, kin_target, mu, logvar, step, config, sbp_pred=None, sb
         "accel_loss": accel_loss,
         "kl_loss": kl_loss,
         "sbp_loss": sbp_loss,
-        "beta": beta
+        "beta": 0.0
     }
 
 def calculate_r2(y_pred, y_true):

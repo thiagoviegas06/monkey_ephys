@@ -8,10 +8,32 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src_kin.config import Config
-from src_kin.model import LFADSKinematicDecoder
+from src_kin.model import LSTMKinematicDecoder
 from src_mae.model import SBP_TCN_Transformer
 from src_kin.preprocessing import SessionDataPhase2
 from src_kin.compute_kin_stats import compute_per_session_kin_stats
+
+def compute_per_session_sbp_stats(data_path):
+    """Compute SBP normalization statistics per session (z-score)."""
+    session_manager = SessionDataPhase2(data_path, is_train=True)
+    sessions = session_manager.generate_session_obj()
+
+    session_stats = {}
+
+    for session in sessions:
+        sbp, _ = session.load_data()
+        if sbp is not None and sbp.shape[0] > 0:
+            mean = np.mean(sbp, axis=0)
+            std = np.std(sbp, axis=0) + 1e-8
+
+            session_stats[session.session_id] = {
+                'mean': torch.tensor(mean, dtype=torch.float32),
+                'std': torch.tensor(std, dtype=torch.float32)
+            }
+
+    print(f"✓ Computed per-session SBP stats for {len(session_stats)} sessions")
+    return session_stats
+
 
 def build_models(config):
     # MAE
@@ -26,18 +48,18 @@ def build_models(config):
     mae.load_state_dict(torch.load(config.mae_checkpoint_path, map_location=config.device)['model_state_dict'])
     mae.eval()
 
-    # LFADS
-    lfads = LFADSKinematicDecoder(
+    # LSTM Kinematics Decoder
+    lstm = LSTMKinematicDecoder(
         input_dim=config.sbp_channels,
         hidden_dim=config.hidden_dim,
-        gen_dim=config.gen_dim,
-        factor_dim=config.factor_dim,
-        output_dim=config.output_dim
+        num_layers=config.num_lstm_layers,
+        output_dim=config.output_dim,
+        dropout=config.lstm_dropout
     ).to(config.device)
-    best_lfads_path = os.path.join(config.checkpoint_dir, "best_model_lfads.pt")
-    checkpoint = torch.load(best_lfads_path, map_location=config.device)
-    lfads.load_state_dict(checkpoint['model_state_dict'])
-    lfads.eval()
+    best_lstm_path = os.path.join(config.checkpoint_dir, "best_model_lstm.pt")
+    checkpoint = torch.load(best_lstm_path, map_location=config.device)
+    lstm.load_state_dict(checkpoint['model_state_dict'])
+    lstm.eval()
 
     # Load per-session kinematics stats for denormalization
     session_kin_stats = checkpoint.get('session_kin_stats', None)
@@ -51,7 +73,14 @@ def build_models(config):
             session_kin_stats[sid]['mean'] = session_kin_stats[sid]['mean'].to(config.device)
             session_kin_stats[sid]['std'] = session_kin_stats[sid]['std'].to(config.device)
 
-    return mae, lfads, session_kin_stats
+    # Load per-session SBP stats for normalization before MAE
+    print("Loading per-session SBP statistics...")
+    session_sbp_stats = compute_per_session_sbp_stats(config.data_path)
+    for sid in session_sbp_stats:
+        session_sbp_stats[sid]['mean'] = session_sbp_stats[sid]['mean'].to(config.device)
+        session_sbp_stats[sid]['std'] = session_sbp_stats[sid]['std'].to(config.device)
+
+    return mae, lstm, session_kin_stats, session_sbp_stats
 
 def smooth_predictions(preds, kernel_size=5):
     """
@@ -72,17 +101,26 @@ def smooth_predictions(preds, kernel_size=5):
     return smoothed
 
 @torch.no_grad()
-def predict_session(mae, lfads, sbp, config, session_id, session_kin_stats):
+def predict_session(mae, lstm, sbp, config, session_id, session_kin_stats, session_sbp_stats):
     N = sbp.shape[0]
     W = config.window_size
     preds = np.zeros((N, config.output_dim), dtype=np.float32)
 
-    # Get per-session denormalization stats
+    # Get per-session normalization stats for SBP
+    if session_id in session_sbp_stats:
+        sbp_mean = session_sbp_stats[session_id]['mean'].cpu().numpy()
+        sbp_std = session_sbp_stats[session_id]['std'].cpu().numpy()
+    else:
+        print(f"Warning: Session {session_id} not in SBP stats, using identity normalization")
+        sbp_mean = np.zeros(config.sbp_channels, dtype=np.float32)
+        sbp_std = np.ones(config.sbp_channels, dtype=np.float32)
+
+    # Get per-session denormalization stats for kinematics
     if session_id in session_kin_stats:
         kin_mean = session_kin_stats[session_id]['mean'].cpu().numpy()
         kin_std = session_kin_stats[session_id]['std'].cpu().numpy()
     else:
-        print(f"Warning: Session {session_id} not in stats, using identity denormalization")
+        print(f"Warning: Session {session_id} not in kinematics stats, using identity denormalization")
         kin_mean = np.zeros(config.output_dim, dtype=np.float32)
         kin_std = np.ones(config.output_dim, dtype=np.float32)
 
@@ -97,14 +135,20 @@ def predict_session(mae, lfads, sbp, config, session_id, session_kin_stats):
             sbp_w = torch.cat([sbp_w, torch.zeros(1, pad_len, config.sbp_channels)], dim=1)
 
         sbp_w = sbp_w.to(config.device)
+
+        # Normalize SBP before passing to MAE
+        sbp_mean_tensor = torch.tensor(sbp_mean, dtype=torch.float32, device=config.device)
+        sbp_std_tensor = torch.tensor(sbp_std, dtype=torch.float32, device=config.device)
+        sbp_w_norm = (sbp_w - sbp_mean_tensor) / sbp_std_tensor
+
         mask = (sbp_w == 0.0).float().to(config.device)
         macro_timestamp = torch.tensor([[w0]], dtype=torch.float32, device=config.device)
 
-        # Impute missing neural activity
-        sbp_imputed = mae(sbp_w, mask, macro_timestamp)
+        # Impute missing neural activity (on normalized SBP)
+        sbp_imputed = mae(sbp_w_norm, mask, macro_timestamp)
 
         # Decode kinematics
-        kin_pred, _, _, _ = lfads(sbp_imputed, mask=mask)
+        kin_pred, _, _, _ = lstm(sbp_imputed, mask=mask)
 
         # Denormalize kinematics (Per-Session Z-Score)
         kin_pred = kin_pred * torch.tensor(kin_std, dtype=torch.float32, device=config.device) + torch.tensor(kin_mean, dtype=torch.float32, device=config.device)
@@ -120,7 +164,7 @@ def predict_session(mae, lfads, sbp, config, session_id, session_kin_stats):
 def run_eval():
     config = Config()
     print("Building models...")
-    mae, lfads, session_kin_stats = build_models(config)
+    mae, lstm, session_kin_stats, session_sbp_stats = build_models(config)
 
     print("Loading test data...")
     session_manager = SessionDataPhase2(config.data_path, is_train=False)
@@ -130,7 +174,7 @@ def run_eval():
     for session in tqdm(sessions, desc="Predicting Test Sessions"):
         sbp, _ = session.load_data()
         if sbp is None: continue
-        preds = predict_session(mae, lfads, sbp, config, session.session_id, session_kin_stats)
+        preds = predict_session(mae, lstm, sbp, config, session.session_id, session_kin_stats, session_sbp_stats)
         
         # Apply smoothing
         preds = smooth_predictions(preds, kernel_size=config.smoothing_kernel_size)

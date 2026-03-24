@@ -1,6 +1,66 @@
 import torch
 import torch.nn as nn
 
+
+class LSTMKinematicDecoder(nn.Module):
+    """
+    Simple LSTM-based kinematics decoder.
+    Input: (B, W, 96) normalized SBP sequences
+    Output: (B, W, 4) predicted kinematics
+
+    Direct supervised learning - no VAE, no latent factors.
+    Optimized for R² metric on position channels.
+    """
+    def __init__(self, input_dim=96, hidden_dim=128, num_layers=2, output_dim=4, dropout=0.1):
+        super(LSTMKinematicDecoder, self).__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+
+        # Bidirectional LSTM for temporal modeling
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+
+        # Output projection: hidden_dim*2 (bidirectional) → output_dim
+        self.fc_out = nn.Linear(hidden_dim * 2, output_dim)
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: (B, W, 96) normalized SBP
+            mask: (B, W, 96) unused, kept for compatibility
+
+        Returns:
+            kin_pred: (B, W, 4) kinematics predictions
+            sbp_pred: (B, W, 96) zeros (unused, for compatibility)
+            mu: (B, hidden_dim) zeros (for compatibility with training)
+            logvar: (B, hidden_dim) zeros (for compatibility with training)
+        """
+        batch_size, seq_len, _ = x.size()
+
+        # LSTM forward pass
+        # lstm_out: (B, W, hidden_dim*2)
+        lstm_out, _ = self.lstm(x)
+
+        # Project to kinematics
+        # (B, W, hidden_dim*2) → (B, W, 4)
+        kin_pred = self.fc_out(lstm_out)
+
+        # Return dummy values for compatibility with training code
+        sbp_pred = torch.zeros(batch_size, seq_len, self.input_dim, device=x.device)
+        mu = torch.zeros(batch_size, self.hidden_dim, device=x.device)
+        logvar = torch.zeros(batch_size, self.hidden_dim, device=x.device)
+
+        return kin_pred, sbp_pred, mu, logvar
+
+
 class LFADSKinematicDecoder(nn.Module):
     def __init__(self, input_dim=96, hidden_dim=128, gen_dim=128, factor_dim=40, output_dim=4):
         super(LFADSKinematicDecoder, self).__init__()
