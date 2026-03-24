@@ -9,8 +9,8 @@ class Config:
     # Data Paths
     data_path = "phase2_v2_kaggle_data"  # Contains D001, D007, etc. with full kinematics
     
-    # Pre-trained MAE Model for imputation
-    mae_checkpoint_path = "checkpoints_200/best_model_tcn_transformer.pt"
+    # Pre-trained MAE Model for imputation (nkin = no kinematics input version)
+    mae_checkpoint_path = "checkpoints/nkin_best_model_tcn_transformer.pt"
 
     # SBP_TCN_Transformer Hyperparameters (must match the saved checkpoint)
     window_size = 300  # Middle ground: captures ~1.5 movement cycles, better temporal context than 200

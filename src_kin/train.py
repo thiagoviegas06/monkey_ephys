@@ -71,8 +71,8 @@ def build_lstm_model(config):
     )
     return model.to(config.device)
 
-def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch, step, session_kin_stats=None, session_sbp_stats=None):
-    lfads_model.train()
+def train_one_epoch(mae_model, lstm_model, dataloader, optimizer, config, epoch, step, session_kin_stats=None, session_sbp_stats=None):
+    lstm_model.train()
 
     total_loss = 0.0
     total_recon = 0.0
@@ -153,8 +153,8 @@ def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch
         
     return total_loss / total_samples, total_recon / total_samples, total_r2 / total_samples, step
 
-def validate_one_epoch(mae_model, lfads_model, dataloader, config, epoch, step, session_kin_stats=None, session_sbp_stats=None):
-    lfads_model.eval()
+def validate_one_epoch(mae_model, lstm_model, dataloader, config, epoch, step, session_kin_stats=None, session_sbp_stats=None):
+    lstm_model.eval()
 
     total_loss = 0.0
     total_recon = 0.0
