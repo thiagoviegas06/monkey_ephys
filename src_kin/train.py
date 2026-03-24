@@ -124,12 +124,12 @@ def train_one_epoch(mae_model, lstm_model, dataloader, optimizer, config, epoch,
         
         # Loss
         loss_dict = lfads_loss(
-            kin_pred, kin_target, mu, logvar, step, config, sbp_pred, sbp_imputed
+            kin_pred, kin_target, mu, logvar, step, config
         )
         loss = loss_dict["loss"]
         
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(lfads_model.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(lstm_model.parameters(), max_norm=5.0)
         optimizer.step()
         
         # Metrics (not for backprop)
@@ -199,7 +199,7 @@ def validate_one_epoch(mae_model, lstm_model, dataloader, config, epoch, step, s
             kin_pred, sbp_pred, mu, logvar = lstm_model(encoder_features, mask=mask)
             
             loss_dict = lfads_loss(
-                kin_pred, kin_target, mu, logvar, step, config, sbp_pred, sbp_imputed
+                kin_pred, kin_target, mu, logvar, step, config
             )
             loss = loss_dict["loss"]
             

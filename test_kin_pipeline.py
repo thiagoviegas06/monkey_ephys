@@ -119,7 +119,7 @@ for i, sid in enumerate(session_ids):
         std = session_kin_stats[sid]['std'].to(config.device)
         kin_target_norm[i] = (kin_target[i] - mean) / std
 
-loss_dict = lfads_loss(kin_pred, kin_target_norm, mu, logvar, 0, config, sbp_pred, encoder_features)
+loss_dict = lfads_loss(kin_pred, kin_target_norm, mu, logvar, 0, config)
 loss = loss_dict["loss"]
 print(f"  ✓ Loss computed: {loss.item():.6f}")
 print(f"    - MSE: {loss_dict['recon_mse'].item():.6f}")
