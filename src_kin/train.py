@@ -208,7 +208,7 @@ def main():
     print("Computing SBP statistics...")
     sbp_mean, sbp_std = compute_sbp_stats(config.data_path)
     
-    best_val_loss = float('inf')
+    best_val_recon = float('inf')
     epochs_without_improvement = 0
     step = 0
     
@@ -219,8 +219,9 @@ def main():
         val_loss, val_recon, val_r2 = validate_one_epoch(mae_model, lfads_model, val_loader, config, epoch, step, kin_mean, kin_std, sbp_mean, sbp_std)
         print(f"Epoch {epoch} Val:   Loss={val_loss:.4f} Recon(MSE)={val_recon:.4f} R2={val_r2:.4f}")
         
-        if val_loss < best_val_loss - config.early_stopping_min_delta:
-            best_val_loss = val_loss
+        # Save best model based on Recon (MSE) as it's more stable and correlated with R2
+        if val_recon < best_val_recon - config.early_stopping_min_delta:
+            best_val_recon = val_recon
             epochs_without_improvement = 0
             best_path = os.path.join(config.checkpoint_dir, "best_model_lfads.pt")
             torch.save({
@@ -228,12 +229,14 @@ def main():
                 'model_state_dict': lfads_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
+                'val_recon': val_recon,
+                'val_r2': val_r2,
                 'kin_mean': kin_mean, # Save stats with model
                 'kin_std': kin_std,
                 'sbp_mean': sbp_mean,
                 'sbp_std': sbp_std,
             }, best_path)
-            print(f"✓ Saved best model to {best_path}")
+            print(f"✓ Saved best model (MSE: {val_recon:.4f}) to {best_path}")
 
         else:
             epochs_without_improvement += 1
