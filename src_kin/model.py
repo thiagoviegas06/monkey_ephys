@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 
 class LFADSKinematicDecoder(nn.Module):
-    def __init__(self, input_dim=96, hidden_dim=128, gen_dim=128, factor_dim=40, output_dim=4):
+    def __init__(self, input_dim=96, hidden_dim=128, gen_dim=128, factor_dim=40, output_dim=4, dropout=0.0):
         super(LFADSKinematicDecoder, self).__init__()
+        
+        self.dropout = nn.Dropout(dropout)
         
         # 1. Encoder: Bidirectional GRU to read the imputed SBP sequence
         self.encoder = nn.GRU(input_dim, hidden_dim, batch_first=True, bidirectional=True)
@@ -25,31 +27,42 @@ class LFADSKinematicDecoder(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, sbp_mean=None, sbp_std=None):
         batch_size, seq_len, _ = x.size()
         
         # --- NORMALIZATION ---
-        # Spatial-Temporal Mask-Aware Normalization
         # In Phase 2, certain channels are zeroed out for the whole session.
-        # We calculate global stats for the window across active channels only.
         if mask is None:
-            # If no mask provided, assume values that are exactly 0 are masked
             mask = (x == 0.0).float()
             
         visible_mask = (~mask.bool()).float()  # 1.0 if visible, 0.0 if masked
-        num_visible = visible_mask.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
         
-        # Calculate global mean and std across ALL active channels in this window
-        mean = (x * visible_mask).sum(dim=(1, 2), keepdim=True) / num_visible
-        var = (((x - mean) * visible_mask) ** 2).sum(dim=(1, 2), keepdim=True) / num_visible
-        std = torch.sqrt(var + 1e-5)
+        if sbp_mean is not None and sbp_std is not None:
+            # Use global statistics across all active channels
+            # Ensure they are on the correct device and broadcast correctly
+            mean = sbp_mean.to(x.device).view(1, 1, 1)
+            std = sbp_std.to(x.device).view(1, 1, 1)
+        else:
+            # Fallback: Spatial-Temporal Mask-Aware Normalization (Per-Window)
+            # We calculate global stats for the window across active channels only.
+            num_visible = visible_mask.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
+            
+            # Calculate global mean and std across ALL active channels in this window
+            mean = (x * visible_mask).sum(dim=(1, 2), keepdim=True) / num_visible
+            var = (((x - mean) * visible_mask) ** 2).sum(dim=(1, 2), keepdim=True) / num_visible
+            # Increased epsilon (1e-4) for better stability as requested
+            std = torch.sqrt(var + 1e-4)
         
         x_norm = ((x - mean) / std) * visible_mask
+
         
         # --- ENCODER ---
         _, h_n = self.encoder(x_norm)
         # Concatenate final forward and backward hidden states
         h_n_concat = torch.cat((h_n[0], h_n[1]), dim=1) 
+        
+        # Apply dropout to encoder output
+        h_n_concat = self.dropout(h_n_concat)
         
         # Get distribution for initial generator state
         mu = self.fc_mu(h_n_concat)
@@ -72,12 +85,15 @@ class LFADSKinematicDecoder(nn.Module):
             # Map to latent factors
             f_t = self.fc_factors(g_t)
             
+            # Apply dropout before the final readouts
+            f_t_drop = self.dropout(f_t)
+            
             # Map to kinematics
-            kin_t = self.fc_kinematics(f_t)
+            kin_t = self.fc_kinematics(f_t_drop)
             kinematic_preds.append(kin_t.unsqueeze(1))
             
             # Map to SBP
-            sbp_t = self.fc_sbp(f_t)
+            sbp_t = self.fc_sbp(f_t_drop)
             
             # Un-normalize SBP prediction back to original scale 
             # (matches sbp_imputed in loss calculation)

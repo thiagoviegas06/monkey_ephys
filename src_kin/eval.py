@@ -32,27 +32,39 @@ def build_models(config):
         hidden_dim=config.hidden_dim,
         gen_dim=config.gen_dim,
         factor_dim=config.factor_dim,
-        output_dim=config.output_dim
+        output_dim=config.output_dim,
+        dropout=config.lfads_dropout
     ).to(config.device)
     best_lfads_path = os.path.join(config.checkpoint_dir, "best_model_lfads.pt")
     checkpoint = torch.load(best_lfads_path, map_location=config.device)
     lfads.load_state_dict(checkpoint['model_state_dict'])
     lfads.eval()
 
-    # Get kinematics stats from checkpoint or recompute
+    # Get kinematics and SBP stats from checkpoint or recompute
     kin_mean = checkpoint.get('kin_mean', None)
     kin_std = checkpoint.get('kin_std', None)
+    sbp_mean = checkpoint.get('sbp_mean', None)
+    sbp_std = checkpoint.get('sbp_std', None)
     
     if kin_mean is None or kin_std is None:
-        print("Kinematics stats not found in checkpoint. Recomputing from training data...")
+        print("Kinematics stats not found in checkpoint. Recomputing...")
+        from src_kin.compute_kin_stats import compute_kin_stats
         kin_mean, kin_std = compute_kin_stats(config.data_path)
     
+    if sbp_mean is None or sbp_std is None:
+        print("SBP stats not found in checkpoint. Recomputing...")
+        from src_kin.compute_kin_stats import compute_sbp_stats
+        sbp_mean, sbp_std = compute_sbp_stats(config.data_path)
+
     kin_mean = kin_mean.to(config.device)
     kin_std = kin_std.to(config.device)
+    sbp_mean = sbp_mean.to(config.device)
+    sbp_std = sbp_std.to(config.device)
 
-    return mae, lfads, kin_mean, kin_std
+    return mae, lfads, kin_mean, kin_std, sbp_mean, sbp_std
 
 def smooth_predictions(preds, kernel_size=5):
+
     """
     Applies a simple moving average filter to the predictions.
     preds: (N, C) numpy array
@@ -71,7 +83,7 @@ def smooth_predictions(preds, kernel_size=5):
     return smoothed
 
 @torch.no_grad()
-def predict_session(mae, lfads, sbp, config, kin_mean, kin_std):
+def predict_session(mae, lfads, sbp, config, kin_mean, kin_std, sbp_mean, sbp_std):
     N = sbp.shape[0]
     W = config.window_size
     preds = np.zeros((N, config.output_dim), dtype=np.float32)
@@ -94,7 +106,7 @@ def predict_session(mae, lfads, sbp, config, kin_mean, kin_std):
         sbp_imputed = mae(sbp_w, mask, macro_timestamp)
         
         # Decode kinematics
-        kin_pred, _, _, _ = lfads(sbp_imputed, mask=mask)
+        kin_pred, _, _, _ = lfads(sbp_imputed, mask=mask, sbp_mean=sbp_mean, sbp_std=sbp_std)
         
         # Un-normalize kinematics (Global Z-Score)
         kin_pred = kin_pred * kin_std + kin_mean
@@ -110,7 +122,7 @@ def predict_session(mae, lfads, sbp, config, kin_mean, kin_std):
 def run_eval():
     config = Config()
     print("Building models...")
-    mae, lfads, kin_mean, kin_std = build_models(config)
+    mae, lfads, kin_mean, kin_std, sbp_mean, sbp_std = build_models(config)
     
     print("Loading test data...")
     session_manager = SessionDataPhase2(config.data_path, is_train=False)
@@ -120,12 +132,13 @@ def run_eval():
     for session in tqdm(sessions, desc="Predicting Test Sessions"):
         sbp, _ = session.load_data()
         if sbp is None: continue
-        preds = predict_session(mae, lfads, sbp, config, kin_mean, kin_std)
+        preds = predict_session(mae, lfads, sbp, config, kin_mean, kin_std, sbp_mean, sbp_std)
         
         # Apply smoothing
         preds = smooth_predictions(preds, kernel_size=config.smoothing_kernel_size)
         
         predictions[session.session_id] = preds
+
         
     print("Constructing submission...")
     sub_path = os.path.join(config.data_path, "sample_submission.csv")

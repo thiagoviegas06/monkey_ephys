@@ -29,6 +29,8 @@ class Config:
     gen_dim = 128
     factor_dim = 40
     output_dim = 4 # Outputs 4 kinematics channels (though only 2 are evaluated)
+    lfads_dropout = 0.3 # Dropout for LFADS Decoder
+
     
     # Training
     batch_size = 128

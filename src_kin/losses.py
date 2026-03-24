@@ -87,9 +87,10 @@ def lfads_loss(kin_pred, kin_target, mu, logvar, step, config, sbp_pred=None, sb
         "beta": beta
     }
 
-def calculate_r2(y_pred, y_true):
+def get_r2_components(y_pred, y_true):
     """
-    Calculates the R^2 (Coefficient of Determination) score for the first 2 position channels.
+    Returns components needed to compute a mathematically correct global R^2 
+    score for the first 2 position channels over the entire epoch.
     y_pred, y_true: (Batch, Time, Channels)
     """
     # Extract only the first 2 channels (index_pos, mrp_pos)
@@ -100,11 +101,18 @@ def calculate_r2(y_pred, y_true):
     y_pred_flat = y_pred.reshape(-1, 2)
     y_true_flat = y_true.reshape(-1, 2)
     
-    ss_res = torch.sum((y_true_flat - y_pred_flat) ** 2, dim=0)
+    ss_res_batch = torch.sum((y_true_flat - y_pred_flat) ** 2, dim=0)
+    sum_y_batch = torch.sum(y_true_flat, dim=0)
+    sum_y_sq_batch = torch.sum(y_true_flat ** 2, dim=0)
+    count_batch = torch.tensor(y_true_flat.shape[0], device=y_true.device, dtype=torch.float32)
     
-    # Calculate mean per channel across all samples in the flattened array
-    mean_true = torch.mean(y_true_flat, dim=0)
-    ss_tot = torch.sum((y_true_flat - mean_true) ** 2, dim=0)
-    
-    r2 = 1 - (ss_res / (ss_tot + 1e-8))
+    return ss_res_batch, sum_y_batch, sum_y_sq_batch, count_batch
+
+def calculate_global_r2(total_ss_res, total_sum_y, total_sum_y_sq, total_count):
+    """
+    Calculates the final R^2 score from accumulated components.
+    """
+    mean_y = total_sum_y / total_count
+    ss_tot = total_sum_y_sq - (total_sum_y ** 2) / total_count
+    r2 = 1 - (total_ss_res / (ss_tot + 1e-8))
     return r2.mean().item()
