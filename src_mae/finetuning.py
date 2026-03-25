@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Finetuning script for SBP masked reconstruction.
-Masks entire channels instead of time-spans to improve robustness to channel dropout.
+Loads pre-generated masked windows from preprocessing function.
 """
 
 import os
 import torch
-import numpy as np
+import pickle
 import argparse
 import random
 from torch.utils.data import Dataset, DataLoader
@@ -15,123 +15,96 @@ from tqdm import tqdm
 from model import SBP_TCN_Transformer
 from losses import kaggle_aligned_nmse_loss
 from config import Config
-from preprocessing import sessionData, compute_session_channel_variance
 
 # ============================================================================
-# New Dataset Class for Finetuning
+# Preprocessed Data Dataset Class
 # ============================================================================
-class SBPChannelMaskDataset(Dataset):
+class PreprocessedMaskedDataset(Dataset):
     """
-    Dataset that masks ENTIRE channels for the whole window.
-    This mimics the channel dropout seen in Phase 2.
+    Loads pre-generated masked windows from pickle files.
+    Each file contains: x_sbp (masked), y_sbp (full), kin, mask, channel_var, session_id, etc.
     """
-    def __init__(self, sessions_data, is_train=True, window_size=200, config=None):
-        self.sessions_data = sessions_data
+    def __init__(self, data_dir, is_train=True, train_split=0.9, seed=42):
+        self.data_dir = data_dir
         self.is_train = is_train
-        self.window_size = window_size
-        self.windows = []
-        self.config = config
+        self.seed = seed
 
-        # Precompute all non-overlapping windows
-        for i, session in enumerate(sessions_data):
-            N = session["N"]
-            for w0 in range(0, N - self.window_size + 1, self.window_size):
-                self.windows.append((i, w0))
-                
-        print(f"Prepared {len(self.windows)} windows for channel-mask finetuning (is_train={is_train})")
-        
-    def __len__(self):
-        return len(self.windows)
-    
-    def __getitem__(self, idx):
-        if self.is_train:
-            sess_idx, w0 = self.windows[idx]
-            session = self.sessions_data[sess_idx]
-            
-            y_sbp = torch.from_numpy(session["sbp"][w0:w0 + self.window_size])
-            kin_w = torch.from_numpy(session["kin"][w0:w0 + self.window_size])
-            C = y_sbp.shape[1]
+        # Load all pkl file paths
+        all_files = [f for f in os.listdir(data_dir) if f.endswith('.pkl')]
 
-            x_sbp = y_sbp.clone()
-            mask = torch.zeros_like(y_sbp, dtype=torch.bool)
-            
-            # Mask entire channels: 20 to 40 channels zeroed out for the WHOLE window
-            num_channels = torch.randint(20, 40, (1,)).item()
-            channels = torch.randperm(C)[:num_channels]
-            
-            x_sbp[:, channels] = 0.0
-            mask[:, channels] = True
-            
+        if not all_files:
+            raise FileNotFoundError(f"No .pkl files found in {data_dir}")
+
+        # Sort for reproducibility
+        all_files.sort()
+
+        # Split train/val
+        random.seed(seed)
+        random.shuffle(all_files)
+        split_idx = int(len(all_files) * train_split)
+
+        if is_train:
+            self.file_list = all_files[:split_idx]
         else:
-            # Deterministic for validation
-            rng = np.random.default_rng(idx + 42) 
-            sess_idx, w0 = self.windows[idx % len(self.windows)]
-            session = self.sessions_data[sess_idx]
-            
-            y_np = session["sbp"][w0:w0 + self.window_size].copy()
-            kin_np = session["kin"][w0:w0 + self.window_size].copy()
-            C = y_np.shape[1]
-            
-            x_np = y_np.copy()
-            mask_np = np.zeros_like(y_np, dtype=bool)
-            
-            # Use deterministic channel selection for validation
-            num_channels = rng.integers(20, 40)
-            channels = rng.choice(C, size=num_channels, replace=False)
-            
-            x_np[:, channels] = 0.0
-            mask_np[:, channels] = True
-            
-            x_sbp = torch.from_numpy(x_np)
-            y_sbp = torch.from_numpy(y_np)
-            mask = torch.from_numpy(mask_np)
-            kin_w = torch.from_numpy(kin_np)
+            self.file_list = all_files[split_idx:]
+
+        print(f"Loaded {len(self.file_list)} {'train' if is_train else 'val'} samples from {data_dir}")
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        file_path = os.path.join(self.data_dir, self.file_list[idx])
+
+        with open(file_path, 'rb') as f:
+            sample = pickle.load(f)
+
+        # Extract data from pickle
+        x_sbp = torch.from_numpy(sample["x_sbp"]).float()      # (W, C) - masked SBP
+        y_sbp = torch.from_numpy(sample["y_sbp"]).float()      # (W, C) - full SBP
+        kin = torch.from_numpy(sample["kin"]).float()          # (W, 4) - kinematics
+        mask = torch.from_numpy(sample["mask"]).bool()         # (W, C) - True where masked
+        channel_var = torch.from_numpy(sample["channel_var"]).float()  # (C,)
+        session_id = sample["session_id"]
+
+        # Create macro_timestamp (approximate from day info if available)
+        day = sample.get("day", 0.0)
+        macro_timestamp = torch.tensor([day], dtype=torch.float32)
 
         return {
-            "x_sbp": x_sbp.float(),
-            "y_sbp": y_sbp.float(),
-            "mask": mask.float(),
-            "kin": kin_w.float(),
-            "channel_var": torch.from_numpy(session["channel_var"]).float(),
-            "session_id": session["session_id"],
-            "macro_timestamp": w0,
+            "x_sbp": x_sbp,
+            "y_sbp": y_sbp,
+            "mask": mask,
+            "kin": kin,
+            "channel_var": channel_var,
+            "macro_timestamp": macro_timestamp,
+            "session_id": session_id,
         }
 
 # ============================================================================
 # Dataloader Helper
 # ============================================================================
-def get_finetune_dataloaders(config, val_split=0.2, shuffle=True, num_workers=8):
-    print("Loading full sessions into RAM for channel-mask finetuning...")
-    sessions, _ = sessionData(f"{config.data_path}/metadata.csv").generate_session_obj()
-    
-    all_sessions_data = []
-    for session in tqdm(sessions, desc="Processing sessions"):
-        if session.isTest(): continue
-        sbp, kin, _, _ = session.load_data(config.data_path)
-        if sbp is None or sbp.shape[0] < config.window_size: continue
-            
-        session_dict = {
-            "sbp": sbp,
-            "kin": kin,
-            "N": sbp.shape[0],
-            "channel_var": compute_session_channel_variance(sbp),
-            "session_id": session.session_id,
-        }
-        all_sessions_data.append(session_dict)
-        
-    random.seed(config.seed)
-    random.shuffle(all_sessions_data)
-    val_size = max(1, int(len(all_sessions_data) * val_split))
-    val_sessions = all_sessions_data[:val_size]
-    train_sessions = all_sessions_data[val_size:]
-    
-    train_dataset = SBPChannelMaskDataset(train_sessions, is_train=True, window_size=config.window_size, config=config)
-    val_dataset = SBPChannelMaskDataset(val_sessions, is_train=False, window_size=config.window_size, config=config)
-    
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True if config.device == "cuda" else False)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=num_workers, pin_memory=True if config.device == "cuda" else False)
-    
-    return train_loader, val_loader, train_dataset, val_dataset
+def get_dataloaders_from_preprocessed(data_dir, batch_size=32, num_workers=4, train_split=0.9, seed=42):
+    """Load preprocessed data from directory."""
+    train_dataset = PreprocessedMaskedDataset(data_dir, is_train=True, train_split=train_split, seed=seed)
+    val_dataset = PreprocessedMaskedDataset(data_dir, is_train=False, train_split=train_split, seed=seed)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+
+    return train_loader, val_loader
 
 # ============================================================================
 # Training Functions
@@ -140,90 +113,100 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
     model.train()
     total_loss = 0.0
     total_samples = 0
-    pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch}/{config.num_epochs}")
-    
+    pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch}")
+
     for batch in pbar:
         x_sbp = batch["x_sbp"].to(config.device)
         y_sbp = batch["y_sbp"].to(config.device)
-        macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()
+        macro_timestamp = batch["macro_timestamp"].to(config.device).float()
         mask_float = batch["mask"].to(config.device).float()
         mask = batch["mask"].to(config.device)
         channel_var = batch["channel_var"].to(config.device)
         session_ids = batch["session_id"]
-        
+
         batch_size = x_sbp.size(0)
         optimizer.zero_grad()
-        
+
         pred = model(x_sbp, mask_float, macro_timestamp)
         loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)
-        
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        
+
         total_loss += loss.item() * batch_size
         total_samples += batch_size
-        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'avg_loss': f'{total_loss / total_samples:.4f}'})
-    
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
     return total_loss / total_samples
 
 def validate_one_epoch(model, dataloader, config, epoch):
     model.eval()
     total_loss = 0.0
     total_samples = 0
-    pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}/{config.num_epochs}")
+    pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}")
 
     with torch.no_grad():
         for batch in pbar:
             x_sbp = batch["x_sbp"].to(config.device)
             y_sbp = batch["y_sbp"].to(config.device)
-            macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()
+            macro_timestamp = batch["macro_timestamp"].to(config.device).float()
             mask_float = batch["mask"].to(config.device).float()
             mask = batch["mask"].to(config.device)
             channel_var = batch["channel_var"].to(config.device)
             session_ids = batch["session_id"]
-            
+
             batch_size = x_sbp.size(0)
             pred = model(x_sbp, mask_float, macro_timestamp)
             loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)
-            
+
             total_loss += loss.item() * batch_size
             total_samples += batch_size
-            pbar.set_postfix({'val_loss': f'{loss.item():.4f}', 'avg_val_loss': f'{total_loss / total_samples:.4f}'})
-    
+            pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
+
     return total_loss / total_samples
 
 # ============================================================================
 # Main Loop
 # ============================================================================
 def main():
-    config = Config()
-    parser = argparse.ArgumentParser(description="Finetune SBP reconstruction with channel masking.")
-    parser.add_argument("--window-size", type=int, default=config.window_size, help="Window size")
-    parser.add_argument("--epochs", type=int, default=15, help="Number of finetuning epochs")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for finetuning")
+    parser = argparse.ArgumentParser(description="Finetune SBP model on 30% masked channels")
+    parser.add_argument('--checkpoint', type=str, required=True, help='Path to best checkpoint')
+    parser.add_argument('--data_dir', type=str, default='kaggle_data/masked_window_p2',
+                        help='Directory with preprocessed masked windows (from preprocess_channel_level_masking)')
+    parser.add_argument('--num_epochs', type=int, default=10, help='Number of finetuning epochs')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for finetuning')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+    parser.add_argument('--output_dir', type=str, default='checkpoints_finetuned', help='Output directory')
+
     args = parser.parse_args()
+    config = Config()
 
-    config.window_size = args.window_size
-    config.num_epochs = args.epochs
-    config.learning_rate = args.lr
-    config.checkpoint_dir = f"checkpoints_{config.window_size}"
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    print("=" * 70)
-    print(f"Starting Channel-Mask Finetuning")
-    print(f"Window size: {config.window_size}")
-    print(f"Learning rate: {config.learning_rate}")
-    print(f"Epochs: {config.num_epochs}")
-    print("=" * 70)
-    
-    # Load model
-    model_path = os.path.join(config.checkpoint_dir, f"best_model_tcn_transformer.pt")
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Best model not found at {model_path}. Train the model first using train.py.")
-    
-    print(f"Loading best model from {model_path}")
-    checkpoint = torch.load(model_path, map_location=config.device)
-    
+    print("="*70)
+    print("FINETUNING: Loading preprocessed data")
+    print("="*70)
+
+    # Check that data exists
+    if not os.path.exists(args.data_dir) or len(os.listdir(args.data_dir)) == 0:
+        raise FileNotFoundError(
+            f"No preprocessed data found at: {args.data_dir}\n"
+            f"Run preprocessing first:\n"
+            f"  python src_mae/preprocessing.py --preprocess_type channel_level_masking --out_dir {args.data_dir}"
+        )
+
+    # Load dataloaders
+    train_loader, val_loader = get_dataloaders_from_preprocessed(
+        args.data_dir,
+        batch_size=args.batch_size,
+        num_workers=4
+    )
+    print(f"✓ Data loaded: {len(train_loader)} train batches, {len(val_loader)} val batches")
+
+    # Build and load model
+    print("\nBuilding model...")
     model = SBP_TCN_Transformer(
         sbp_channels=config.sbp_channels,
         d_model=config.d_model,
@@ -231,45 +214,63 @@ def main():
         num_layers=config.num_layers,
         tcn_levels=config.tcn_levels,
         dropout=config.dropout
-    ).to(config.device)
-    
-    if 'model_state_dict' in checkpoint:
+    )
+
+    # Load checkpoint
+    if not os.path.exists(args.checkpoint):
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+
+    checkpoint = torch.load(args.checkpoint, map_location=config.device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
     else:
         model.load_state_dict(checkpoint)
-    
-    # Prepare dataloaders
-    train_loader, val_loader, train_dataset, val_dataset = get_finetune_dataloaders(
-        config, num_workers=8
+
+    model.to(config.device)
+    print(f"✓ Loaded checkpoint from: {args.checkpoint}")
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.num_epochs, eta_min=1e-6)
-
+    # Finetuning loop
     best_val_loss = float('inf')
-    
-    for epoch in range(1, config.num_epochs + 1):
+    best_epoch = 0
+
+    print("\n" + "="*70)
+    print("STEP: Finetuning")
+    print("="*70)
+
+    for epoch in range(1, args.num_epochs + 1):
+        print(f"\nEpoch {epoch}/{args.num_epochs}")
+
         train_loss = train_one_epoch(model, train_loader, optimizer, config, epoch)
-        print(f"\tTrain NMSE: {train_loss:.6f}")
         val_loss = validate_one_epoch(model, val_loader, config, epoch)
-        print(f"\tVal NMSE: {val_loss:.6f}")
-        
-        scheduler.step()
-        
+
+        print(f"  Train Loss: {train_loss:.6f}")
+        print(f"  Val Loss:   {val_loss:.6f}")
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            finetune_model_path = os.path.join(config.checkpoint_dir, f"ft_best_model_tcn_transformer_finetuned.pt")
+            best_epoch = epoch
+            checkpoint_path = os.path.join(args.output_dir, 'best_model_finetuned.pt')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-                'config': config.__dict__,
-            }, finetune_model_path)
-            print(f"✓ Best finetuned model saved: {finetune_model_path}")
+                'val_loss': val_loss
+            }, checkpoint_path)
+            print(f"✓ Best model saved: {checkpoint_path}")
 
-    print(f"\nFinetuning complete. Best val_loss: {best_val_loss:.6f}")
-    print("=" * 70)
+        scheduler.step(val_loss)
 
-if __name__ == "__main__":
+    print("\n" + "="*70)
+    print(f"FINETUNING COMPLETE")
+    print(f"Best validation loss: {best_val_loss:.6f} (Epoch {best_epoch})")
+    print(f"Output: {os.path.join(args.output_dir, 'best_model_finetuned.pt')}")
+    print("="*70)
+
+if __name__ == '__main__':
     main()
