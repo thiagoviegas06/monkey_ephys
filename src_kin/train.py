@@ -83,9 +83,14 @@ def train_one_epoch(mae_model, kinematic_model, dataloader, optimizer, config, e
             # For simplicity in Kin decoder, we pass global stats if provided, or None
             # The MAE model will use window-local stats if channel_mean is None.
             # But better to provide the sbp_mean_global to handle fully masked channels.
+            
+            # Correctly expand global stats to (batch_size, sbp_channels)
+            channel_mean = sbp_mean_global.view(1, 1).expand(batch_size, config.sbp_channels) if sbp_mean_global is not None else None
+            channel_var = (sbp_std_global**2).view(1, 1).expand(batch_size, config.sbp_channels) if sbp_std_global is not None else None
+            
             sbp_imputed = mae_model(sbp_masked, mask, macro_timestamp.unsqueeze(-1), 
-                                   channel_mean=sbp_mean_global.expand(batch_size, -1) if sbp_mean_global is not None else None,
-                                   channel_var=(sbp_std_global**2).expand(batch_size, -1) if sbp_std_global is not None else None)
+                                   channel_mean=channel_mean,
+                                   channel_var=channel_var)
             # The imputed signal shouldn't have gradients flowing back to MAE
             sbp_imputed = sbp_imputed.detach()
             
@@ -166,9 +171,13 @@ def validate_one_epoch(mae_model, kinematic_model, dataloader, config, epoch, st
             
             batch_size = sbp_masked.size(0)
             
+            # Correctly expand global stats to (batch_size, sbp_channels)
+            channel_mean = sbp_mean_global.view(1, 1).expand(batch_size, config.sbp_channels) if sbp_mean_global is not None else None
+            channel_var = (sbp_std_global**2).view(1, 1).expand(batch_size, config.sbp_channels) if sbp_std_global is not None else None
+            
             sbp_imputed = mae_model(sbp_masked, mask, macro_timestamp.unsqueeze(-1),
-                                   channel_mean=sbp_mean_global.expand(batch_size, -1) if sbp_mean_global is not None else None,
-                                   channel_var=(sbp_std_global**2).expand(batch_size, -1) if sbp_std_global is not None else None)
+                                   channel_mean=channel_mean,
+                                   channel_var=channel_var)
             
             kin_pred, _, _, _ = kinematic_model(sbp_imputed, mask=mask, session_num=session_num, macro_timestamp=macro_timestamp, sbp_mean=sbp_mean_global, sbp_std=sbp_std_global)
             

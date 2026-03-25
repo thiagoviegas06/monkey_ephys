@@ -112,7 +112,11 @@ def predict_session(mae, kinematic_model, sbp, config, kin_mean, kin_std, sbp_me
         session_num = torch.tensor([[num_id]], dtype=torch.float32, device=config.device)
         
         # Impute missing neural activity
-        sbp_imputed = mae(sbp_w, mask, macro_timestamp)
+        # Expand global stats to (1, sbp_channels) for the window
+        channel_mean = sbp_mean.view(1, 1).expand(1, config.sbp_channels) if sbp_mean is not None else None
+        channel_var = (sbp_std**2).view(1, 1).expand(1, config.sbp_channels) if sbp_std is not None else None
+        
+        sbp_imputed = mae(sbp_w, mask, macro_timestamp, channel_mean=channel_mean, channel_var=channel_var)
         
         # Decode kinematics
         kin_pred, _, _, _ = kinematic_model(
