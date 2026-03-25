@@ -64,8 +64,8 @@ class SBPDataset(Dataset):
             else:
                 # --- SPAN MASKING (Phase 1 Style) ---
                 num_spans = torch.randint(2, 4, (1,)).item()
-                # Approx triangular distribution (45 to 85 length for 400 window, 20, 50 for 200)
-                span_lengths = torch.randint(45, 85, (num_spans,)) 
+                # Approx triangular distribution (20 to 50 for 200 window)
+                span_lengths = torch.randint(20, 50, (num_spans,)) 
                 
                 total_len = span_lengths.sum().item() + (num_spans - 1) * 10
                 if total_len < self.window_size:
