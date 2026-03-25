@@ -355,7 +355,7 @@ def preprocess_channel_level_masking(data_path, window_size=200, step_size=50, m
         for w0 in range(0, N - window_size + 1, step_size):
             w0s.append(w0)
 
-        session_variance = compute_session_channel_variance(sbp_norm)
+        session_variance = compute_session_channel_variance(sbp)
 
         for w0 in w0s:
             y = sbp_norm[w0:w0 + window_size]      # (W,96)
