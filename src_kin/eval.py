@@ -19,7 +19,8 @@ def build_models(config):
         sbp_channels=config.sbp_channels,
         d_model=config.d_model,
         nhead=config.nhead,
-        num_layers=config.num_layers,
+        num_encoder_layers=config.num_encoder_layers,
+        num_decoder_layers=config.num_decoder_layers,
         tcn_levels=config.tcn_levels,
         dropout=config.dropout
     ).to(config.device)

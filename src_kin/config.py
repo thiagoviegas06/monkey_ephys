@@ -17,7 +17,8 @@ class Config:
     sbp_channels = 96
     d_model = 64  
     nhead = 8  
-    num_layers = 8 
+    num_encoder_layers = 6 
+    num_decoder_layers = 2
     tcn_levels = 8  
     dropout = 0.1  
     
