@@ -49,32 +49,47 @@ class SBPDataset(Dataset):
             x_sbp = y_sbp.clone()
             mask = torch.zeros_like(y_sbp, dtype=torch.bool)
             
-            # Fast inline dynamic masking (bypasses old_preprocessing.py)
-            num_spans = torch.randint(2, 4, (1,)).item()
-            # Approx triangular distribution (45 to 85 length for 400 window, 20, 50 for 200)
-            span_lengths = torch.randint(45, 85, (num_spans,)) 
+            # Use channel_mask_prob from config or default to 0.5
+            channel_mask_prob = getattr(self.config, 'channel_mask_prob', 0.5) if self.config else 0.5
             
-            total_len = span_lengths.sum().item() + (num_spans - 1) * 10
-            if total_len < self.window_size:
-                available_starts = self.window_size - total_len
-                # Distribute the remaining gap space randomly
-                offsets = torch.rand(num_spans)
-                offsets = (offsets / (offsets.sum() + 1e-6) * available_starts).int()
+            # Determine masking strategy
+            strategy_roll = torch.rand(1).item()
+            
+            if strategy_roll < channel_mask_prob:
+                # --- CHANNEL MASKING (Phase 2 Style) ---
+                num_channels = torch.randint(20, 40, (1,)).item()
+                channels = torch.randperm(C)[:num_channels]
+                x_sbp[:, channels] = 0.0
+                mask[:, channels] = True
+                mask_type = 0 # 0 for Channel
+            else:
+                # --- SPAN MASKING (Phase 1 Style) ---
+                num_spans = torch.randint(2, 4, (1,)).item()
+                # Approx triangular distribution (45 to 85 length for 400 window, 20, 50 for 200)
+                span_lengths = torch.randint(45, 85, (num_spans,)) 
                 
-                curr_t = 0
-                for i in range(num_spans):
-                    curr_t += offsets[i].item()
-                    t0 = curr_t
-                    t1 = t0 + span_lengths[i].item()
+                total_len = span_lengths.sum().item() + (num_spans - 1) * 10
+                if total_len < self.window_size:
+                    available_starts = self.window_size - total_len
+                    # Distribute the remaining gap space randomly
+                    offsets = torch.rand(num_spans)
+                    offsets = (offsets / (offsets.sum() + 1e-6) * available_starts).int()
                     
-                    # Fast channel selection using randperm
-                    num_channels = torch.randint(20, 40, (1,)).item()
-                    channels = torch.randperm(C)[:num_channels]
-                    
-                    x_sbp[t0:t1, channels] = 0.0
-                    mask[t0:t1, channels] = True
-                    
-                    curr_t = t1 + 10 # Enforce minimum gap
+                    curr_t = 0
+                    for i in range(num_spans):
+                        curr_t += offsets[i].item()
+                        t0 = curr_t
+                        t1 = t0 + span_lengths[i].item()
+                        
+                        # Fast channel selection using randperm
+                        num_channels = torch.randint(20, 40, (1,)).item()
+                        channels = torch.randperm(C)[:num_channels]
+                        
+                        x_sbp[t0:t1, channels] = 0.0
+                        mask[t0:t1, channels] = True
+                        
+                        curr_t = t1 + 10 # Enforce minimum gap
+                mask_type = 1 # 1 for Span
 
         else:
             # Deterministic for validation: round-robin through the sets

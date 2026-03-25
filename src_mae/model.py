@@ -84,8 +84,9 @@ class SBP_TCN_Transformer(nn.Module):
     """
     Hybrid TCN + Cross-Channel Transformer for masked SBP reconstruction.
     Operates without kinematics data.
+    Uses True Asymmetric MAE architecture (Encoder for visible only, Decoder for imputation).
     """
-    def __init__(self, sbp_channels=96, d_model=64, nhead=8, num_layers=4, tcn_levels=4, dropout=0.1):
+    def __init__(self, sbp_channels=96, d_model=64, nhead=8, num_encoder_layers=6, num_decoder_layers=2, tcn_levels=4, dropout=0.1):
         super().__init__()
         self.sbp_channels = sbp_channels
         self.d_model = d_model
@@ -114,7 +115,7 @@ class SBP_TCN_Transformer(nn.Module):
         # A bridging norm to stabilize features before hitting the Transformer
         self.pre_transformer_norm = nn.LayerNorm(d_model)
         
-        # --- 4. Cross-Channel Transformer ---
+        # --- 4. Cross-Channel Asymmetric Transformer (Encoder-Decoder) ---
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, 
             nhead=nhead, 
@@ -124,7 +125,18 @@ class SBP_TCN_Transformer(nn.Module):
             activation='gelu',
             norm_first=True  # Pre-Norm stabilizes deep transformers immediately
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+        
+        decoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=d_model * 4, 
+            dropout=dropout,
+            batch_first=True,
+            activation='gelu',
+            norm_first=True
+        )
+        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=num_decoder_layers)
         
         # --- 5. Output Projection ---
         self.output_proj = nn.Linear(d_model, 1)
@@ -141,16 +153,16 @@ class SBP_TCN_Transformer(nn.Module):
         B, W, C = sbp_masked.shape
         
         # ==========================================
-        # PHASE 0: REVERSIBLE INSTANCE NORMALIZATION
+        # PHASE 0: REVERSIBLE INSTANCE NORMALIZATION (PER-CHANNEL)
         # ==========================================
-        # A. Normalize SBP (Only compute stats on VISIBLE values across ALL channels/time)
+        # A. Normalize SBP (Only compute stats on VISIBLE values per channel)
         visible_mask = (~mask.bool()).float()  # 1.0 if visible, 0.0 if masked
-        # num_visible: (B, 1, 1) - total unmasked pixels in the window
-        num_visible = visible_mask.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
+        # num_visible: (B, 1, C) - total unmasked pixels per channel
+        num_visible_c = visible_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
         
-        # Spatial-Temporal Global Mean/Std
-        sbp_mean = (sbp_masked * visible_mask).sum(dim=(1, 2), keepdim=True) / num_visible
-        sbp_var = (((sbp_masked - sbp_mean) * visible_mask) ** 2).sum(dim=(1, 2), keepdim=True) / num_visible
+        # Temporal Mean/Std per channel
+        sbp_mean = (sbp_masked * visible_mask).sum(dim=1, keepdim=True) / num_visible_c
+        sbp_var = (((sbp_masked - sbp_mean) * visible_mask) ** 2).sum(dim=1, keepdim=True) / num_visible_c
         sbp_std = torch.sqrt(sbp_var + 1e-5)
         
         # Normalize SBP, keeping masked values safely at exactly 0
@@ -178,7 +190,7 @@ class SBP_TCN_Transformer(nn.Module):
         x = x + time_emb
         
         # ==========================================
-        # PHASE 3: SPATIAL PREP & TRANSFORMER
+        # PHASE 3: SPATIAL PREP & ASYMMETRIC TRANSFORMER
         # ==========================================
         x = x.permute(0, 3, 1, 2) 
         x = x.reshape(B * W, C, self.d_model)
@@ -186,12 +198,25 @@ class SBP_TCN_Transformer(nn.Module):
         x = x + self.channel_embeddings
         x = self.pre_transformer_norm(x)  # Standardize before Attention
         
-        x = self.transformer_encoder(x)
+        # Padding mask for the Encoder: True where masked
+        # Shape: (B*W, C). PyTorch's src_key_padding_mask prevents attending TO True positions.
+        padding_mask = mask.view(B * W, C).bool()
+        
+        # The Encoder strictly processes visible channels to build a pristine spatial representation.
+        enc_out = self.encoder(x, src_key_padding_mask=padding_mask)
+        
+        # Construct Decoder input: 
+        # For visible tokens, use the deeply encoded pristine representation.
+        # For masked tokens, inject the original TCN spatial embedding back in as a "query" token.
+        decoder_in = torch.where(padding_mask.unsqueeze(-1), x, enc_out)
+        
+        # The Decoder processes the full sequence, allowing masked tokens to query visible tokens.
+        dec_out = self.decoder(decoder_in)
         
         # ==========================================
         # PHASE 4: PROJECTION & REVERSIBLE BLENDING
         # ==========================================
-        pred_norm = self.output_proj(x)
+        pred_norm = self.output_proj(dec_out)
         pred_norm = pred_norm.view(B, W, C)
         
         # Un-normalize the predictions back to the original signal's distribution

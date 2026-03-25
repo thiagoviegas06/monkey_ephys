@@ -24,9 +24,12 @@ class Config:
     # SBP_TCN_Transformer Hyperparameters
     d_model = 64  # Embedding dimension for transformer
     nhead = 8  # Number of attention heads
-    num_layers = 8 # Number of transformer encoder blocks stacked on top of each other
+    num_encoder_layers = 6 # Number of transformer encoder blocks
+    num_decoder_layers = 2 # Number of transformer decoder blocks
     tcn_levels = 8  # Number of TCN dilation layers
     dropout = 0.1  # Dropout rate in transformer for regularization
+    channel_mask_prob = 0.5 # Probability of full channel mask during training
+
     
     # Training
     batch_size = 128
