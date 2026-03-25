@@ -56,16 +56,22 @@ class PreprocessedMaskedDataset(Dataset):
     def __getitem__(self, idx):
         file_path = os.path.join(self.data_dir, self.file_list[idx])
 
-        with open(file_path, 'rb') as f:
-            sample = pickle.load(f)
+        try:
+            with open(file_path, 'rb') as f:
+                sample = pickle.load(f)
+        except Exception as e:
+            raise RuntimeError(f"Error loading {file_path}: {e}")
 
-        # Extract data from pickle
-        x_sbp = torch.from_numpy(sample["x_sbp"]).float()      # (W, C) - masked SBP
-        y_sbp = torch.from_numpy(sample["y_sbp"]).float()      # (W, C) - full SBP
-        kin = torch.from_numpy(sample["kin"]).float()          # (W, 4) - kinematics
-        mask = torch.from_numpy(sample["mask"]).bool()         # (W, C) - True where masked
-        channel_var = torch.from_numpy(sample["channel_var"]).float()  # (C,)
-        session_id = sample["session_id"]
+        # Extract data from pickle (with error checking)
+        try:
+            x_sbp = torch.from_numpy(sample["x_sbp"]).float()      # (W, C) - masked SBP
+            y_sbp = torch.from_numpy(sample["y_sbp"]).float()      # (W, C) - full SBP
+            kin = torch.from_numpy(sample["kin"]).float()          # (W, 4) - kinematics
+            mask = torch.from_numpy(sample["mask"]).bool()         # (W, C) - True where masked
+            channel_var = torch.from_numpy(sample["channel_var"]).float()  # (C,)
+            session_id = sample["session_id"]
+        except KeyError as e:
+            raise KeyError(f"Missing key {e} in {file_path}")
 
         # Create macro_timestamp (approximate from day info if available)
         day = sample.get("day", 0.0)
@@ -84,7 +90,7 @@ class PreprocessedMaskedDataset(Dataset):
 # ============================================================================
 # Dataloader Helper
 # ============================================================================
-def get_dataloaders_from_preprocessed(data_dir, batch_size=32, num_workers=4, train_split=0.9, seed=42):
+def get_dataloaders_from_preprocessed(data_dir, batch_size=32, num_workers=0, train_split=0.9, seed=42):
     """Load preprocessed data from directory."""
     train_dataset = PreprocessedMaskedDataset(data_dir, is_train=True, train_split=train_split, seed=seed)
     val_dataset = PreprocessedMaskedDataset(data_dir, is_train=False, train_split=train_split, seed=seed)
@@ -94,14 +100,14 @@ def get_dataloaders_from_preprocessed(data_dir, batch_size=32, num_workers=4, tr
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=False  # Disable pin_memory when num_workers=0
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=False
     )
 
     return train_loader, val_loader
@@ -232,7 +238,7 @@ def main():
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+        optimizer, mode='min', factor=0.5, patience=3
     )
 
     # Finetuning loop
