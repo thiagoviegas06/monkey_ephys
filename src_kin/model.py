@@ -97,8 +97,8 @@ class PerceiverIOKinematicDecoder(nn.Module):
         visible_mask = (~mask.bool()).float()
         
         if sbp_mean is not None and sbp_std is not None:
-            mean = sbp_mean.to(x.device).view(1, 1, 1)
-            std = sbp_std.to(x.device).view(1, 1, 1)
+            mean = sbp_mean.to(x.device).view(1, 1, -1)
+            std = sbp_std.to(x.device).view(1, 1, -1)
         else:
             num_visible = visible_mask.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
             mean = (x * visible_mask).sum(dim=(1, 2), keepdim=True) / num_visible

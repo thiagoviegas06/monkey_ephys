@@ -36,11 +36,12 @@ def build_model(config):
         d_model=config.d_model,
         nhead=config.nhead,
         num_encoder_layers=config.num_encoder_layers,
+        num_temporal_layers=getattr(config, 'num_temporal_layers', 2),
         num_decoder_layers=config.num_decoder_layers,
         tcn_levels=config.tcn_levels,
         dropout=config.dropout
     )
-    print("Built Hybrid TCN + Cross-Channel Transformer (Asymmetric MAE)")
+    print(f"Built Axial TCN + Transformer (d_model={config.d_model})")
     return model.to(config.device)
 
 
@@ -67,6 +68,7 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None)
         
         mask_float = batch["mask"].to(config.device).float()
         mask = batch["mask"].to(config.device)     # (B, W, C)
+        channel_mean = batch["channel_mean"].to(config.device)
         channel_var = batch["channel_var"].to(config.device)  # (B, C) per-channel variance
         session_ids = batch["session_id"]
         
@@ -74,7 +76,7 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch, scheduler=None)
         optimizer.zero_grad()
         
         # ===== Forward pass =====
-        pred = model(x_sbp, mask_float, macro_timestamp)  # (B, W, C)
+        pred = model(x_sbp, mask_float, macro_timestamp, channel_mean, channel_var)  # (B, W, C)
         
         # ===== Compute loss =====
         loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)
@@ -120,13 +122,14 @@ def validate_one_epoch(model, dataloader, config, epoch):
             
             mask_float = batch["mask"].to(config.device).float()
             mask = batch["mask"].to(config.device)     # (B, W, C)
+            channel_mean = batch["channel_mean"].to(config.device)
             channel_var = batch["channel_var"].to(config.device)
             session_ids = batch["session_id"]
             
             batch_size = x_sbp.size(0)
             
             # ===== Forward pass =====
-            pred = model(x_sbp, mask_float, macro_timestamp)  # (B, W, C)
+            pred = model(x_sbp, mask_float, macro_timestamp, channel_mean, channel_var)  # (B, W, C)
             
             # ===== Compute loss =====
             loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)

@@ -8,7 +8,7 @@ from torch.utils.data.dataset import random_split
 import random
 from tqdm import tqdm
 
-from preprocessing import sessionData, compute_session_channel_variance
+from preprocessing import sessionData, compute_session_stats
 from preprocessing import sample_multi_span_lengths_and_starts, apply_multi_span_mask_to_window
 
 # ============================================================================
@@ -61,7 +61,6 @@ class SBPDataset(Dataset):
                 channels = torch.randperm(C)[:num_channels]
                 x_sbp[:, channels] = 0.0
                 mask[:, channels] = True
-                mask_type = 0 # 0 for Channel
             else:
                 # --- SPAN MASKING (Phase 1 Style) ---
                 num_spans = torch.randint(2, 4, (1,)).item()
@@ -89,7 +88,6 @@ class SBPDataset(Dataset):
                         mask[t0:t1, channels] = True
                         
                         curr_t = t1 + 10 # Enforce minimum gap
-                mask_type = 1 # 1 for Span
 
         else:
             # Deterministic for validation
@@ -115,6 +113,7 @@ class SBPDataset(Dataset):
             "y_sbp": y_sbp.float(),
             "mask": mask.float(),
             "kin": kin_w.float(),
+            "channel_mean": torch.from_numpy(session["channel_mean"]).float(),
             "channel_var": torch.from_numpy(session["channel_var"]).float(),
             "session_id": session["session_id"],
             "macro_timestamp": w0,
@@ -133,7 +132,6 @@ def get_dataloaders(config, batch_size=32, val_split=0.2, shuffle=True, num_work
     sessions, _ = sessionData(f"{config.data_path}/metadata.csv").generate_session_obj()
     
     all_sessions_data = []
-    base_sig = None
     
     for session in tqdm(sessions, desc="Processing sessions"):
         if session.isTest():
@@ -142,12 +140,14 @@ def get_dataloaders(config, batch_size=32, val_split=0.2, shuffle=True, num_work
         sbp, kin, _, _ = session.load_data(config.data_path)
         if sbp is None or sbp.shape[0] < config.window_size:
             continue
-            
+        
+        session_mean, session_var = compute_session_stats(sbp)
         session_dict = {
             "sbp": sbp,
             "kin": kin,
             "N": sbp.shape[0],
-            "channel_var": compute_session_channel_variance(sbp),
+            "channel_mean": session_mean,
+            "channel_var": session_var,
             "session_id": session.session_id,
         }
         all_sessions_data.append(session_dict)

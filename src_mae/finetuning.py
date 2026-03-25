@@ -11,7 +11,7 @@ from losses import kaggle_aligned_nmse_loss
 from config import Config
 from preprocessing import (
     sessionData, 
-    compute_session_channel_variance,
+    compute_session_stats,
     sample_multi_span_lengths_and_starts,
     apply_multi_span_mask_to_window
 )
@@ -84,6 +84,7 @@ class SBPChannelMaskDataset(Dataset):
             "y_sbp": torch.from_numpy(y_np).float(),
             "mask": torch.from_numpy(mask_np).float(),
             "kin": torch.from_numpy(kin_np).float(),
+            "channel_mean": torch.from_numpy(session["channel_mean"]).float(),
             "channel_var": torch.from_numpy(session["channel_var"]).float(),
             "session_id": session["session_id"],
             "macro_timestamp": w0,
@@ -103,11 +104,13 @@ def get_finetune_dataloaders(config, val_split=0.2, shuffle=True, num_workers=8)
         sbp, kin, _, _ = session.load_data(config.data_path)
         if sbp is None or sbp.shape[0] < config.window_size: continue
             
+        session_mean, session_var = compute_session_stats(sbp)
         session_dict = {
             "sbp": sbp,
             "kin": kin,
             "N": sbp.shape[0],
-            "channel_var": compute_session_channel_variance(sbp),
+            "channel_mean": session_mean,
+            "channel_var": session_var,
             "session_id": session.session_id,
         }
         all_sessions_data.append(session_dict)
@@ -145,6 +148,7 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()
         mask_float = batch["mask"].to(config.device).float()
         mask = batch["mask"].to(config.device)
+        channel_mean = batch["channel_mean"].to(config.device)
         channel_var = batch["channel_var"].to(config.device)
         session_ids = batch["session_id"]
         mask_types = batch["mask_type"]
@@ -152,7 +156,7 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         batch_size = x_sbp.size(0)
         optimizer.zero_grad()
         
-        pred = model(x_sbp, mask_float, macro_timestamp)
+        pred = model(x_sbp, mask_float, macro_timestamp, channel_mean, channel_var)
         loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)
         
         loss.backward()
@@ -165,8 +169,6 @@ def train_one_epoch(model, dataloader, optimizer, config, epoch):
         # Track by type (unweighted for logging)
         with torch.no_grad():
             for i, m_type in enumerate(mask_types.tolist()):
-                # Individual sample loss is hard with kaggle_aligned, so we just log the batch average
-                # into the bucket that matches the majority of the batch or just append the batch loss
                 type_losses[m_type].append(loss.item())
 
         pbar.set_postfix({
@@ -193,12 +195,13 @@ def validate_one_epoch(model, dataloader, config, epoch):
             macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()
             mask_float = batch["mask"].to(config.device).float()
             mask = batch["mask"].to(config.device)
+            channel_mean = batch["channel_mean"].to(config.device)
             channel_var = batch["channel_var"].to(config.device)
             session_ids = batch["session_id"]
             mask_types = batch["mask_type"]
             
             batch_size = x_sbp.size(0)
-            pred = model(x_sbp, mask_float, macro_timestamp)
+            pred = model(x_sbp, mask_float, macro_timestamp, channel_mean, channel_var)
             loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)
             
             total_loss += loss.item() * batch_size
@@ -253,6 +256,7 @@ def main():
         d_model=config.d_model,
         nhead=config.nhead,
         num_encoder_layers=config.num_encoder_layers,
+        num_temporal_layers=getattr(config, 'num_temporal_layers', 2),
         num_decoder_layers=config.num_decoder_layers,
         tcn_levels=config.tcn_levels,
         dropout=config.dropout
@@ -298,4 +302,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -25,11 +25,12 @@ def build_model(config):
         d_model=config.d_model,
         nhead=config.nhead,
         num_encoder_layers=config.num_encoder_layers,
+        num_temporal_layers=getattr(config, 'num_temporal_layers', 2),
         num_decoder_layers=config.num_decoder_layers,
         tcn_levels=config.tcn_levels,
         dropout=config.dropout
     )
-    print("Built Hybrid TCN + Cross-Channel Transformer")
+    print(f"Built Axial TCN + Transformer (d_model={config.d_model})")
     return model.to(config.device)
 
 
@@ -148,6 +149,27 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device,
         mask_np = info["mask"]
         N, C = masked_sbp_np.shape
         
+        # Calculate session-level stats for the model (ignoring masked regions as best as possible)
+        # Note: In test sessions, ~30% channels are fully zeroed out.
+        visible_channels = ~(masked_sbp_np == 0).all(axis=0)
+        if visible_channels.any():
+            sess_mean = np.mean(masked_sbp_np[:, visible_channels], axis=0).mean() # global mean of visible
+            sess_var = np.var(masked_sbp_np[:, visible_channels], axis=0).mean()   # global var of visible
+            
+            # Create (C,) arrays with global defaults
+            session_mean_np = np.full(C, sess_mean, dtype=np.float32)
+            session_var_np = np.full(C, sess_var, dtype=np.float32)
+            
+            # Fill in actual stats for visible channels
+            session_mean_np[visible_channels] = np.mean(masked_sbp_np[:, visible_channels], axis=0)
+            session_var_np[visible_channels] = np.var(masked_sbp_np[:, visible_channels], axis=0)
+        else:
+            session_mean_np = np.zeros(C, dtype=np.float32)
+            session_var_np = np.ones(C, dtype=np.float32)
+            
+        session_mean = torch.from_numpy(session_mean_np).to(device).unsqueeze(0)
+        session_var = torch.from_numpy(session_var_np).to(device).unsqueeze(0)
+
         # Buffers for weighted averaging across the full session
         pred_acc = torch.zeros((N, C), device=device)
         weight_acc = torch.zeros((N, C), device=device)
@@ -165,7 +187,7 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device,
             macro_ts = torch.tensor([[float(w0)]], device=device, dtype=torch.float32)
 
             # Model prediction (un-normalized internally by SBP_TCN_Transformer)
-            pred_window = model(x_window, m_window, macro_ts) # (1, W, C)
+            pred_window = model(x_window, m_window, macro_ts, session_mean, session_var) # (1, W, C)
             
             # Accumulate weighted predictions
             pred_acc[w0:w1] += pred_window.squeeze(0) * weight_window.squeeze(0)
@@ -178,7 +200,7 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device,
             m_window = full_mask[w0:w1].unsqueeze(0)
             macro_ts = torch.tensor([[float(w0)]], device=device)
             
-            pred_window = model(x_window, m_window, macro_ts)
+            pred_window = model(x_window, m_window, macro_ts, session_mean, session_var)
             pred_acc[w0:w1] += pred_window.squeeze(0) * weight_window.squeeze(0)
             weight_acc[w0:w1] += weight_window.squeeze(0)
 

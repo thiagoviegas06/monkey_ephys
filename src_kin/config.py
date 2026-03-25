@@ -15,11 +15,12 @@ class Config:
     # SBP_TCN_Transformer Hyperparameters (must match the saved checkpoint)
     window_size = 200
     sbp_channels = 96
-    d_model = 64  
+    d_model = 128  
     nhead = 8  
-    num_encoder_layers = 6 
+    num_encoder_layers = 4 
+    num_temporal_layers = 2
     num_decoder_layers = 2
-    tcn_levels = 8  
+    tcn_levels = 6  
     dropout = 0.1  
     
     # Seed

@@ -21,12 +21,16 @@ def build_mae_model(config):
         d_model=config.d_model,
         nhead=config.nhead,
         num_encoder_layers=config.num_encoder_layers,
+        num_temporal_layers=getattr(config, 'num_temporal_layers', 2),
         num_decoder_layers=config.num_decoder_layers,
         tcn_levels=config.tcn_levels,
         dropout=config.dropout
     )
     checkpoint = torch.load(config.mae_checkpoint_path, map_location=config.device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
     model.to(config.device)
     model.eval()
     for param in model.parameters():
@@ -38,7 +42,7 @@ def build_kinematic_model(config):
     model = PerceiverIOKinematicDecoder(config)
     return model.to(config.device)
 
-def train_one_epoch(mae_model, kinematic_model, dataloader, optimizer, config, epoch, step, kin_mean=None, kin_std=None, sbp_mean=None, sbp_std=None):
+def train_one_epoch(mae_model, kinematic_model, dataloader, optimizer, config, epoch, step, kin_mean=None, kin_std=None, sbp_mean_global=None, sbp_std_global=None):
     kinematic_model.train()
     
     total_loss = 0.0
@@ -54,6 +58,9 @@ def train_one_epoch(mae_model, kinematic_model, dataloader, optimizer, config, e
     if kin_mean is not None:
         kin_mean = kin_mean.to(config.device)
         kin_std = kin_std.to(config.device)
+    if sbp_mean_global is not None:
+        sbp_mean_global = sbp_mean_global.to(config.device)
+        sbp_std_global = sbp_std_global.to(config.device)
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{config.num_epochs}")
     for batch in pbar:
@@ -72,13 +79,18 @@ def train_one_epoch(mae_model, kinematic_model, dataloader, optimizer, config, e
         
         # Phase 1: Impute missing channels
         with torch.no_grad():
-            # MAE expects macro_timestamp as (B, 1)
-            sbp_imputed = mae_model(sbp_masked, mask, macro_timestamp.unsqueeze(-1))
+            # MAE expects macro_timestamp as (B, 1) and optional session stats
+            # For simplicity in Kin decoder, we pass global stats if provided, or None
+            # The MAE model will use window-local stats if channel_mean is None.
+            # But better to provide the sbp_mean_global to handle fully masked channels.
+            sbp_imputed = mae_model(sbp_masked, mask, macro_timestamp.unsqueeze(-1), 
+                                   channel_mean=sbp_mean_global.expand(batch_size, -1) if sbp_mean_global is not None else None,
+                                   channel_var=(sbp_std_global**2).expand(batch_size, -1) if sbp_std_global is not None else None)
             # The imputed signal shouldn't have gradients flowing back to MAE
             sbp_imputed = sbp_imputed.detach()
             
         # Phase 2: Perceiver IO Decoder
-        kin_pred, _, _, _ = kinematic_model(sbp_imputed, mask=mask, session_num=session_num, macro_timestamp=macro_timestamp, sbp_mean=sbp_mean, sbp_std=sbp_std)
+        kin_pred, _, _, _ = kinematic_model(sbp_imputed, mask=mask, session_num=session_num, macro_timestamp=macro_timestamp, sbp_mean=sbp_mean_global, sbp_std=sbp_std_global)
         
         # Loss
         loss_dict = kinematic_perceiver_loss(
@@ -119,7 +131,7 @@ def train_one_epoch(mae_model, kinematic_model, dataloader, optimizer, config, e
     final_r2 = calculate_global_r2(total_ss_res, total_sum_y, total_sum_y_sq, total_count)
     return total_loss / total_samples, total_recon / total_samples, final_r2, step
 
-def validate_one_epoch(mae_model, kinematic_model, dataloader, config, epoch, step, kin_mean=None, kin_std=None, sbp_mean=None, sbp_std=None):
+def validate_one_epoch(mae_model, kinematic_model, dataloader, config, epoch, step, kin_mean=None, kin_std=None, sbp_mean_global=None, sbp_std_global=None):
     kinematic_model.eval()
     
     total_loss = 0.0
@@ -135,6 +147,9 @@ def validate_one_epoch(mae_model, kinematic_model, dataloader, config, epoch, st
     if kin_mean is not None:
         kin_mean = kin_mean.to(config.device)
         kin_std = kin_std.to(config.device)
+    if sbp_mean_global is not None:
+        sbp_mean_global = sbp_mean_global.to(config.device)
+        sbp_std_global = sbp_std_global.to(config.device)
     
     pbar = tqdm(dataloader, desc=f"Val Epoch {epoch}/{config.num_epochs}")
     with torch.no_grad():
@@ -151,8 +166,11 @@ def validate_one_epoch(mae_model, kinematic_model, dataloader, config, epoch, st
             
             batch_size = sbp_masked.size(0)
             
-            sbp_imputed = mae_model(sbp_masked, mask, macro_timestamp.unsqueeze(-1))
-            kin_pred, _, _, _ = kinematic_model(sbp_imputed, mask=mask, session_num=session_num, macro_timestamp=macro_timestamp, sbp_mean=sbp_mean, sbp_std=sbp_std)
+            sbp_imputed = mae_model(sbp_masked, mask, macro_timestamp.unsqueeze(-1),
+                                   channel_mean=sbp_mean_global.expand(batch_size, -1) if sbp_mean_global is not None else None,
+                                   channel_var=(sbp_std_global**2).expand(batch_size, -1) if sbp_std_global is not None else None)
+            
+            kin_pred, _, _, _ = kinematic_model(sbp_imputed, mask=mask, session_num=session_num, macro_timestamp=macro_timestamp, sbp_mean=sbp_mean_global, sbp_std=sbp_std_global)
             
             loss_dict = kinematic_perceiver_loss(
                 kin_pred, kin_target, config
