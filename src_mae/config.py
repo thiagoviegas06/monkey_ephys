@@ -22,19 +22,18 @@ class Config:
     sbp_channels = 96
     
     # SBP_TCN_Transformer Hyperparameters
-    d_model = 128  # Embedding dimension for transformer
+    d_model = 192  # Embedding dimension for transformer
     nhead = 8  # Number of attention heads
-    num_encoder_layers = 5 # Number of spatial transformer encoder blocks
-    num_temporal_layers = 2 # Number of temporal transformer blocks
+    num_axial_layers = 4 # Number of interleaved temporal-spatial blocks
     num_decoder_layers = 2 # Number of transformer decoder blocks
-    tcn_levels = 5  # Number of TCN dilation layers (2^5 = 32 dilation, RF ~125)
-    dropout = 0.1  # Dropout rate in transformer for regularization
+    tcn_levels = 4  # Number of TCN dilation layers
+    dropout = 0.15  # Dropout rate for regularization
     channel_mask_prob = 0.5 # Probability of full channel mask during training
 
     
     # Training
     batch_size = 128
-    learning_rate = 7e-4
+    learning_rate = 3e-4
     weight_decay = 1e-4
     num_epochs = 80
     early_stopping_patience = 8  # Stop if val loss doesn't improve for this many epochs

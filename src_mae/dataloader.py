@@ -90,23 +90,34 @@ class SBPDataset(Dataset):
                         curr_t = t1 + 10 # Enforce minimum gap
 
         else:
-            # Deterministic for validation
+            # Deterministic for validation to ensure stable evaluation metrics
             y_sbp = torch.from_numpy(session["sbp"][w0:w0 + self.window_size])
             kin_w = torch.from_numpy(session["kin"][w0:w0 + self.window_size])
             C = y_sbp.shape[1]
             
-            # Use deterministic RNG based on idx to make masking consistent but varied across samples
+            # Use deterministic RNG based on idx to make masking consistent across epochs
             rng = np.random.default_rng(idx + 42) 
-            
             y_np = y_sbp.numpy().copy()
+            x_np = y_np.copy()
+            mask_np = np.zeros_like(y_np, dtype=bool)
             
-            # Match training-like span masking for validation
-            num_spans = 2
-            spans = sample_multi_span_lengths_and_starts(rng, self.window_size, num_spans=num_spans, min_gap=10)
-            x_np, m_np = apply_multi_span_mask_to_window(y_np, spans, num_spans=num_spans, rng=rng)
+            channel_mask_prob = getattr(self.config, 'channel_mask_prob', 0.5) if self.config else 0.5
+            
+            # Use the same multi-strategy masking as training
+            if rng.random() < channel_mask_prob:
+                # --- CHANNEL MASKING ---
+                num_channels = rng.integers(20, 40)
+                channels = rng.choice(C, size=num_channels, replace=False)
+                x_np[:, channels] = 0.0
+                mask_np[:, channels] = True
+            else:
+                # --- SPAN MASKING ---
+                num_spans = rng.integers(2, 4)
+                spans = sample_multi_span_lengths_and_starts(rng, self.window_size, num_spans=num_spans, min_gap=10)
+                x_np, mask_np = apply_multi_span_mask_to_window(y_np, spans, num_spans=num_spans, rng=rng)
             
             x_sbp = torch.from_numpy(x_np)
-            mask = torch.from_numpy(m_np)
+            mask = torch.from_numpy(mask_np)
 
         return {
             "x_sbp": x_sbp.float(),
