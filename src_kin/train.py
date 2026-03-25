@@ -9,8 +9,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src_kin.config import Config
 from src_kin.dataloader import get_dataloaders
-from src_kin.model import LFADSKinematicDecoder
-from src_kin.losses import lfads_loss, get_r2_components, calculate_global_r2
+from src_kin.model import PerceiverIOKinematicDecoder
+from src_kin.losses import kinematic_perceiver_loss, get_r2_components, calculate_global_r2
 from src_mae.model import SBP_TCN_Transformer
 from src_kin.compute_kin_stats import compute_kin_stats, compute_sbp_stats
 
@@ -33,19 +33,12 @@ def build_mae_model(config):
     print(f"Loaded Phase 1 MAE model from {config.mae_checkpoint_path}")
     return model
 
-def build_lfads_model(config):
-    model = LFADSKinematicDecoder(
-        input_dim=config.sbp_channels,
-        hidden_dim=config.hidden_dim,
-        gen_dim=config.gen_dim,
-        factor_dim=config.factor_dim,
-        output_dim=config.output_dim,
-        dropout=config.lfads_dropout
-    )
+def build_kinematic_model(config):
+    model = PerceiverIOKinematicDecoder(config)
     return model.to(config.device)
 
-def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch, step, kin_mean=None, kin_std=None, sbp_mean=None, sbp_std=None):
-    lfads_model.train()
+def train_one_epoch(mae_model, kinematic_model, dataloader, optimizer, config, epoch, step, kin_mean=None, kin_std=None, sbp_mean=None, sbp_std=None):
+    kinematic_model.train()
     
     total_loss = 0.0
     total_recon = 0.0
@@ -65,7 +58,8 @@ def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch
     for batch in pbar:
         sbp_masked = batch["sbp_masked"].to(config.device) # (B, W, C)
         mask = batch["mask"].to(config.device) # (B, W, C)
-        macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float() # (B, 1)
+        macro_timestamp = batch["macro_timestamp"].to(config.device).float() # (B,)
+        session_num = batch["session_num"].to(config.device).float() # (B, 1)
         kin_target = batch["kin"].to(config.device) # (B, W, 4)
         
         # Normalize targets (Global Z-Score)
@@ -77,21 +71,22 @@ def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch
         
         # Phase 1: Impute missing channels
         with torch.no_grad():
-            sbp_imputed = mae_model(sbp_masked, mask, macro_timestamp)
+            # MAE expects macro_timestamp as (B, 1)
+            sbp_imputed = mae_model(sbp_masked, mask, macro_timestamp.unsqueeze(-1))
             # The imputed signal shouldn't have gradients flowing back to MAE
             sbp_imputed = sbp_imputed.detach()
             
-        # Phase 2: LFADS Decoder
-        kin_pred, sbp_pred, mu, logvar = lfads_model(sbp_imputed, mask=mask, sbp_mean=sbp_mean, sbp_std=sbp_std)
+        # Phase 2: Perceiver IO Decoder
+        kin_pred, _, _, _ = kinematic_model(sbp_imputed, mask=mask, session_num=session_num, macro_timestamp=macro_timestamp, sbp_mean=sbp_mean, sbp_std=sbp_std)
         
         # Loss
-        loss_dict = lfads_loss(
-            kin_pred, kin_target, mu, logvar, step, config, sbp_pred, sbp_imputed
+        loss_dict = kinematic_perceiver_loss(
+            kin_pred, kin_target, config
         )
         loss = loss_dict["loss"]
         
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(lfads_model.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(kinematic_model.parameters(), max_norm=5.0)
         optimizer.step()
         
         # Metrics (not for backprop)
@@ -117,15 +112,14 @@ def train_one_epoch(mae_model, lfads_model, dataloader, optimizer, config, epoch
             'mse': f"{loss_dict['recon_mse'].item():.4f}",
             'corr': f"{loss_dict['corr_loss'].item():.4f}",
             'accel': f"{loss_dict['accel_loss'].item():.4f}",
-            'R2': f"{running_r2_score:.4f}",
-            'beta': f"{loss_dict['beta']:.4f}"
+            'R2': f"{running_r2_score:.4f}"
         })
         
     final_r2 = calculate_global_r2(total_ss_res, total_sum_y, total_sum_y_sq, total_count)
     return total_loss / total_samples, total_recon / total_samples, final_r2, step
 
-def validate_one_epoch(mae_model, lfads_model, dataloader, config, epoch, step, kin_mean=None, kin_std=None, sbp_mean=None, sbp_std=None):
-    lfads_model.eval()
+def validate_one_epoch(mae_model, kinematic_model, dataloader, config, epoch, step, kin_mean=None, kin_std=None, sbp_mean=None, sbp_std=None):
+    kinematic_model.eval()
     
     total_loss = 0.0
     total_recon = 0.0
@@ -146,7 +140,8 @@ def validate_one_epoch(mae_model, lfads_model, dataloader, config, epoch, step, 
         for batch in pbar:
             sbp_masked = batch["sbp_masked"].to(config.device)
             mask = batch["mask"].to(config.device)
-            macro_timestamp = batch["macro_timestamp"].unsqueeze(-1).to(config.device).float()
+            macro_timestamp = batch["macro_timestamp"].to(config.device).float()
+            session_num = batch["session_num"].to(config.device).float()
             kin_target = batch["kin"].to(config.device)
             
             # Normalize targets
@@ -155,11 +150,11 @@ def validate_one_epoch(mae_model, lfads_model, dataloader, config, epoch, step, 
             
             batch_size = sbp_masked.size(0)
             
-            sbp_imputed = mae_model(sbp_masked, mask, macro_timestamp)
-            kin_pred, sbp_pred, mu, logvar = lfads_model(sbp_imputed, mask=mask, sbp_mean=sbp_mean, sbp_std=sbp_std)
+            sbp_imputed = mae_model(sbp_masked, mask, macro_timestamp.unsqueeze(-1))
+            kin_pred, _, _, _ = kinematic_model(sbp_imputed, mask=mask, session_num=session_num, macro_timestamp=macro_timestamp, sbp_mean=sbp_mean, sbp_std=sbp_std)
             
-            loss_dict = lfads_loss(
-                kin_pred, kin_target, mu, logvar, step, config, sbp_pred, sbp_imputed
+            loss_dict = kinematic_perceiver_loss(
+                kin_pred, kin_target, config
             )
             loss = loss_dict["loss"]
             
@@ -193,9 +188,9 @@ def main():
     
     print("Building models...")
     mae_model = build_mae_model(config)
-    lfads_model = build_lfads_model(config)
+    kinematic_model = build_kinematic_model(config)
     
-    optimizer = torch.optim.AdamW(lfads_model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    optimizer = torch.optim.AdamW(kinematic_model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     
     print("Loading data...")
     train_loader, val_loader, _, _ = get_dataloaders(config, num_workers=4)
@@ -213,20 +208,20 @@ def main():
     step = 0
     
     for epoch in range(1, config.num_epochs + 1):
-        train_loss, train_recon, train_r2, step = train_one_epoch(mae_model, lfads_model, train_loader, optimizer, config, epoch, step, kin_mean, kin_std, sbp_mean, sbp_std)
+        train_loss, train_recon, train_r2, step = train_one_epoch(mae_model, kinematic_model, train_loader, optimizer, config, epoch, step, kin_mean, kin_std, sbp_mean, sbp_std)
         print(f"Epoch {epoch} Train: Loss={train_loss:.4f} Recon(MSE)={train_recon:.4f} R2={train_r2:.4f}")
         
-        val_loss, val_recon, val_r2 = validate_one_epoch(mae_model, lfads_model, val_loader, config, epoch, step, kin_mean, kin_std, sbp_mean, sbp_std)
+        val_loss, val_recon, val_r2 = validate_one_epoch(mae_model, kinematic_model, val_loader, config, epoch, step, kin_mean, kin_std, sbp_mean, sbp_std)
         print(f"Epoch {epoch} Val:   Loss={val_loss:.4f} Recon(MSE)={val_recon:.4f} R2={val_r2:.4f}")
         
         # Save best model based on Recon (MSE) as it's more stable and correlated with R2
         if val_recon < best_val_recon - config.early_stopping_min_delta:
             best_val_recon = val_recon
             epochs_without_improvement = 0
-            best_path = os.path.join(config.checkpoint_dir, "best_model_lfads.pt")
+            best_path = os.path.join(config.checkpoint_dir, "best_model_perceiver.pt")
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': lfads_model.state_dict(),
+                'model_state_dict': kinematic_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
                 'val_recon': val_recon,

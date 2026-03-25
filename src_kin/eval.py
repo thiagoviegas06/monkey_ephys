@@ -8,7 +8,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src_kin.config import Config
-from src_kin.model import LFADSKinematicDecoder
+from src_kin.model import PerceiverIOKinematicDecoder
 from src_mae.model import SBP_TCN_Transformer
 from src_kin.preprocessing import SessionDataPhase2
 from src_kin.compute_kin_stats import compute_kin_stats
@@ -26,25 +26,25 @@ def build_models(config):
     mae.load_state_dict(torch.load(config.mae_checkpoint_path, map_location=config.device)['model_state_dict'])
     mae.eval()
 
-    # LFADS
-    lfads = LFADSKinematicDecoder(
-        input_dim=config.sbp_channels,
-        hidden_dim=config.hidden_dim,
-        gen_dim=config.gen_dim,
-        factor_dim=config.factor_dim,
-        output_dim=config.output_dim,
-        dropout=config.lfads_dropout
-    ).to(config.device)
-    best_lfads_path = os.path.join(config.checkpoint_dir, "best_model_lfads.pt")
-    checkpoint = torch.load(best_lfads_path, map_location=config.device)
-    lfads.load_state_dict(checkpoint['model_state_dict'])
-    lfads.eval()
+    # Perceiver IO Kinematic Decoder
+    kinematic_model = PerceiverIOKinematicDecoder(config).to(config.device)
+    best_model_path = os.path.join(config.checkpoint_dir, "best_model_perceiver.pt")
+    
+    # Need to handle case if checkpoint doesn't exist yet gracefully
+    if os.path.exists(best_model_path):
+        checkpoint = torch.load(best_model_path, map_location=config.device)
+        kinematic_model.load_state_dict(checkpoint['model_state_dict'])
+        # Get kinematics and SBP stats from checkpoint or recompute
+        kin_mean = checkpoint.get('kin_mean', None)
+        kin_std = checkpoint.get('kin_std', None)
+        sbp_mean = checkpoint.get('sbp_mean', None)
+        sbp_std = checkpoint.get('sbp_std', None)
+    else:
+        print(f"Warning: {best_model_path} not found. Using untrained model.")
+        kin_mean, kin_std, sbp_mean, sbp_std = None, None, None, None
 
-    # Get kinematics and SBP stats from checkpoint or recompute
-    kin_mean = checkpoint.get('kin_mean', None)
-    kin_std = checkpoint.get('kin_std', None)
-    sbp_mean = checkpoint.get('sbp_mean', None)
-    sbp_std = checkpoint.get('sbp_std', None)
+    kinematic_model.eval()
+
     
     if kin_mean is None or kin_std is None:
         print("Kinematics stats not found in checkpoint. Recomputing...")
@@ -61,7 +61,7 @@ def build_models(config):
     sbp_mean = sbp_mean.to(config.device)
     sbp_std = sbp_std.to(config.device)
 
-    return mae, lfads, kin_mean, kin_std, sbp_mean, sbp_std
+    return mae, kinematic_model, kin_mean, kin_std, sbp_mean, sbp_std
 
 def smooth_predictions(preds, kernel_size=5):
 
@@ -83,10 +83,15 @@ def smooth_predictions(preds, kernel_size=5):
     return smoothed
 
 @torch.no_grad()
-def predict_session(mae, lfads, sbp, config, kin_mean, kin_std, sbp_mean, sbp_std):
+def predict_session(mae, kinematic_model, sbp, config, kin_mean, kin_std, sbp_mean, sbp_std, session_id):
     N = sbp.shape[0]
     W = config.window_size
     preds = np.zeros((N, config.output_dim), dtype=np.float32)
+    
+    try:
+        num_id = float(''.join(filter(str.isdigit, session_id)))
+    except ValueError:
+        num_id = 0.0
     
     # Process in windows
     for w0 in range(0, N, W):
@@ -100,13 +105,23 @@ def predict_session(mae, lfads, sbp, config, kin_mean, kin_std, sbp_mean, sbp_st
             
         sbp_w = sbp_w.to(config.device)
         mask = (sbp_w == 0.0).float().to(config.device)
+        
+        # Format timestamps and session
         macro_timestamp = torch.tensor([[w0]], dtype=torch.float32, device=config.device)
+        session_num = torch.tensor([[num_id]], dtype=torch.float32, device=config.device)
         
         # Impute missing neural activity
         sbp_imputed = mae(sbp_w, mask, macro_timestamp)
         
         # Decode kinematics
-        kin_pred, _, _, _ = lfads(sbp_imputed, mask=mask, sbp_mean=sbp_mean, sbp_std=sbp_std)
+        kin_pred, _, _, _ = kinematic_model(
+            sbp_imputed, 
+            mask=mask, 
+            session_num=session_num, 
+            macro_timestamp=macro_timestamp.squeeze(-1), 
+            sbp_mean=sbp_mean, 
+            sbp_std=sbp_std
+        )
         
         # Un-normalize kinematics (Global Z-Score)
         kin_pred = kin_pred * kin_std + kin_mean
@@ -122,7 +137,7 @@ def predict_session(mae, lfads, sbp, config, kin_mean, kin_std, sbp_mean, sbp_st
 def run_eval():
     config = Config()
     print("Building models...")
-    mae, lfads, kin_mean, kin_std, sbp_mean, sbp_std = build_models(config)
+    mae, kinematic_model, kin_mean, kin_std, sbp_mean, sbp_std = build_models(config)
     
     print("Loading test data...")
     session_manager = SessionDataPhase2(config.data_path, is_train=False)
@@ -132,7 +147,7 @@ def run_eval():
     for session in tqdm(sessions, desc="Predicting Test Sessions"):
         sbp, _ = session.load_data()
         if sbp is None: continue
-        preds = predict_session(mae, lfads, sbp, config, kin_mean, kin_std, sbp_mean, sbp_std)
+        preds = predict_session(mae, kinematic_model, sbp, config, kin_mean, kin_std, sbp_mean, sbp_std, session.session_id)
         
         # Apply smoothing
         preds = smooth_predictions(preds, kernel_size=config.smoothing_kernel_size)

@@ -24,13 +24,16 @@ class Config:
     # Seed
     seed = 42
     
-    # LFADS Model Hyperparameters
-    hidden_dim = 64
-    gen_dim = 64
-    factor_dim = 40
-    output_dim = 4 # Outputs 4 kinematics channels (though only 2 are evaluated)
-    lfads_dropout = 0.3 # Dropout for LFADS Decoder
-
+    # Perceiver IO Model Hyperparameters
+    perceiver_latent_dim = 128
+    perceiver_num_latents = 64
+    perceiver_d_model = 128
+    perceiver_cross_heads = 4
+    perceiver_latent_heads = 8
+    perceiver_latent_layers = 6
+    output_dim = 4 # Outputs 4 kinematics channels
+    perceiver_dropout = 0.1
+    max_session_num = 300 # Used for normalizing the continuous session feature
     
     # Training
     batch_size = 128
@@ -40,13 +43,10 @@ class Config:
     early_stopping_patience = 7  
     early_stopping_min_delta = 1e-5  
     
-    # LFADS Loss Hyperparameters
-    beta_anneal_steps = 2000 # Number of batches to linearly anneal beta
-    max_beta = 0.01 # Maximum weight for the KL divergence penalty
+    # Loss Hyperparameters
     kin_recon_weight = 50.0 # Weight for the kinematic reconstruction loss
     correlation_weight = 10.0 # Weight for the Pearson correlation loss
     acceleration_weight = 1.0 # Weight for the acceleration penalty (smoothing)
-    sbp_recon_weight = 0.0 # Weight for the multi-task SBP reconstruction (disabled as requested)
     
     # Smoothing
     smoothing_kernel_size = 5 # Kernel size for moving average smoothing

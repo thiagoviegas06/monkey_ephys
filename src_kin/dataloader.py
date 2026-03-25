@@ -39,10 +39,17 @@ class KinematicsDataset(Dataset):
         # Since Phase 2 0s out channels completely for the session:
         mask = (sbp_w == 0.0)
         
+        # Extract numerical session ID for Perceiver IO
+        try:
+            num_id = float(''.join(filter(str.isdigit, session["session_id"])))
+        except ValueError:
+            num_id = 0.0
+            
         item = {
             "sbp_masked": sbp_w.float(),
             "mask": mask.float(),
             "session_id": session["session_id"],
+            "session_num": torch.tensor([num_id], dtype=torch.float32),
             "macro_timestamp": torch.tensor(w0, dtype=torch.float32) # required by MAE
         }
         

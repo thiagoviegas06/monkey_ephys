@@ -41,16 +41,14 @@ def acceleration_penalty(y_pred):
     accel = y_pred[:, 2:, :] - 2 * y_pred[:, 1:-1, :] + y_pred[:, :-2, :]
     return torch.mean(accel**2)
 
-def lfads_loss(kin_pred, kin_target, mu, logvar, step, config, sbp_pred=None, sbp_target=None):
+def kinematic_perceiver_loss(kin_pred, kin_target, config):
     """
-    Computes the enhanced loss for the LFADS Kinematic Decoder.
+    Computes the enhanced loss for the Perceiver IO Kinematic Decoder.
     Loss = kin_recon_weight * MSE(Kinematics) 
            + correlation_weight * Pearson_Loss
            + acceleration_weight * Acceleration_Penalty
-           + beta * KL_Divergence
     """
     # 1. Kinematic Reconstruction (MSE)
-    # Scaled up to focus gradients on trajectory
     recon_loss = F.mse_loss(kin_pred, kin_target)
     
     # 2. Pearson Correlation Loss
@@ -59,32 +57,16 @@ def lfads_loss(kin_pred, kin_target, mu, logvar, step, config, sbp_pred=None, sb
     # 3. Acceleration Penalty (In-network smoothing)
     accel_loss = acceleration_penalty(kin_pred)
     
-    # 4. KL Divergence (Latent Regularization)
-    kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    
-    # 5. Beta Annealing
-    beta = min(config.max_beta, config.max_beta * (step / max(1, config.beta_anneal_steps)))
-    
     # Total weighted loss
     loss = (config.kin_recon_weight * recon_loss) + \
            (config.correlation_weight * corr_loss) + \
-           (config.acceleration_weight * accel_loss) + \
-           (beta * kl_loss)
-    
-    # 6. Optional Multi-Task SBP Regularization (usually set to 0.0)
-    sbp_loss = torch.tensor(0.0, device=kin_pred.device)
-    if sbp_pred is not None and sbp_target is not None and config.sbp_recon_weight > 0:
-        sbp_loss = F.mse_loss(sbp_pred, sbp_target)
-        loss = loss + config.sbp_recon_weight * sbp_loss
-        
+           (config.acceleration_weight * accel_loss)
+           
     return {
         "loss": loss,
         "recon_mse": recon_loss,
         "corr_loss": corr_loss,
-        "accel_loss": accel_loss,
-        "kl_loss": kl_loss,
-        "sbp_loss": sbp_loss,
-        "beta": beta
+        "accel_loss": accel_loss
     }
 
 def get_r2_components(y_pred, y_true):
