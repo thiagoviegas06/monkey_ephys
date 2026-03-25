@@ -2,6 +2,77 @@ import torch
 import torch.nn as nn
 
 
+class KinematicDecoderTransformer(nn.Module):
+    """
+    Clean kinematics decoder that uses MAE transformer encoder representation.
+
+    Takes the transformer encoder output from MAE (before output projection)
+    and learns kinematics from it.
+
+    Input: (B*W, C, d_model) transformer encoder output
+    - B = batch size
+    - W = window size (200)
+    - C = channels (96)
+    - d_model = embedding dimension (64)
+
+    Output: (B, W, 4) predicted kinematics
+
+    Architecture:
+    1. Channel aggregation: (B*W, C, d_model) → (B*W, d_model)
+    2. Reshape to temporal: (B, W, d_model)
+    3. Temporal LSTM: (B, W, d_model) → (B, W, hidden_dim*2)
+    4. Output projection: (B, W, hidden_dim*2) → (B, W, 4)
+    """
+    def __init__(self, d_model=64, window_size=200, hidden_dim=128,
+                 num_lstm_layers=2, output_dim=4, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.window_size = window_size
+        self.hidden_dim = hidden_dim
+
+        # Channel aggregation: mean pool across channel dimension
+        self.channel_pool = nn.AdaptiveAvgPool1d(1)
+
+        # Temporal modeling with bidirectional LSTM
+        self.lstm = nn.LSTM(
+            input_size=d_model,
+            hidden_size=hidden_dim,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_lstm_layers > 1 else 0.0
+        )
+
+        # Final output projection
+        self.fc_out = nn.Linear(hidden_dim * 2, output_dim)
+
+    def forward(self, transformer_repr):
+        """
+        Args:
+            transformer_repr: (B*W, C, d_model) from MAE transformer encoder
+
+        Returns:
+            kin_pred: (B, W, 4) predicted kinematics
+        """
+        B_W, C, d_model = transformer_repr.shape
+        B = B_W // self.window_size
+
+        # Channel aggregation: (B*W, C, d_model) → (B*W, d_model)
+        x = transformer_repr.transpose(1, 2)  # (B*W, d_model, C)
+        x = self.channel_pool(x).squeeze(-1)  # (B*W, d_model)
+
+        # Reshape for temporal processing: (B*W, d_model) → (B, W, d_model)
+        x = x.reshape(B, self.window_size, d_model)
+
+        # Temporal LSTM processing
+        lstm_out, _ = self.lstm(x)  # (B, W, hidden_dim*2)
+
+        # Project to kinematics
+        kin_pred = self.fc_out(lstm_out)  # (B, W, 4)
+
+        return kin_pred
+
+
 class LSTMKinematicDecoder(nn.Module):
     """
     LSTM-based kinematics decoder using MAE encoder features.

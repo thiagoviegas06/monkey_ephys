@@ -237,5 +237,68 @@ class SBP_TCN_Transformer(nn.Module):
         pred_unnorm = (pred_norm * sbp_std) + sbp_mean
         
         final_output = torch.where(mask.bool(), pred_unnorm, sbp_masked)
-        
+
         return final_output
+
+    def extract_encoder_repr(self, sbp_masked, mask, macro_time):
+        """
+        Extract transformer encoder representation for downstream tasks (e.g., kinematics prediction).
+
+        Returns the representation right after transformer encoder, before output projection.
+        This is a rich, learned representation of the input that should be task-agnostic.
+
+        Args:
+            sbp_masked: (B, W, C) masked SBP input
+            mask: (B, W, C) mask indicating masked positions
+            macro_time: (B, 1) time information
+
+        Returns:
+            encoder_repr: (B*W, C, d_model) transformer encoder output
+            sbp_mean: (B, 1, 1) for potential denormalization
+            sbp_std: (B, 1, 1) for potential denormalization
+        """
+        B, W, C = sbp_masked.shape
+
+        # ==========================================
+        # PHASE 0: NORMALIZATION (same as forward)
+        # ==========================================
+        visible_mask = (~mask.bool()).float()
+        num_visible = visible_mask.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
+
+        sbp_mean = (sbp_masked * visible_mask).sum(dim=(1, 2), keepdim=True) / num_visible
+        sbp_var = (((sbp_masked - sbp_mean) * visible_mask) ** 2).sum(dim=(1, 2), keepdim=True) / num_visible
+        sbp_std = torch.sqrt(sbp_var + 1e-5)
+
+        sbp_norm = ((sbp_masked - sbp_mean) / sbp_std) * visible_mask
+        macro_time_norm = self.macro_bn(macro_time)
+
+        # ==========================================
+        # PHASE 1: TCN
+        # ==========================================
+        sbp_exp = sbp_norm.transpose(1, 2).unsqueeze(-1)
+        mask_exp = mask.transpose(1, 2).unsqueeze(-1)
+
+        x_tcn = torch.cat([sbp_exp, mask_exp], dim=-1)
+        x_tcn = x_tcn.reshape(B * C, W, -1).transpose(1, 2)
+
+        tcn_out = self.tcn(x_tcn)
+        x = tcn_out.view(B, C, self.d_model, W)
+
+        # ==========================================
+        # PHASE 2: TIME EMBEDDINGS
+        # ==========================================
+        time_emb = self.macro_time_encoder(macro_time_norm).unsqueeze(-1)
+        x = x + time_emb
+
+        # ==========================================
+        # PHASE 3: TRANSFORMER ENCODER (extract here)
+        # ==========================================
+        x = x.permute(0, 3, 1, 2)  # (B, W, C, d_model)
+        x = x.reshape(B * W, C, self.d_model)
+
+        x = x + self.channel_embeddings
+        x = self.pre_transformer_norm(x)
+
+        encoder_repr = self.transformer_encoder(x)  # (B*W, C, d_model)
+
+        return encoder_repr, sbp_mean, sbp_std

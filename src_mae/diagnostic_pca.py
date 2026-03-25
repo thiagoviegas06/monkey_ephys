@@ -123,12 +123,16 @@ def extract_transformer_embeddings(model, dataloader, config, num_batches=5):
                     emb_flat = emb.reshape(-1, d_model)
                     embeddings_list.append(emb_flat)
 
-                    # Create labels for each sample (encode session_id)
-                    # session_ids is a list of B strings (one per sample in batch)
-                    B = x_sbp.size(0)
+                    # Create labels for each embedding
+                    # session_ids is a list of B session IDs
+                    # emb shape is (B*W, C, d_model), flattened to (B*W*C, d_model)
+                    B = x_sbp.size(0)  # batch size
+                    W = x_sbp.size(1)  # window size (typically 200)
+                    embeddings_per_sample = W * C  # embeddings per sample
+
                     for i, sid in enumerate(session_ids):
-                        # Each sample in batch contributes W*C embeddings
-                        sample_labels = [sid] * (len(emb) // B)
+                        # Each sample contributes W*C embeddings
+                        sample_labels = [sid] * embeddings_per_sample
                         session_labels.extend(sample_labels)
 
     finally:
