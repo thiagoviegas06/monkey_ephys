@@ -194,6 +194,25 @@ def predict_sessions(model: nn.Module, session_data: dict, device: torch.device,
         
     return predictions
 
+def build_submission(sample_submission_path: str, predictions: dict, output_csv: str):
+    sub = pd.read_csv(sample_submission_path)
+
+    for session_id, pred_full in predictions.items():
+        idx = sub["session_id"] == session_id
+        if not idx.any():
+            continue
+
+        time_bins = sub.loc[idx, "time_bin"].to_numpy(dtype=np.int64)
+        channels = sub.loc[idx, "channel"].to_numpy(dtype=np.int64)
+        sub.loc[idx, "predicted_sbp"] = pred_full[time_bins, channels].astype(np.float32)
+
+    if sub["predicted_sbp"].isna().any():
+        n_nan = int(sub["predicted_sbp"].isna().sum())
+        raise RuntimeError(f"Submission has {n_nan} NaN predictions.")
+
+    sub.to_csv(output_csv, index=False)
+    print(f"Saved submission: {output_csv}")
+    return sub
 
 def run_eval(model_path, data_path, output_csv, window_size, seed, args):
     global config
