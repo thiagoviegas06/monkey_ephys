@@ -363,14 +363,20 @@ def preprocess_channel_level_masking(data_path, window_size=200, step_size=50, m
 
             # Apply channel-level masking
             C = y.shape[1]
+            W = y.shape[0]
             num_masked_channels = int(C * mask_ratio)
             masked_channels = np.random.choice(C, size=num_masked_channels, replace=False)
             x = y.copy()
             x[:, masked_channels] = 0.0  # Mask entire channels
 
+            # Create boolean mask: True where masked, False where observed
+            M = np.zeros((W, C), dtype=np.bool_)
+            M[:, masked_channels] = True
+
             sample = {
                 "x_sbp": x.astype(np.float32),
                 "y_sbp": y.astype(np.float32),
+                "mask": M,  # Boolean mask (W, C): True where masked
                 "kin": kin_w.astype(np.float32),
                 "channel_var": session_variance.astype(np.float32),
                 "session_id": session.session_id,

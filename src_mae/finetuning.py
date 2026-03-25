@@ -62,18 +62,35 @@ class PreprocessedMaskedDataset(Dataset):
         except Exception as e:
             raise RuntimeError(f"Error loading {file_path}: {e}")
 
-        # Extract data from pickle (with error checking)
+        # Extract required fields
         try:
-            x_sbp = torch.from_numpy(sample["x_sbp"]).float()      # (W, C) - masked SBP
             y_sbp = torch.from_numpy(sample["y_sbp"]).float()      # (W, C) - full SBP
             kin = torch.from_numpy(sample["kin"]).float()          # (W, 4) - kinematics
-            mask = torch.from_numpy(sample["mask"]).bool()         # (W, C) - True where masked
             channel_var = torch.from_numpy(sample["channel_var"]).float()  # (C,)
             session_id = sample["session_id"]
         except KeyError as e:
-            raise KeyError(f"Missing key {e} in {file_path}")
+            raise KeyError(f"Missing required key {e} in {file_path}. "
+                         f"File must be from preprocess_channel_level_masking.")
 
-        # Create macro_timestamp (approximate from day info if available)
+        # Extract masked SBP (x_sbp)
+        if "x_sbp" in sample:
+            x_sbp = torch.from_numpy(sample["x_sbp"]).float()  # (W, C)
+        else:
+            # Fallback: create x_sbp by zeroing out based on mask
+            x_sbp = y_sbp.clone()
+            if "mask" in sample:
+                mask_np = sample["mask"]
+                x_sbp[torch.from_numpy(mask_np).bool()] = 0.0
+
+        # Extract mask (True where masked)
+        if "mask" in sample:
+            mask = torch.from_numpy(sample["mask"]).bool()  # (W, C)
+        else:
+            # Fallback: no mask information, assume all visible
+            W, C = y_sbp.shape
+            mask = torch.zeros((W, C), dtype=torch.bool)
+
+        # Create macro_timestamp
         day = sample.get("day", 0.0)
         macro_timestamp = torch.tensor([day], dtype=torch.float32)
 
@@ -202,6 +219,27 @@ def main():
             f"Run preprocessing first:\n"
             f"  python src_mae/preprocessing.py --preprocess_type channel_level_masking --out_dir {args.data_dir}"
         )
+
+    # Validate data format by checking first pickle file
+    pkl_files = [f for f in os.listdir(args.data_dir) if f.endswith('.pkl')]
+    if pkl_files:
+        try:
+            with open(os.path.join(args.data_dir, pkl_files[0]), 'rb') as f:
+                sample = pickle.load(f)
+            required_keys = ["y_sbp", "kin", "channel_var", "session_id"]
+            missing_keys = [k for k in required_keys if k not in sample]
+            if missing_keys:
+                raise ValueError(
+                    f"Data format error: missing keys {missing_keys}\n"
+                    f"Make sure data was created with:\n"
+                    f"  python src_mae/preprocessing.py --preprocess_type channel_level_masking --out_dir {args.data_dir}\n"
+                    f"NOT with preprocess_overlapping_dynamic or preprocess_non_overlapping"
+                )
+            # Warn if x_sbp or mask missing (can be generated on-the-fly)
+            if "x_sbp" not in sample or "mask" not in sample:
+                print("⚠️  Warning: x_sbp and/or mask not in data. Will be generated on-the-fly.")
+        except Exception as e:
+            print(f"⚠️  Could not validate data format: {e}")
 
     # Load dataloaders
     train_loader, val_loader = get_dataloaders_from_preprocessed(
