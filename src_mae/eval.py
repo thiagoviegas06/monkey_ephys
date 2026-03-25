@@ -131,50 +131,68 @@ def load_model(model_path: str, device: torch.device) -> nn.Module:
 
 
 @torch.no_grad()
-def predict_sessions(model: nn.Module, session_data: dict, device: torch.device):
+def predict_sessions(model: nn.Module, session_data: dict, device: torch.device, window_size: int):
+    """
+    Predicts masked SBP using a rolling window with 50% overlap.
+    Averages overlapping predictions using a Hanning window to prioritize the center.
+    """
     predictions = {}
+    step_size = window_size // 2 # 50% overlap for robust ensembling
+    
+    # Pre-calculate a temporal weight window (Hanning) to favor the center of each prediction
+    # This reduces "edge artifacts" where the TCN/Transformer has less context.
+    weight_window = torch.hann_window(window_size, periodic=False).to(device).view(1, window_size, 1)
+
     for session_id, info in session_data.items():
-        masked_sbp = info["masked_sbp"]
-        mask = info["mask"]
-        windows = info["windows"]
-        macro_timestamp = info.get("macro_timestamp", 0.0)
+        masked_sbp_np = info["masked_sbp"]
+        mask_np = info["mask"]
+        N, C = masked_sbp_np.shape
+        
+        # Buffers for weighted averaging across the full session
+        pred_acc = torch.zeros((N, C), device=device)
+        weight_acc = torch.zeros((N, C), device=device)
+        
+        # Convert full session to tensor for fast indexing
+        full_sbp = torch.from_numpy(masked_sbp_np).to(device, dtype=torch.float32)
+        full_mask = torch.from_numpy(mask_np).to(device, dtype=torch.float32)
 
-        pred_full = masked_sbp.copy()
-        covered = np.zeros_like(mask, dtype=np.bool_)
+        # Rolling window inference
+        for w0 in range(0, N - window_size + 1, step_size):
+            w1 = w0 + window_size
+            
+            x_window = full_sbp[w0:w1].unsqueeze(0) # (1, W, C)
+            m_window = full_mask[w0:w1].unsqueeze(0) # (1, W, C)
+            macro_ts = torch.tensor([[float(w0)]], device=device, dtype=torch.float32)
 
-        for w0, w1 in windows:
-            x_window = torch.from_numpy(masked_sbp[w0:w1]).unsqueeze(0).to(device, dtype=torch.float32)
-            m_window = torch.from_numpy(mask[w0:w1]).unsqueeze(0).to(device, dtype=torch.float32)
-            macro_ts_tensor = torch.tensor([[macro_timestamp]], device=device, dtype=torch.float32)
+            # Model prediction (un-normalized internally by SBP_TCN_Transformer)
+            pred_window = model(x_window, m_window, macro_ts) # (1, W, C)
+            
+            # Accumulate weighted predictions
+            pred_acc[w0:w1] += pred_window.squeeze(0) * weight_window.squeeze(0)
+            weight_acc[w0:w1] += weight_window.squeeze(0)
 
-            pred_window = model(x_window, m_window, macro_ts_tensor).squeeze(0).cpu().numpy()
+        # Handle the final edge if it wasn't perfectly covered by step_size
+        if (N - window_size) % step_size != 0:
+            w0, w1 = N - window_size, N
+            x_window = full_sbp[w0:w1].unsqueeze(0)
+            m_window = full_mask[w0:w1].unsqueeze(0)
+            macro_ts = torch.tensor([[float(w0)]], device=device)
+            
+            pred_window = model(x_window, m_window, macro_ts)
+            pred_acc[w0:w1] += pred_window.squeeze(0) * weight_window.squeeze(0)
+            weight_acc[w0:w1] += weight_window.squeeze(0)
 
-            m_np = mask[w0:w1]
-            block = pred_full[w0:w1]
-            block[m_np] = pred_window[m_np]
-            pred_full[w0:w1] = block
-            covered[w0:w1] |= m_np
+        # Final weighted average
+        final_pred = pred_acc / weight_acc.clamp(min=1e-8)
+        final_pred_np = final_pred.cpu().numpy()
 
-        n_missing = int((mask & ~covered).sum())
-        if n_missing > 0:
-            raise RuntimeError(f"Session {session_id}: {n_missing} positions not covered.")
-
-        predictions[session_id] = pred_full
+        # Blend: Keep original observed data, only use prediction for masked indices
+        result = masked_sbp_np.copy()
+        result[mask_np] = final_pred_np[mask_np]
+        
+        predictions[session_id] = result
+        
     return predictions
-
-
-def build_submission(sample_submission_path: str, predictions: dict, output_csv: str):
-    sub = pd.read_csv(sample_submission_path)
-    for session_id, pred_full in predictions.items():
-        idx = sub["session_id"] == session_id
-        if not idx.any(): continue
-
-        time_bins = sub.loc[idx, "time_bin"].to_numpy(dtype=np.int64)
-        channels = sub.loc[idx, "channel"].to_numpy(dtype=np.int64)
-        sub.loc[idx, "predicted_sbp"] = pred_full[time_bins, channels].astype(np.float32)
-
-    sub.to_csv(output_csv, index=False)
-    print(f"Saved submission: {output_csv}")
 
 
 def run_eval(model_path, data_path, output_csv, window_size, seed, args):
@@ -185,18 +203,24 @@ def run_eval(model_path, data_path, output_csv, window_size, seed, args):
     print(f"Loading model: {model_path}")
     model = load_model(model_path, device)
 
-    session_data = preprocess_test(
-        data_path=data_path,
-        window_size=window_size,
-        metadata_csv=os.path.join(data_path, "metadata.csv"),
-        seed=seed
-    )
+    # Note: We no longer need build_randomized_windows_from_mask because 
+    # predict_sessions now iterates through the whole session linearly.
+    masked_files = os.path.join(data_path, "test/*_sbp_masked.npy")
+    session_data = {}
 
-    print("Running inference...")
-    predictions = predict_sessions(model, session_data, device)
+    for file in sorted(glob(masked_files)):
+        session_id = Path(file).stem.split("_")[0]
+        session_data[session_id] = {
+            "masked_sbp": np.load(file),
+            "mask": np.load(file.replace("sbp_masked", "mask")),
+        }
+
+    print(f"Running rolling inference (window={window_size}, overlap=50%)...")
+    predictions = predict_sessions(model, session_data, device, window_size)
 
     print("Constructing submission CSV...")
     build_submission(os.path.join(data_path, "sample_submission.csv"), predictions, output_csv)
+
 
 
 def parse_args():
