@@ -222,7 +222,10 @@ class SBP_TCN_Transformer(nn.Module):
         # For visible tokens, use the deeply encoded pristine representation.
         # For masked tokens, inject a proper learned mask token with positional info.
         mask_tokens = self.mask_token.expand(B * W, C, -1)
-        time_emb_flat = time_emb.permute(0, 3, 1, 2).reshape(B * W, 1, self.d_model)
+        
+        # Correctly broadcast per-batch time embedding to all W time steps
+        time_emb_flat = time_emb.squeeze(-1).repeat_interleave(W, dim=0) # (B*W, 1, d_model)
+        
         mask_tokens_with_pos = mask_tokens + self.channel_embeddings + time_emb_flat
         mask_tokens_with_pos = self.pre_transformer_norm(mask_tokens_with_pos)
         
