@@ -126,6 +126,10 @@ class SBP_TCN_Transformer(nn.Module):
             norm_first=True  # Pre-Norm stabilizes deep transformers immediately
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+        self.enc_norm = nn.LayerNorm(d_model)
+        
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.normal_(self.mask_token, std=0.02)
         
         decoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, 
@@ -158,12 +162,20 @@ class SBP_TCN_Transformer(nn.Module):
         # A. Normalize SBP (Only compute stats on VISIBLE values per channel)
         visible_mask = (~mask.bool()).float()  # 1.0 if visible, 0.0 if masked
         # num_visible: (B, 1, C) - total unmasked pixels per channel
-        num_visible_c = visible_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        num_visible_c = visible_mask.sum(dim=1, keepdim=True)
+        
+        # Safe RevIN: Detect fully masked channels
+        is_fully_masked = (num_visible_c == 0).float()
+        safe_num_visible = num_visible_c.clamp(min=1.0)
         
         # Temporal Mean/Std per channel
-        sbp_mean = (sbp_masked * visible_mask).sum(dim=1, keepdim=True) / num_visible_c
-        sbp_var = (((sbp_masked - sbp_mean) * visible_mask) ** 2).sum(dim=1, keepdim=True) / num_visible_c
+        sbp_mean = (sbp_masked * visible_mask).sum(dim=1, keepdim=True) / safe_num_visible
+        sbp_var = (((sbp_masked - sbp_mean) * visible_mask) ** 2).sum(dim=1, keepdim=True) / safe_num_visible
         sbp_std = torch.sqrt(sbp_var + 1e-5)
+        
+        # For fully masked channels, force mean=0 and std=1 so prediction output is unaffected
+        sbp_mean = sbp_mean * (1 - is_fully_masked)
+        sbp_std = sbp_std * (1 - is_fully_masked) + is_fully_masked * 1.0
         
         # Normalize SBP, keeping masked values safely at exactly 0
         sbp_norm = ((sbp_masked - sbp_mean) / sbp_std) * visible_mask
@@ -204,11 +216,17 @@ class SBP_TCN_Transformer(nn.Module):
         
         # The Encoder strictly processes visible channels to build a pristine spatial representation.
         enc_out = self.encoder(x, src_key_padding_mask=padding_mask)
+        enc_out = self.enc_norm(enc_out)
         
         # Construct Decoder input: 
         # For visible tokens, use the deeply encoded pristine representation.
-        # For masked tokens, inject the original TCN spatial embedding back in as a "query" token.
-        decoder_in = torch.where(padding_mask.unsqueeze(-1), x, enc_out)
+        # For masked tokens, inject a proper learned mask token with positional info.
+        mask_tokens = self.mask_token.expand(B * W, C, -1)
+        time_emb_flat = time_emb.permute(0, 3, 1, 2).reshape(B * W, 1, self.d_model)
+        mask_tokens_with_pos = mask_tokens + self.channel_embeddings + time_emb_flat
+        mask_tokens_with_pos = self.pre_transformer_norm(mask_tokens_with_pos)
+        
+        decoder_in = torch.where(padding_mask.unsqueeze(-1), mask_tokens_with_pos, enc_out)
         
         # The Decoder processes the full sequence, allowing masked tokens to query visible tokens.
         dec_out = self.decoder(decoder_in)
