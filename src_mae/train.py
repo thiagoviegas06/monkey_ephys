@@ -131,6 +131,15 @@ def validate_one_epoch(model, dataloader, config, epoch):
             # ===== Compute loss =====
             loss = kaggle_aligned_nmse_loss(pred, y_sbp, mask, channel_var, session_ids)
             
+            if loss.item() > 20.0:
+                print(f"\n[WARNING] High loss ({loss.item():.2f}) in batch. Sessions: {list(set(session_ids))}")
+                # Optional: find which session in the batch is the worst
+                for sid in set(session_ids):
+                    s_idx = [i for i, s in enumerate(session_ids) if s == sid]
+                    s_loss = kaggle_aligned_nmse_loss(pred[s_idx], y_sbp[s_idx], mask[s_idx], channel_var[s_idx], [sid]*len(s_idx))
+                    if s_loss.item() > 10.0:
+                         print(f"  - Session {sid} loss: {s_loss.item():.2f}")
+            
             # ===== Logging =====
             total_loss += loss.item() * batch_size
             total_samples += batch_size

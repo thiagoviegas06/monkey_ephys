@@ -92,24 +92,23 @@ class SBPDataset(Dataset):
                 mask_type = 1 # 1 for Span
 
         else:
-            # Deterministic for validation: round-robin through the sets
+            # Deterministic for validation
+            y_sbp = torch.from_numpy(session["sbp"][w0:w0 + self.window_size])
+            kin_w = torch.from_numpy(session["kin"][w0:w0 + self.window_size])
+            C = y_sbp.shape[1]
+            
+            # Use deterministic RNG based on idx to make masking consistent but varied across samples
             rng = np.random.default_rng(idx + 42) 
-            session = rng.choice(self.sessions_data)
             
-            max_start = session["N"] - self.window_size
-            w0 = rng.integers(0, max_start + 1)
+            y_np = y_sbp.numpy().copy()
             
-            y_np = session["sbp"][w0:w0 + self.window_size].copy()
-            kin_np = session["kin"][w0:w0 + self.window_size].copy()
-            
+            # Match training-like span masking for validation
             num_spans = 2
             spans = sample_multi_span_lengths_and_starts(rng, self.window_size, num_spans=num_spans, min_gap=10)
             x_np, m_np = apply_multi_span_mask_to_window(y_np, spans, num_spans=num_spans, rng=rng)
             
             x_sbp = torch.from_numpy(x_np)
-            y_sbp = torch.from_numpy(y_np)
             mask = torch.from_numpy(m_np)
-            kin_w = torch.from_numpy(kin_np)
 
         return {
             "x_sbp": x_sbp.float(),

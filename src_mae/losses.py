@@ -66,7 +66,7 @@ def stable_masked_nmse_loss(pred, target, mask, global_var_c):
     mse_c = sq_error.sum(dim=(0, 1)) / mask.sum(dim=(0, 1)).clamp(min=1)
     
     # Normalize by the fixed global variance, not the batch variance
-    nmse_c = mse_c / global_var_c.clamp(min=1e-8)
+    nmse_c = mse_c / global_var_c.clamp(min=1e-4)
     
     # Only average over channels that actually had masks in this batch
     active_channels = mask.sum(dim=(0, 1)) > 0
@@ -78,7 +78,7 @@ def kaggle_aligned_nmse_loss(pred: torch.Tensor,
                              mask: torch.Tensor,
                              channel_var: torch.Tensor,
                              session_ids: list = None,
-                             eps: float = 1e-8):
+                             eps: float = 1e-4):
     """
     Kaggle-aligned NMSE loss that matches the competition metric.
     
@@ -122,7 +122,7 @@ def kaggle_aligned_nmse_loss(pred: torch.Tensor,
         
         # Normalize by per-session channel variance: (B, C)
         channel_var_clamped = channel_var.clamp(min=eps)
-        nmse_bc = mse_bc / channel_var_clamped
+        nmse_bc = (mse_bc / channel_var_clamped).clamp(max=50.0)
         
         # Only consider (sample, channel) pairs that were actually masked
         active = n_masked > 0
@@ -171,7 +171,12 @@ def kaggle_aligned_nmse_loss(pred: torch.Tensor,
             if sess_active.sum() > 0:
                 # Weighted averaging: weight by number of masked positions
                 session_weight = sess_n_masked[sess_active].sum()
-                nmse_list.append(sess_nmse_c[sess_active].mean())
+                
+                # Compute session mean NMSE and clip it for stability
+                sess_nmse = sess_nmse_c[sess_active].mean()
+                sess_nmse = torch.clamp(sess_nmse, max=50.0)
+                
+                nmse_list.append(sess_nmse)
                 weight_list.append(session_weight)
         
         if len(nmse_list) == 0:
