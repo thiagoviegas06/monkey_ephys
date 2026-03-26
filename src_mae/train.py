@@ -165,7 +165,7 @@ def train_val_loader():
             batch_size=config.batch_size,
             val_split=0.2,
             shuffle=True,
-            num_workers=12,  # Parallel data loading
+            num_workers=8,  # Parallel data loading
             pin_memory=True if config.device == "cuda" else False
         )
 
@@ -174,7 +174,7 @@ def train_val_loader():
             config, 
             batch_size=config.batch_size,
             val_split=0.2,
-            num_workers=12,  # Parallel data loading
+            num_workers=8,  # Parallel data loading
         )
 
     else:

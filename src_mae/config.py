@@ -32,7 +32,7 @@ class Config:
 
     
     # Training
-    batch_size = 64
+    batch_size = 32
     learning_rate = 3e-4
     weight_decay = 1e-4
     num_epochs = 80
