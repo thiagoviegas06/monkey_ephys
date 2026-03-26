@@ -194,8 +194,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train kinematics decoder on MAE encoder representation")
     parser.add_argument('--mae_checkpoint', type=str, default='checkpoints_200/best_model_tcn_transformer.pt',
                         help='Path to MAE checkpoint')
-    parser.add_argument('--data_dir', type=str, default='kaggle_data/custom_unmasked_windows_p2',
-                        help='Directory with preprocessed data')
+    parser.add_argument('--data_dir', type=str, default='phase2_v2_kaggle_data',
+                        help='Directory with phase 2 data (must contain train/ subdir with *_sbp.npy files)')
     parser.add_argument('--output_dir', type=str, default='checkpoints_kin_decoder',
                         help='Output directory for checkpoints')
     parser.add_argument('--num_epochs', type=int, default=30, help='Number of training epochs')

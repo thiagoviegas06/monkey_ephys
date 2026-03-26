@@ -323,9 +323,14 @@ def preprocess_overlapping_dynamic(data_path, window_size=200, step_size=50, lag
             with open(sample_path, "wb") as f:
                 pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-def preprocess_channel_level_masking(data_path, window_size=200, step_size=50, mask_ratio=0.3, out_dir=None):
+def preprocess_channel_level_masking(data_path, window_size=200, step_size=50, mask_ratio=0.3, out_dir=None, per_session=False):
     """
     Preprocesses data by applying channel-level masking to entire channels across all time bins in a window.
+
+    Args:
+        per_session: If True, the same channels are masked for every window in a session
+                     (seeded by session_id — matches test distribution). If False, each
+                     window gets independently random masked channels.
     """
     if out_dir is None:
         out_dir = os.path.join(data_path, f"masked_window_p2")
@@ -335,7 +340,7 @@ def preprocess_channel_level_masking(data_path, window_size=200, step_size=50, m
     for session in sessions:
         if session.isTest():
             continue
-            
+
         sbp, kin, starts_bins, end_bins = session.load_data(data_path)
         if sbp is None: continue
 
@@ -357,6 +362,13 @@ def preprocess_channel_level_masking(data_path, window_size=200, step_size=50, m
 
         session_variance = compute_session_channel_variance(sbp)
 
+        # Per-session mode: pick channels once for the whole session
+        if per_session:
+            session_rng = np.random.RandomState(hash(session.session_id) & 0xFFFFFFFF)
+            C = sbp_norm.shape[1]
+            num_masked_channels = int(C * mask_ratio)
+            session_masked_channels = session_rng.choice(C, size=num_masked_channels, replace=False)
+
         for w0 in w0s:
             y = sbp_norm[w0:w0 + window_size]      # (W,96)
             kin_w = kin[w0:w0 + window_size]  # (W,4) - raw, no normalization
@@ -365,7 +377,10 @@ def preprocess_channel_level_masking(data_path, window_size=200, step_size=50, m
             C = y.shape[1]
             W = y.shape[0]
             num_masked_channels = int(C * mask_ratio)
-            masked_channels = np.random.choice(C, size=num_masked_channels, replace=False)
+            if per_session:
+                masked_channels = session_masked_channels
+            else:
+                masked_channels = np.random.choice(C, size=num_masked_channels, replace=False)
             x = y.copy()
             x[:, masked_channels] = 0.0  # Mask entire channels
 
@@ -407,6 +422,7 @@ if __name__ == "__main__":
     parser.add_argument('--step_size', type=int, default=50, help='Step size for sliding windows')
     parser.add_argument('--lag_bins', type=int, default=5, help='Lag bins (for overlapping_dynamic)')
     parser.add_argument('--mask_ratio', type=float, default=0.3, help='Masking ratio (for channel_level_masking)')
+    parser.add_argument('--per_session', action='store_true', help='Mask same channels for all windows in a session (matches test distribution)')
     parser.add_argument('--out_dir', type=str, default=None, help='Output directory (if None, uses default based on preprocess_type)')
 
     args = parser.parse_args()
@@ -417,7 +433,8 @@ if __name__ == "__main__":
             window_size=args.window_size,
             step_size=args.step_size,
             mask_ratio=args.mask_ratio,
-            out_dir=args.out_dir
+            out_dir=args.out_dir,
+            per_session=args.per_session,
         )
     else:  # overlapping_dynamic
         preprocess_overlapping_dynamic(
