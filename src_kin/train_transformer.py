@@ -62,7 +62,7 @@ def build_mae_model(checkpoint_path, device):
     return model, config
 
 
-def build_kin_decoder(d_model=64, window_size=200, device='cpu'):
+def build_kin_decoder(d_model=64, window_size=300, device='cpu'):
     """Build kinematics decoder."""
     decoder = KinematicDecoderTransformer(
         d_model=d_model,
@@ -95,13 +95,14 @@ def train_one_epoch(mae_model, kin_decoder, dataloader, optimizer, device):
         x_sbp = batch["sbp_masked"].to(device)  # (B, W, 96)
         kin_target = batch["kin"].to(device)  # (B, W, 4)
         mask = batch["mask"].to(device).float()  # (B, W, 96)
+        macro_time = batch["macro_timestamp"].unsqueeze(-1).to(device)  # (B, 1)
 
         batch_size = x_sbp.size(0)
         optimizer.zero_grad()
 
         # Extract encoder representation from MAE (frozen)
         with torch.no_grad():
-            encoder_repr, _, _ = mae_model.extract_encoder_repr(x_sbp, mask, torch.zeros(batch_size, 1).to(device))
+            encoder_repr, _, _ = mae_model.extract_encoder_repr(x_sbp, mask, macro_time)
 
         # Predict kinematics
         kin_pred = kin_decoder(encoder_repr)  # (B, W, 4)
@@ -155,11 +156,12 @@ def validate(mae_model, kin_decoder, dataloader, device):
         x_sbp = batch["sbp_masked"].to(device)
         kin_target = batch["kin"].to(device)
         mask = batch["mask"].to(device).float()
+        macro_time = batch["macro_timestamp"].unsqueeze(-1).to(device)  # (B, 1)
 
         batch_size = x_sbp.size(0)
 
         # Extract encoder representation
-        encoder_repr, _, _ = mae_model.extract_encoder_repr(x_sbp, mask, torch.zeros(batch_size, 1).to(device))
+        encoder_repr, _, _ = mae_model.extract_encoder_repr(x_sbp, mask, macro_time)
 
         # Predict kinematics
         kin_pred = kin_decoder(encoder_repr)
@@ -214,18 +216,21 @@ def main():
     # Load MAE (frozen)
     mae_model, mae_config = build_mae_model(args.mae_checkpoint, device)
 
-    # Build decoder
+    # Load kin config and override from CLI args
+    kin_config = KinConfig()
+    kin_config.batch_size = args.batch_size
+    kin_config.data_path = args.data_dir
+
+    # Build decoder using kin window size (must match the data)
     kin_decoder = build_kin_decoder(
         d_model=mae_config.d_model,
-        window_size=mae_config.window_size,
+        window_size=kin_config.window_size,
         device=device
     )
-    print(f"✓ Built kinematics decoder")
+    print(f"✓ Built kinematics decoder (window_size={kin_config.window_size})")
 
     # Load data
     print(f"\nLoading data from {args.data_dir}...")
-    kin_config = KinConfig()
-    kin_config.batch_size = args.batch_size  # Override batch_size from CLI
     train_loader, val_loader, _, _ = get_dataloaders(
         kin_config,
         val_split=0.2,
