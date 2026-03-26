@@ -20,8 +20,7 @@ def build_mae_model(config):
         sbp_channels=config.sbp_channels,
         d_model=config.d_model,
         nhead=config.nhead,
-        num_encoder_layers=config.num_encoder_layers,
-        num_temporal_layers=getattr(config, 'num_temporal_layers', 2),
+        num_axial_layers=config.num_axial_layers,
         num_decoder_layers=config.num_decoder_layers,
         tcn_levels=config.tcn_levels,
         dropout=config.dropout

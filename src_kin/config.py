@@ -16,13 +16,12 @@ class Config:
     # SBP_TCN_Transformer Hyperparameters (must match the saved checkpoint)
     window_size = 200
     sbp_channels = 96
-    d_model = 128  
+    d_model = 192  
     nhead = 8  
-    num_encoder_layers = 4 
-    num_temporal_layers = 2
+    num_axial_layers = 4 
     num_decoder_layers = 2
-    tcn_levels = 6  
-    dropout = 0.1  
+    tcn_levels = 4  
+    dropout = 0.15  
     
     # Pre-trained MAE Model for imputation
     mae_checkpoint_path = os.path.join(ROOT_DIR, f"checkpoints_{window_size}", "best_model_tcn_transformer.pt")
