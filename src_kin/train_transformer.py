@@ -19,7 +19,6 @@ import sys
 import argparse
 import torch
 import numpy as np
-from collections import defaultdict
 from tqdm import tqdm
 
 # Add root directory to path for imports
@@ -30,7 +29,7 @@ from src_kin.model import KinematicDecoderTransformer
 from src_mae.config import Config as MAEConfig
 from src_kin.config import Config as KinConfig
 from src_kin.dataloader import get_dataloaders
-from src_kin.losses import pearson_correlation_loss, acceleration_penalty, get_r2_components, calculate_global_r2, calculate_per_session_r2
+from src_kin.losses import pearson_correlation_loss, acceleration_penalty, calculate_per_session_r2
 
 import torch.nn as nn
 
@@ -84,11 +83,9 @@ def train_one_epoch(mae_model, kin_decoder, dataloader, optimizer, device):
     total_loss = 0.0
     total_samples = 0
 
-    # For global R² calculation
-    total_ss_res = 0.0
-    total_sum_y = 0.0
-    total_sum_y_sq = 0.0
-    total_count = 0.0
+    # Per-session accumulators for Kaggle-aligned R²
+    session_preds = {}
+    session_targets = {}
 
     pbar = tqdm(dataloader, desc="Training")
 
@@ -97,6 +94,7 @@ def train_one_epoch(mae_model, kin_decoder, dataloader, optimizer, device):
         kin_target = batch["kin"].to(device)  # (B, W, 4)
         mask = batch["mask"].to(device).float()  # (B, W, 96)
         macro_time = batch["macro_timestamp"].unsqueeze(-1).to(device)  # (B, 1)
+        session_ids = batch["session_id"]
 
         batch_size = x_sbp.size(0)
         optimizer.zero_grad()
@@ -122,17 +120,23 @@ def train_one_epoch(mae_model, kin_decoder, dataloader, optimizer, device):
         total_loss += loss.item() * batch_size
         total_samples += batch_size
 
-        # Accumulate R² components
-        ss_res, sum_y, sum_y_sq, count = get_r2_components(kin_pred.detach(), kin_target)
-        total_ss_res += ss_res
-        total_sum_y += sum_y
-        total_sum_y_sq += sum_y_sq
-        total_count += count
+        # Accumulate per-session predictions for Kaggle-aligned R²
+        pred_np = kin_pred.detach()[..., :2].cpu().numpy()    # (B, W, 2)
+        target_np = kin_target[..., :2].cpu().numpy()         # (B, W, 2)
+        for i, sid in enumerate(session_ids):
+            if sid not in session_preds:
+                session_preds[sid] = []
+                session_targets[sid] = []
+            session_preds[sid].append(pred_np[i])
+            session_targets[sid].append(target_np[i])
 
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
     avg_loss = total_loss / max(total_samples, 1)
-    r2 = calculate_global_r2(total_ss_res, total_sum_y, total_sum_y_sq, total_count)
+
+    all_preds   = [np.clip(np.concatenate(session_preds[s],   axis=0), 0, 1) for s in session_preds]
+    all_targets = [np.concatenate(session_targets[s], axis=0) for s in session_targets]
+    r2 = calculate_per_session_r2(all_preds, all_targets)
 
     return avg_loss, r2
 
