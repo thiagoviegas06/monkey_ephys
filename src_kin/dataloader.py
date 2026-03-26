@@ -39,21 +39,17 @@ class KinematicsDataset(Dataset):
 
         # Apply 30% channel masking consistent per session (matches test distribution)
         mask = torch.zeros_like(sbp_w, dtype=torch.bool)
-        if self.is_train:
-            # Use session_id to deterministically select which channels to mask
-            # Same channels masked throughout the entire session (like real test data)
-            session_id = session["session_id"]
-            rng = np.random.RandomState(hash(session_id) & 0xFFFFFFFF)
+        # Apply session-seeded 30% channel masking for both train and val
+        # Same channels masked for all windows in a session (matches test distribution)
+        session_id = session["session_id"]
+        rng = np.random.RandomState(hash(session_id) & 0xFFFFFFFF)
 
-            num_channels = sbp_w.shape[1]  # 96
-            num_to_mask = max(1, int(num_channels * 0.3))
-            channels_to_mask = rng.choice(num_channels, size=num_to_mask, replace=False)
+        num_channels = sbp_w.shape[1]  # 96
+        num_to_mask = max(1, int(num_channels * 0.3))
+        channels_to_mask = rng.choice(num_channels, size=num_to_mask, replace=False)
 
-            sbp_w[:, channels_to_mask] = 0.0
-            mask[:, channels_to_mask] = True
-        else:
-            # Validation: no masking
-            mask = (sbp_w == 0.0)
+        sbp_w[:, channels_to_mask] = 0.0
+        mask[:, channels_to_mask] = True
 
         item = {
             "sbp_masked": sbp_w,
