@@ -282,6 +282,18 @@ def main():
         else:
             patience_counter += 1
 
+        # Periodic checkpoint every 3 epochs
+        if epoch % 3 == 0:
+            periodic_path = os.path.join(args.output_dir, f'kin_decoder_epoch{epoch}.pt')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': kin_decoder.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'val_r2': val_r2
+            }, periodic_path)
+            print(f"  Checkpoint saved: {periodic_path}")
+
         # Early stopping
         if patience_counter >= args.early_stopping_patience:
             print(f"\n⚠️  Early stopping triggered (patience={args.early_stopping_patience})")
