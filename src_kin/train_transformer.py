@@ -2,11 +2,11 @@
 """
 Train kinematics decoder using pre-trained MAE encoder representation.
 
-Uses the same data as the PCA analysis and trains the attention-based decoder
-on downstream kinematics prediction task.
+Uses transformer-based decoder architecture (alternative to LSTM in train.py).
+Trains attention-based decoder on downstream kinematics prediction task.
 
 Usage:
-    python train_kin_decoder.py \
+    python src_kin/train_transformer.py \
       --mae_checkpoint checkpoints_200/best_model_tcn_transformer.pt \
       --data_dir kaggle_data/custom_unmasked_windows_p2 \
       --output_dir checkpoints_kin_decoder \
@@ -21,11 +21,13 @@ import torch
 import numpy as np
 from tqdm import tqdm
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Add root directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src_mae.model import SBP_TCN_Transformer
 from src_kin.model import KinematicDecoderTransformer
 from src_mae.config import Config as MAEConfig
+from src_kin.config import Config as KinConfig
 from src_kin.dataloader import get_dataloaders
 from src_kin.losses import pearson_correlation_loss, acceleration_penalty, get_r2_components, calculate_global_r2
 
@@ -206,7 +208,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     print("="*70)
-    print("KINEMATICS DECODER TRAINING")
+    print("KINEMATICS DECODER TRAINING (Transformer)")
     print("="*70)
 
     # Load MAE (frozen)
@@ -222,9 +224,10 @@ def main():
 
     # Load data
     print(f"\nLoading data from {args.data_dir}...")
+    kin_config = KinConfig()
+    kin_config.batch_size = args.batch_size  # Override batch_size from CLI
     train_loader, val_loader, _, _ = get_dataloaders(
-        mae_config,
-        batch_size=args.batch_size,
+        kin_config,
         val_split=0.2,
         num_workers=4
     )

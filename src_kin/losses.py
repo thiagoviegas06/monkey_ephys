@@ -81,16 +81,67 @@ def calculate_r2(y_pred, y_true):
     # Extract only the first 2 channels (index_pos, mrp_pos)
     y_pred = y_pred[..., :2]
     y_true = y_true[..., :2]
-    
+
     # Flatten Batch and Time dimensions
     y_pred_flat = y_pred.reshape(-1, 2)
     y_true_flat = y_true.reshape(-1, 2)
-    
+
     ss_res = torch.sum((y_true_flat - y_pred_flat) ** 2, dim=0)
-    
+
     # Calculate mean per channel across all samples in the flattened array
     mean_true = torch.mean(y_true_flat, dim=0)
     ss_tot = torch.sum((y_true_flat - mean_true) ** 2, dim=0)
-    
+
     r2 = 1 - (ss_res / (ss_tot + 1e-8))
     return r2.mean().item()
+
+def get_r2_components(y_pred, y_true):
+    """
+    Extracts R² components for accumulation across batches.
+    Returns: (ss_res, sum_y, sum_y_sq, count)
+
+    y_pred, y_true: (Batch, Time, Channels)
+    """
+    # Extract only the first 2 channels (index_pos, mrp_pos)
+    y_pred = y_pred[..., :2]
+    y_true = y_true[..., :2]
+
+    # Flatten Batch and Time dimensions
+    y_pred_flat = y_pred.reshape(-1, 2)
+    y_true_flat = y_true.reshape(-1, 2)
+
+    # Sum of squared residuals
+    ss_res = torch.sum((y_true_flat - y_pred_flat) ** 2).item()
+
+    # Sum of y values and sum of squared y values (for computing global mean and variance)
+    sum_y = torch.sum(y_true_flat).item()
+    sum_y_sq = torch.sum(y_true_flat ** 2).item()
+    count = y_true_flat.shape[0]
+
+    return ss_res, sum_y, sum_y_sq, count
+
+def calculate_global_r2(total_ss_res, total_sum_y, total_sum_y_sq, total_count):
+    """
+    Calculates global R² from accumulated components.
+
+    Args:
+        total_ss_res: sum of squared residuals across all batches
+        total_sum_y: sum of y values across all batches
+        total_sum_y_sq: sum of y² values across all batches
+        total_count: total number of samples
+
+    Returns:
+        r2: R² score (float)
+    """
+    if total_count == 0:
+        return 0.0
+
+    # Compute global mean
+    mean_y = total_sum_y / total_count
+
+    # Compute total sum of squares
+    ss_tot = total_sum_y_sq - (total_sum_y ** 2) / total_count
+
+    # Compute R²
+    r2 = 1.0 - (total_ss_res / (ss_tot + 1e-8))
+    return r2
