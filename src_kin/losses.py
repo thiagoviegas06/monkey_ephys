@@ -116,7 +116,7 @@ def get_r2_components(y_pred, y_true):
     # Sum of y values and sum of squared y values (for computing global mean and variance)
     sum_y = torch.sum(y_true_flat).item()
     sum_y_sq = torch.sum(y_true_flat ** 2).item()
-    count = y_true_flat.shape[0]
+    count = y_true_flat.numel()  # N * num_channels, must match sum_y/sum_y_sq totals
 
     return ss_res, sum_y, sum_y_sq, count
 
