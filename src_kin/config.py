@@ -13,7 +13,7 @@ class Config:
     mae_checkpoint_path = "checkpoints/nkin_best_model_tcn_transformer.pt"
 
     # SBP_TCN_Transformer Hyperparameters (must match the saved checkpoint)
-    window_size = 300  # Middle ground: captures ~1.5 movement cycles, better temporal context than 200
+    window_size = 200  # Must match MAE training window size
     sbp_channels = 96
     d_model = 64  
     nhead = 8  
@@ -51,7 +51,7 @@ class Config:
     acceleration_weight = 0.1 # Light smoothing penalty (prevents jitter, doesn't over-constrain)
     
     # Window stride for training (sliding window step size)
-    window_step_size = 75  # 25% overlap, proportional to window_size=300
+    window_step_size = 50  # 25% overlap, proportional to window_size=200
 
     # Smoothing
     smoothing_kernel_size = 5 # Kernel size for moving average smoothing
