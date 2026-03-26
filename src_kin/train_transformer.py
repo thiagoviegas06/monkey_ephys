@@ -19,6 +19,7 @@ import sys
 import argparse
 import torch
 import numpy as np
+from collections import defaultdict
 from tqdm import tqdm
 
 # Add root directory to path for imports
@@ -29,7 +30,7 @@ from src_kin.model import KinematicDecoderTransformer
 from src_mae.config import Config as MAEConfig
 from src_kin.config import Config as KinConfig
 from src_kin.dataloader import get_dataloaders
-from src_kin.losses import pearson_correlation_loss, acceleration_penalty, get_r2_components, calculate_global_r2
+from src_kin.losses import pearson_correlation_loss, acceleration_penalty, get_r2_components, calculate_global_r2, calculate_per_session_r2
 
 import torch.nn as nn
 
@@ -107,8 +108,8 @@ def train_one_epoch(mae_model, kin_decoder, dataloader, optimizer, device):
         # Predict kinematics
         kin_pred = kin_decoder(encoder_repr)  # (B, W, 4)
 
-        # Loss: MSE + Pearson correlation + acceleration penalty
-        recon_loss = nn.MSELoss()(kin_pred, kin_target)
+        # Loss: MSE on evaluated channels only + Pearson correlation + acceleration penalty
+        recon_loss = nn.MSELoss()(kin_pred[..., :2], kin_target[..., :2])
         corr_loss = pearson_correlation_loss(kin_pred, kin_target)
         accel_loss = acceleration_penalty(kin_pred)
 
@@ -138,17 +139,15 @@ def train_one_epoch(mae_model, kin_decoder, dataloader, optimizer, device):
 
 @torch.no_grad()
 def validate(mae_model, kin_decoder, dataloader, device):
-    """Validate kinematics decoder."""
+    """Validate kinematics decoder with Kaggle-aligned per-session R²."""
     kin_decoder.eval()
 
     total_loss = 0.0
     total_samples = 0
 
-    # For global R² calculation
-    total_ss_res = 0.0
-    total_sum_y = 0.0
-    total_sum_y_sq = 0.0
-    total_count = 0.0
+    # Per-session accumulators for Kaggle-aligned R²
+    session_preds = {}   # session_id -> list of (W, 2) arrays
+    session_targets = {} # session_id -> list of (W, 2) arrays
 
     pbar = tqdm(dataloader, desc="Validation")
 
@@ -157,17 +156,14 @@ def validate(mae_model, kin_decoder, dataloader, device):
         kin_target = batch["kin"].to(device)
         mask = batch["mask"].to(device).float()
         macro_time = batch["macro_timestamp"].unsqueeze(-1).to(device)  # (B, 1)
+        session_ids = batch["session_id"]
 
         batch_size = x_sbp.size(0)
 
-        # Extract encoder representation
         encoder_repr, _, _ = mae_model.extract_encoder_repr(x_sbp, mask, macro_time)
-
-        # Predict kinematics
         kin_pred = kin_decoder(encoder_repr)
 
-        # Loss
-        recon_loss = nn.MSELoss()(kin_pred, kin_target)
+        recon_loss = nn.MSELoss()(kin_pred[..., :2], kin_target[..., :2])
         corr_loss = pearson_correlation_loss(kin_pred, kin_target)
         accel_loss = acceleration_penalty(kin_pred)
         loss = recon_loss + 0.1 * corr_loss + 0.01 * accel_loss
@@ -175,17 +171,24 @@ def validate(mae_model, kin_decoder, dataloader, device):
         total_loss += loss.item() * batch_size
         total_samples += batch_size
 
-        # Accumulate R² components
-        ss_res, sum_y, sum_y_sq, count = get_r2_components(kin_pred, kin_target)
-        total_ss_res += ss_res
-        total_sum_y += sum_y
-        total_sum_y_sq += sum_y_sq
-        total_count += count
+        # Accumulate per-session predictions (first 2 channels = evaluated positions)
+        pred_np = kin_pred[..., :2].cpu().numpy()    # (B, W, 2)
+        target_np = kin_target[..., :2].cpu().numpy() # (B, W, 2)
+        for i, sid in enumerate(session_ids):
+            if sid not in session_preds:
+                session_preds[sid] = []
+                session_targets[sid] = []
+            session_preds[sid].append(pred_np[i])    # (W, 2)
+            session_targets[sid].append(target_np[i])
 
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
     avg_loss = total_loss / max(total_samples, 1)
-    r2 = calculate_global_r2(total_ss_res, total_sum_y, total_sum_y_sq, total_count)
+
+    # Concatenate windows per session then compute Kaggle-aligned R²
+    all_preds   = [np.clip(np.concatenate(session_preds[s],   axis=0), 0, 1) for s in session_preds]
+    all_targets = [np.concatenate(session_targets[s], axis=0) for s in session_targets]
+    r2 = calculate_per_session_r2(all_preds, all_targets)
 
     return avg_loss, r2
 
