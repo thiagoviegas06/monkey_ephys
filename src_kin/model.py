@@ -18,7 +18,7 @@ class ChannelAttention(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(d_model, d_model // reduction, bias=False),
             nn.ReLU(inplace=True),
-            nn.Linear(d_model // reduction, d_model, bias=False)
+            nn.Linear(d_model // reduction, num_channels, bias=False)
         )
         self.sigmoid = nn.Sigmoid()
 
