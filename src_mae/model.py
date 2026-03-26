@@ -170,26 +170,26 @@ class SBP_TCN_Transformer(nn.Module):
         mask_exp = mask.transpose(1, 2).unsqueeze(-1)       
         x_tcn = torch.cat([sbp_exp, mask_exp], dim=-1).reshape(B * C, W, 2).transpose(1, 2)
         
-        x = self.tcn(x_tcn).transpose(1, 2).view(B, C, W, self.d_model) # (B, C, W, d_model)
+        x = self.tcn(x_tcn).transpose(1, 2).reshape(B, C, W, self.d_model) # (B, C, W, d_model)
         
         # PHASE 2: INTERLEAVED AXIAL ENCODER
-        spat_pad_mask = mask.view(B * W, C).bool()
+        spat_pad_mask = mask.reshape(B * W, C).bool()
         
         for layer in self.axial_layers:
             # A. Temporal Attention (Across W)
-            x = x.view(B * C, W, self.d_model)
+            x = x.reshape(B * C, W, self.d_model)
             x = self.temp_pos_encoding(x)
             x = layer['temp'](x)
             
             # B. Spatial Attention (Across C)
-            x = x.view(B, C, W, self.d_model).permute(0, 2, 1, 3).reshape(B * W, C, self.d_model)
+            x = x.reshape(B, C, W, self.d_model).permute(0, 2, 1, 3).reshape(B * W, C, self.d_model)
             x = x + self.channel_embeddings
             x = layer['spat'](x, src_key_padding_mask=spat_pad_mask)
             
             # Reshape back to (B, C, W, d_model) for next temporal pass
-            x = x.view(B, W, C, self.d_model).permute(0, 2, 1, 3)
+            x = x.reshape(B, W, C, self.d_model).permute(0, 2, 1, 3)
             
-        enc_out = self.enc_norm(x.view(B, C, W, self.d_model).permute(0, 2, 1, 3).reshape(B * W, C, self.d_model))
+        enc_out = self.enc_norm(x.reshape(B, C, W, self.d_model).permute(0, 2, 1, 3).reshape(B * W, C, self.d_model))
         
         # PHASE 3: ASYMMETRIC DECODER
         mask_tokens = self.mask_token.expand(B * W, C, -1) + self.channel_embeddings
@@ -200,7 +200,7 @@ class SBP_TCN_Transformer(nn.Module):
         dec_out = self.decoder(dec_in)
         
         # PHASE 4: PROJECTION & UN-NORMALIZATION
-        pred_norm = self.output_proj(dec_out).view(B, W, C)
+        pred_norm = self.output_proj(dec_out).reshape(B, W, C)
         pred_unnorm = (pred_norm * sbp_std) + sbp_mean
         
         return torch.where(mask.bool(), pred_unnorm, sbp_masked)

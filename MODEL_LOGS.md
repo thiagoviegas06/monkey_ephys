@@ -34,5 +34,14 @@
     - `early_stopping_patience`: 8 (Increased for slower convergence)
     - **Masking**: Fixed span lengths 20-50 (Corrected for window 200)
 - **Results**:
-    - *Awaiting training results*
-- **Improvements**: Corrected masking logic, slightly deeper spatial transformer, and optimized TCN receptive field for better memory/performance balance.
+    - **Best Val NMSE**: 0.769786 (Epoch 22)
+    - **Train NMSE**: 0.752154 (Epoch 22)
+    - **Status**: Plateauing after ~20 epochs.
+- **Key Insights**:
+    - **Underfitting**: Very tight Train/Val gap (< 0.02) indicates the model has capacity to grow.
+    - **Instability**: Validation spikes (e.g., Epoch 5, 16) suggest sensitivity to batch-level variance or specific sessions.
+    - **Performance Ceiling**: Baseline NMSE (~0.77) is dominated by Phase 2-style channel dropout (full channel masking).
+- **Next Steps**:
+    - Increase `d_model` to 192 and `num_axial_layers` to 6.
+    - Increase `batch_size` to 128 to stabilize gradients and session statistics.
+    - Log Channel vs. Span NMSE separately to isolate the bottleneck.

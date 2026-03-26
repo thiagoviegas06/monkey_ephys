@@ -1,4 +1,8 @@
 import torch
+import os
+
+# Get the project root directory (one level up from src_kin)
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ============================================================================
 # Configuration file for Phase 2 Kinematic Decoder training
@@ -7,10 +11,7 @@ class Config:
     """Training configuration - modify these parameters as needed"""
     
     # Data Paths
-    data_path = "kaggle_data_phase2"
-    
-    # Pre-trained MAE Model for imputation
-    mae_checkpoint_path = "checkpoints_200/best_model_tcn_transformer.pt"
+    data_path = os.path.join(ROOT_DIR, "kaggle_data_phase2")
     
     # SBP_TCN_Transformer Hyperparameters (must match the saved checkpoint)
     window_size = 200
@@ -22,6 +23,9 @@ class Config:
     num_decoder_layers = 2
     tcn_levels = 6  
     dropout = 0.1  
+    
+    # Pre-trained MAE Model for imputation
+    mae_checkpoint_path = os.path.join(ROOT_DIR, f"checkpoints_{window_size}", "best_model_tcn_transformer.pt")
     
     # Seed
     seed = 42
@@ -57,7 +61,7 @@ class Config:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Checkpoints
-    checkpoint_dir = "checkpoints_kin"
+    checkpoint_dir = os.path.join(ROOT_DIR, "checkpoints_kin")
     save_every = 5  
     
     # Logging
