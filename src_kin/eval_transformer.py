@@ -166,6 +166,16 @@ def main():
         sbp_path = os.path.join(test_dir, f"{session_id}_sbp.npy")
         sbp = np.load(sbp_path).astype(np.float32)  # (N, 96)
 
+        # Per-session z-score — must match MAE training preprocessing
+        # Compute stats only on visible (non-zero) channels to avoid masked channels
+        # pulling the mean/std toward zero
+        channel_active = (sbp != 0.0).any(axis=0)  # (96,) — False for fully-masked channels
+        if channel_active.any():
+            sbp_mean = np.where(channel_active, sbp.mean(axis=0), 0.0)
+            sbp_std  = np.where(channel_active, sbp.std(axis=0) + 1e-5, 1.0)
+            sbp = (sbp - sbp_mean) / sbp_std
+            sbp[:, ~channel_active] = 0.0  # keep masked channels at zero
+
         preds = predict_session(mae, decoder, sbp, kin_config.window_size, device)
 
         idx = sub["session_id"] == session_id

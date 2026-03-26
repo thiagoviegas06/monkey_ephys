@@ -75,9 +75,14 @@ def get_dataloaders(config, val_split=0.2, shuffle=True, num_workers=4, pin_memo
         sbp, kin = session.load_data()
         if sbp is None or sbp.shape[0] < config.window_size:
             continue
-            
+
+        # Per-session z-score normalization — must match MAE training preprocessing
+        sbp_mean = sbp.mean(axis=0)        # (96,)
+        sbp_std = sbp.std(axis=0) + 1e-5   # (96,)
+        sbp_norm = (sbp - sbp_mean) / sbp_std
+
         session_dict = {
-            "sbp": sbp,
+            "sbp": sbp_norm,
             "kin": kin,
             "N": sbp.shape[0],
             "session_id": session.session_id,
