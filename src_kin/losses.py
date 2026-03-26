@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 def pearson_correlation_loss(y_pred, y_true):
     """
@@ -72,6 +73,26 @@ def lfads_loss(kin_pred, kin_target, mu, logvar, step, config, sbp_pred=None, sb
         "sbp_loss": sbp_loss,
         "beta": 0.0
     }
+
+def calculate_per_session_r2(all_preds, all_targets):
+    """
+    Computes mean R² per session per channel — matches Kaggle's evaluation.
+
+    Args:
+        all_preds:   list of (N_i, 2) numpy arrays, one per session
+        all_targets: list of (N_i, 2) numpy arrays, one per session
+
+    Returns:
+        mean R² across sessions and channels (scalar)
+    """
+    r2s = []
+    for pred, target in zip(all_preds, all_targets):
+        for ch in range(pred.shape[1]):
+            ss_res = np.sum((target[:, ch] - pred[:, ch]) ** 2)
+            ss_tot = np.sum((target[:, ch] - target[:, ch].mean()) ** 2) + 1e-8
+            r2s.append(1.0 - ss_res / ss_tot)
+    return float(np.mean(r2s))
+
 
 def calculate_r2(y_pred, y_true):
     """
