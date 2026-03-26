@@ -92,7 +92,7 @@ def train_one_epoch(mae_model, kin_decoder, dataloader, optimizer, device):
     pbar = tqdm(dataloader, desc="Training")
 
     for batch in pbar:
-        x_sbp = batch["x_sbp"].to(device)  # (B, W, 96)
+        x_sbp = batch["sbp_masked"].to(device)  # (B, W, 96)
         kin_target = batch["kin"].to(device)  # (B, W, 4)
         mask = batch["mask"].to(device).float()  # (B, W, 96)
 
@@ -152,7 +152,7 @@ def validate(mae_model, kin_decoder, dataloader, device):
     pbar = tqdm(dataloader, desc="Validation")
 
     for batch in pbar:
-        x_sbp = batch["x_sbp"].to(device)
+        x_sbp = batch["sbp_masked"].to(device)
         kin_target = batch["kin"].to(device)
         mask = batch["mask"].to(device).float()
 
