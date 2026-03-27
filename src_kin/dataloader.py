@@ -46,6 +46,25 @@ class KinematicsDataset(Dataset):
             # Random masking per window — prevents decoder from memorizing
             # session identity via fixed mask patterns
             channels_to_mask = np.random.choice(num_channels, size=num_to_mask, replace=False)
+
+            # Additional random channel dropout (5-15% extra) — varies masking
+            # ratio per window so model is robust to different amounts of missing data
+            extra_candidates = np.setdiff1d(np.arange(num_channels), channels_to_mask)
+            num_extra = np.random.randint(0, max(1, int(num_channels * 0.15)))
+            if num_extra > 0 and len(extra_candidates) >= num_extra:
+                extra_channels = np.random.choice(extra_candidates, size=num_extra, replace=False)
+                channels_to_mask = np.concatenate([channels_to_mask, extra_channels])
+
+            sbp_w[:, channels_to_mask] = 0.0
+            mask[:, channels_to_mask] = True
+
+            # Gaussian noise augmentation on visible channels — simulates
+            # recording variability across sessions (applied after masking
+            # so noise is only added to observed values)
+            noise_std = np.random.uniform(0.0, 0.1)
+            visible = ~mask.bool()
+            sbp_w[visible] += torch.randn(visible.sum()) * noise_std
+
         else:
             # Session-seeded masking for val — matches test distribution
             # where the same channels are masked for the whole session
@@ -53,8 +72,8 @@ class KinematicsDataset(Dataset):
             rng = np.random.RandomState(hash(session_id) & 0xFFFFFFFF)
             channels_to_mask = rng.choice(num_channels, size=num_to_mask, replace=False)
 
-        sbp_w[:, channels_to_mask] = 0.0
-        mask[:, channels_to_mask] = True
+            sbp_w[:, channels_to_mask] = 0.0
+            mask[:, channels_to_mask] = True
 
         item = {
             "sbp_masked": sbp_w,
