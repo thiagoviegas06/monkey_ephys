@@ -71,7 +71,7 @@ def build_kin_decoder(d_model=64, window_size=300, device='cpu'):
         num_temporal_layers=2,
         num_heads=8,
         output_dim=4,
-        dropout=0.3
+        dropout=0.1
     )
     return decoder.to(device)
 
@@ -246,7 +246,7 @@ def main():
     print(f"✓ Data loaded")
 
     # Optimizer
-    optimizer = torch.optim.AdamW(kin_decoder.parameters(), lr=args.lr, weight_decay=1e-3)
+    optimizer = torch.optim.AdamW(kin_decoder.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=3, verbose=True
     )

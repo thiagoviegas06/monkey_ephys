@@ -36,7 +36,7 @@ class Config:
     batch_size = 128
     learning_rate = 1e-3
     weight_decay = 1e-4
-    num_epochs = 30  # Total: 20 frozen + 10 unfrozen
+    num_epochs = 50  # Total: 20 frozen + 10 unfrozen
 
     # Two-Stage Training
     frozen_epochs = 20  # Train LSTM only (MAE frozen)
@@ -51,7 +51,7 @@ class Config:
     acceleration_weight = 0.1 # Light smoothing penalty (prevents jitter, doesn't over-constrain)
     
     # Window stride for training (sliding window step size)
-    window_step_size = 50  # 25% overlap, proportional to window_size=200
+    window_step_size = 200  # no overlap, fully independent windows
 
     # Smoothing
     smoothing_kernel_size = 5 # Kernel size for moving average smoothing
