@@ -10,7 +10,7 @@
     - `num_decoder_layers`: 2
     - `tcn_levels`: 6
     - `learning_rate`: 1e-3
-    - `batch_size`: 128
+    - `batch_size`: 32
     - `early_stopping_patience`: 5
     - **Masking**: Span lengths 45-85 (Buggy for window 200)
 - **Results**:
@@ -30,18 +30,16 @@
     - `num_decoder_layers`: 2
     - `tcn_levels`: 5 (Reduced to save memory, RF ~125)
     - `learning_rate`: 7e-4 (Lower for stability)
-    - `batch_size`: 128
+    - `batch_size`: 32
     - `early_stopping_patience`: 8 (Increased for slower convergence)
     - **Masking**: Fixed span lengths 20-50 (Corrected for window 200)
 - **Results**:
-    - **Best Val NMSE**: 0.769786 (Epoch 22)
-    - **Train NMSE**: 0.752154 (Epoch 22)
-    - **Status**: Plateauing after ~20 epochs.
+    - **Best Val NMSE**: 0.761353 (Epoch 27)
+    - **Train NMSE**: 0.746852 (Epoch 27)
+    - **Status**: Plateauing after ~20 epochs and slowly improving after.
 - **Key Insights**:
     - **Underfitting**: Very tight Train/Val gap (< 0.02) indicates the model has capacity to grow.
-    - **Instability**: Validation spikes (e.g., Epoch 5, 16) suggest sensitivity to batch-level variance or specific sessions.
     - **Performance Ceiling**: Baseline NMSE (~0.77) is dominated by Phase 2-style channel dropout (full channel masking).
 - **Next Steps**:
     - Increase `d_model` to 192 and `num_axial_layers` to 6.
-    - Increase `batch_size` to 128 to stabilize gradients and session statistics.
     - Log Channel vs. Span NMSE separately to isolate the bottleneck.

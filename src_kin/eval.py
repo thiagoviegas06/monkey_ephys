@@ -111,16 +111,26 @@ def predict_session(mae, kinematic_model, sbp, config, kin_mean, kin_std, sbp_me
         macro_timestamp = torch.tensor([[w0]], dtype=torch.float32, device=config.device)
         session_num = torch.tensor([[num_id]], dtype=torch.float32, device=config.device)
         
-        # Impute missing neural activity
+        # Impute missing neural activity or extract embeddings
         # Expand global stats to (1, sbp_channels) for the window
         channel_mean = sbp_mean.view(1, 1).expand(1, config.sbp_channels) if sbp_mean is not None else None
         channel_var = (sbp_std**2).view(1, 1).expand(1, config.sbp_channels) if sbp_std is not None else None
-        
-        sbp_imputed = mae(sbp_w, mask, macro_timestamp, channel_mean=channel_mean, channel_var=channel_var)
-        
+
+        if getattr(config, 'use_mae_embeddings', False):
+            # Get embeddings from MAE (returns 1, W, C, d_model)
+            mae_out = mae(sbp_w, mask, macro_timestamp.unsqueeze(-1), 
+                         channel_mean=channel_mean, 
+                         channel_var=channel_var,
+                         return_embeddings=True)
+        else:
+            # Get imputed SBP
+            mae_out = mae(sbp_w, mask, macro_timestamp.unsqueeze(-1), 
+                         channel_mean=channel_mean, 
+                         channel_var=channel_var)
+
         # Decode kinematics
         kin_pred, _, _, _ = kinematic_model(
-            sbp_imputed, 
+            mae_out, 
             mask=mask, 
             session_num=session_num, 
             macro_timestamp=macro_timestamp.squeeze(-1), 

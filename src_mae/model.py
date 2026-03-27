@@ -142,7 +142,7 @@ class SBP_TCN_Transformer(nn.Module):
         nn.init.xavier_uniform_(self.output_proj.weight, gain=0.1)
         nn.init.zeros_(self.output_proj.bias)
 
-    def forward(self, sbp_masked, mask, macro_time, channel_mean=None, channel_var=None):
+    def forward(self, sbp_masked, mask, macro_time, channel_mean=None, channel_var=None, return_embeddings=False):
         B, W, C = sbp_masked.shape
         
         # PHASE 0: NORMALIZATION (Session-Aware)
@@ -198,6 +198,9 @@ class SBP_TCN_Transformer(nn.Module):
         
         dec_in = torch.where(spat_pad_mask.unsqueeze(-1), mask_tokens, enc_out)
         dec_out = self.decoder(dec_in)
+        
+        if return_embeddings:
+            return dec_out.reshape(B, W, C, self.d_model)
         
         # PHASE 4: PROJECTION & UN-NORMALIZATION
         pred_norm = self.output_proj(dec_out).reshape(B, W, C)

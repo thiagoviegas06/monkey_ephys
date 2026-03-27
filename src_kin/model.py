@@ -24,16 +24,26 @@ class PerceiverIOKinematicDecoder(nn.Module):
         self.d_model = config.perceiver_d_model
         self.latent_dim = config.perceiver_latent_dim
         
+        # MAE Embedding Configuration
+        self.use_mae_embeddings = getattr(config, 'use_mae_embeddings', False)
+        self.mae_embedding_type = getattr(config, 'mae_embedding_type', 'pooled')
+        
+        if self.use_mae_embeddings:
+            # MAE d_model is 192 (from src_mae/config.py, also in src_kin/config.py)
+            self.input_dim = config.d_model 
+        else:
+            self.input_dim = config.sbp_channels
+
         # FiLM Generator MLP
-        # Takes normalized session_num (1D) and outputs gamma, beta (each size sbp_channels)
+        # Takes normalized session_num (1D) and outputs gamma, beta (each size input_dim)
         self.film_mlp = nn.Sequential(
             nn.Linear(1, 32),
             nn.SiLU(),
-            nn.Linear(32, config.sbp_channels * 2)
+            nn.Linear(32, self.input_dim * 2)
         )
         
-        # Maps 96 channels to D_model
-        self.input_proj = nn.Linear(config.sbp_channels, self.d_model)
+        # Maps input features to D_model
+        self.input_proj = nn.Linear(self.input_dim, self.d_model)
         
         # Positional Encoding for time
         self.pos_encoder = PositionalEncoding(self.d_model)
@@ -88,37 +98,51 @@ class PerceiverIOKinematicDecoder(nn.Module):
         self.window_size = config.window_size
 
     def forward(self, x, mask=None, session_num=None, macro_timestamp=None, sbp_mean=None, sbp_std=None):
+        # Handle 4D input (Full MAE embeddings: B, W, C, d_mae)
+        if x.dim() == 4:
+            batch_size, seq_len, num_channels, feat_dim = x.size()
+            # If we want to use 'pooled' but got 'full', we pool here
+            if self.mae_embedding_type == 'pooled':
+                x = x.mean(dim=2)
+            else:
+                # Treat each channel as a separate token at each time bin
+                # Reshape to (Batch, W * C, feat_dim)
+                x = x.reshape(batch_size, seq_len * num_channels, feat_dim)
+        
         batch_size, seq_len, _ = x.size()
         
-        if mask is None:
-            mask = (x == 0.0).float()
-            
-        # Normalize SBP 
-        visible_mask = (~mask.bool()).float()
-        
-        if sbp_mean is not None and sbp_std is not None:
-            mean = sbp_mean.to(x.device).view(1, 1, -1)
-            std = sbp_std.to(x.device).view(1, 1, -1)
+        if self.use_mae_embeddings:
+            # Skip SBP normalization for high-level embeddings
+            x_norm = x
         else:
-            num_visible = visible_mask.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
-            mean = (x * visible_mask).sum(dim=(1, 2), keepdim=True) / num_visible
-            var = (((x - mean) * visible_mask) ** 2).sum(dim=(1, 2), keepdim=True) / num_visible
-            std = torch.sqrt(var + 1e-4)
+            if mask is None:
+                mask = (x == 0.0).float()
+                
+            # Normalize SBP 
+            visible_mask = (~mask.bool()).float()
             
-        x_norm = ((x - mean) / std) * visible_mask
+            if sbp_mean is not None and sbp_std is not None:
+                mean = sbp_mean.to(x.device).view(1, 1, -1)
+                std = sbp_std.to(x.device).view(1, 1, -1)
+            else:
+                num_visible = visible_mask.sum(dim=(1, 2), keepdim=True).clamp(min=1.0)
+                mean = (x * visible_mask).sum(dim=(1, 2), keepdim=True) / num_visible
+                var = (((x - mean) * visible_mask) ** 2).sum(dim=(1, 2), keepdim=True) / num_visible
+                std = torch.sqrt(var + 1e-4)
+                
+            x_norm = ((x - mean) / std) * visible_mask
         
         # FiLM Modulation
         if session_num is None:
             session_num = torch.zeros(batch_size, 1, device=x.device)
         
         session_norm = session_num / self.max_session_num
-        film_params = self.film_mlp(session_norm) # (Batch, 96*2)
+        film_params = self.film_mlp(session_norm) # (Batch, input_dim*2)
         gamma, beta = torch.chunk(film_params, 2, dim=-1)
-        # gamma, beta: (Batch, 96). Expand to (Batch, 1, 96)
         gamma = gamma.unsqueeze(1)
         beta = beta.unsqueeze(1)
         
-        # Apply FiLM: 1.0 + gamma acts as scale centered at 1
+        # Apply FiLM
         x_mod = x_norm * (1.0 + gamma) + beta
         
         # Map modulated input to D_model
@@ -131,7 +155,16 @@ class PerceiverIOKinematicDecoder(nn.Module):
         if macro_timestamp.dim() == 2:
             macro_timestamp = macro_timestamp.squeeze(-1) # (Batch,)
             
-        time_offsets = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+        # Adjust time offsets if seq_len has changed (e.g. for 'full' embeddings)
+        if self.use_mae_embeddings and self.mae_embedding_type == 'full':
+            # For full embeddings, we have W * C tokens. 
+            # We can repeat the time offset for each channel.
+            W = self.window_size
+            C = x.size(1) // W
+            time_offsets = torch.arange(W, device=x.device).repeat_interleave(C).unsqueeze(0).expand(batch_size, -1)
+        else:
+            time_offsets = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+            
         absolute_time = macro_timestamp.unsqueeze(-1) + time_offsets # (Batch, SeqLen)
         
         pos_emb = self.pos_encoder(x_proj, absolute_time) # (Batch, SeqLen, D_model)
@@ -153,7 +186,15 @@ class PerceiverIOKinematicDecoder(nn.Module):
         latents = self.processor(latents)
         
         # Decode (Cross-Attention)
-        output_queries = self.query_proj(pos_emb) # (Batch, SeqLen, D_model)
+        # For full embeddings, we might still only want W output predictions.
+        if self.use_mae_embeddings and self.mae_embedding_type == 'full':
+             # We need query tokens for each of the W time bins.
+             # One way is to take the first token of each time bin's C tokens.
+             W = self.window_size
+             C = x.size(1) // W
+             output_queries = self.query_proj(pos_emb[:, ::C, :]) # (Batch, W, D_model)
+        else:
+             output_queries = self.query_proj(pos_emb) # (Batch, SeqLen, D_model)
         
         q_dec = self.decoder_norm1(output_queries)
         kv_dec = self.decoder_norm2(latents)

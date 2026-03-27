@@ -25,6 +25,8 @@ class Config:
     
     # Pre-trained MAE Model for imputation
     mae_checkpoint_path = os.path.join(ROOT_DIR, f"checkpoints_{window_size}", "best_model_tcn_transformer.pt")
+    use_mae_embeddings = True # Set to True to use MAE embeddings instead of raw SBP
+    mae_embedding_type = 'pooled' # 'pooled' or 'full'
     
     # Seed
     seed = 42
@@ -42,16 +44,16 @@ class Config:
     
     # Training
     batch_size = 128
-    learning_rate = 1e-3
+    learning_rate = 2e-3
     weight_decay = 1e-4
     num_epochs = 50
     early_stopping_patience = 7  
     early_stopping_min_delta = 1e-5  
     
     # Loss Hyperparameters
-    kin_recon_weight = 50.0 # Weight for the kinematic reconstruction loss
-    correlation_weight = 10.0 # Weight for the Pearson correlation loss
-    acceleration_weight = 1.0 # Weight for the acceleration penalty (smoothing)
+    kin_recon_weight = 1.0 # Weight for the kinematic reconstruction loss
+    correlation_weight = 0.1 # Weight for the Pearson correlation loss
+    acceleration_weight = 0.01 # Weight for the acceleration penalty (smoothing)
     
     # Smoothing
     smoothing_kernel_size = 5 # Kernel size for moving average smoothing

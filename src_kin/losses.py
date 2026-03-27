@@ -44,12 +44,12 @@ def acceleration_penalty(y_pred):
 def kinematic_perceiver_loss(kin_pred, kin_target, config):
     """
     Computes the enhanced loss for the Perceiver IO Kinematic Decoder.
-    Loss = kin_recon_weight * MSE(Kinematics) 
+    Loss = kin_recon_weight * MSE(Kinematics[..., :2]) 
            + correlation_weight * Pearson_Loss
            + acceleration_weight * Acceleration_Penalty
     """
-    # 1. Kinematic Reconstruction (MSE)
-    recon_loss = F.mse_loss(kin_pred, kin_target)
+    # 1. Kinematic Reconstruction (MSE) - Focused on evaluated channels
+    recon_loss = F.mse_loss(kin_pred[..., :2], kin_target[..., :2])
     
     # 2. Pearson Correlation Loss
     corr_loss = pearson_correlation_loss(kin_pred, kin_target)
