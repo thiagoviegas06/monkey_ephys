@@ -99,7 +99,8 @@ class KinematicDecoderTransformer(nn.Module):
             dim_feedforward=d_model * 4,
             dropout=dropout,
             batch_first=True,
-            activation='gelu'
+            activation='gelu',
+            norm_first=True
         )
         self.temporal_attention = nn.TransformerEncoder(
             temporal_layer,

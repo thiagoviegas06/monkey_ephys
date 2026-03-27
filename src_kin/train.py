@@ -246,11 +246,11 @@ def main():
     
     # Compute global statistics for kinematics
     print("Computing kinematics statistics...")
-    kin_mean, kin_std = compute_kin_stats(config.data_path)
+    kin_mean, kin_std = compute_kin_stats(config.data_path, getattr(config, 'phase1_data_path', None))
     
     # Compute global statistics for SBP
     print("Computing SBP statistics...")
-    sbp_mean, sbp_std = compute_sbp_stats(config.data_path)
+    sbp_mean, sbp_std = compute_sbp_stats(config.data_path, getattr(config, 'phase1_data_path', None))
     
     best_val_recon = float('inf')
     epochs_without_improvement = 0

@@ -9,10 +9,15 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src_kin.preprocessing import SessionDataPhase2
 
-def compute_kin_stats(data_path):
+def compute_kin_stats(data_path, phase1_data_path=None):
     session_manager = SessionDataPhase2(data_path, is_train=True)
     sessions = session_manager.generate_session_obj()
     
+    if phase1_data_path and os.path.exists(phase1_data_path):
+        session_manager_p1 = SessionDataPhase2(phase1_data_path, is_train=True)
+        sessions_p1 = session_manager_p1.generate_session_obj(source_name="phase1")
+        sessions.extend(sessions_p1)
+        
     all_kin = []
     for session in tqdm(sessions, desc="Loading kinematics for stats"):
         _, kin = session.load_data()
@@ -30,10 +35,15 @@ def compute_kin_stats(data_path):
     # Return as tensors for easy use in training loop
     return torch.tensor(mean, dtype=torch.float32), torch.tensor(std, dtype=torch.float32)
 
-def compute_sbp_stats(data_path):
+def compute_sbp_stats(data_path, phase1_data_path=None):
     session_manager = SessionDataPhase2(data_path, is_train=True)
     sessions = session_manager.generate_session_obj()
     
+    if phase1_data_path and os.path.exists(phase1_data_path):
+        session_manager_p1 = SessionDataPhase2(phase1_data_path, is_train=True)
+        sessions_p1 = session_manager_p1.generate_session_obj(source_name="phase1")
+        sessions.extend(sessions_p1)
+        
     all_sbp_means = []
     all_sbp_vars = []
     all_counts = []

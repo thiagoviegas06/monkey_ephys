@@ -40,7 +40,7 @@ class Config:
     
     # Training
     batch_size = 128
-    learning_rate = 2e-3
+    learning_rate = 3e-4
     weight_decay = 1e-4
     num_epochs = 50
     early_stopping_patience = 7  
