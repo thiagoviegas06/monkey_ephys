@@ -8,7 +8,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src_kin.config import Config
-from src_kin.model import PerceiverIOKinematicDecoder
+from src_kin.model import KinematicDecoderTransformer
 from src_mae.model import SBP_TCN_Transformer
 from src_kin.preprocessing import SessionDataPhase2
 from src_kin.compute_kin_stats import compute_kin_stats
@@ -27,8 +27,17 @@ def build_models(config):
     mae.load_state_dict(torch.load(config.mae_checkpoint_path, map_location=config.device)['model_state_dict'])
     mae.eval()
 
-    # Perceiver IO Kinematic Decoder
-    kinematic_model = PerceiverIOKinematicDecoder(config).to(config.device)
+    # Kinematic Decoder Transformer
+    kinematic_model = KinematicDecoderTransformer(
+        d_model=config.d_model,
+        window_size=config.window_size,
+        num_channels=config.sbp_channels,
+        num_temporal_layers=config.decoder_num_temporal_layers,
+        num_heads=config.decoder_num_heads,
+        output_dim=config.output_dim,
+        dropout=config.decoder_dropout
+    ).to(config.device)
+    
     best_model_path = os.path.join(config.checkpoint_dir, "best_model_perceiver.pt")
     
     # Need to handle case if checkpoint doesn't exist yet gracefully
@@ -118,25 +127,18 @@ def predict_session(mae, kinematic_model, sbp, config, kin_mean, kin_std, sbp_me
 
         if getattr(config, 'use_mae_embeddings', False):
             # Get embeddings from MAE (returns 1, W, C, d_model)
-            mae_out = mae(sbp_w, mask, macro_timestamp.unsqueeze(-1), 
+            mae_out = mae(sbp_w, mask, macro_timestamp, 
                          channel_mean=channel_mean, 
                          channel_var=channel_var,
                          return_embeddings=True)
         else:
             # Get imputed SBP
-            mae_out = mae(sbp_w, mask, macro_timestamp.unsqueeze(-1), 
+            mae_out = mae(sbp_w, mask, macro_timestamp, 
                          channel_mean=channel_mean, 
                          channel_var=channel_var)
 
         # Decode kinematics
-        kin_pred, _, _, _ = kinematic_model(
-            mae_out, 
-            mask=mask, 
-            session_num=session_num, 
-            macro_timestamp=macro_timestamp.squeeze(-1), 
-            sbp_mean=sbp_mean, 
-            sbp_std=sbp_std
-        )
+        kin_pred = kinematic_model(mae_out)
         
         # Un-normalize kinematics (Global Z-Score)
         kin_pred = kin_pred * kin_std + kin_mean

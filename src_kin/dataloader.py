@@ -33,10 +33,20 @@ class KinematicsDataset(Dataset):
         sess_idx, w0 = self.windows[idx]
         session = self.sessions_data[sess_idx]
         
-        sbp_w = torch.from_numpy(session["sbp"][w0:w0 + self.window_size])
+        sbp_w = torch.from_numpy(session["sbp"][w0:w0 + self.window_size]).clone()
         
+        # Determine source and apply masking if Phase 1
+        is_phase1 = session.get("source_name", "phase2") == "phase1"
+        
+        if is_phase1 and self.is_train:
+            # Randomly mask 30% of channels for Phase 1 data (replicate Phase 2)
+            C = sbp_w.shape[1]
+            num_to_mask = int(C * 0.3)
+            # Mask the same channels across the entire window (like Phase 2)
+            masked_channels = torch.randperm(C)[:num_to_mask]
+            sbp_w[:, masked_channels] = 0.0
+            
         # Calculate mask: True where channels are fully 0.
-        # Since Phase 2 0s out channels completely for the session:
         mask = (sbp_w == 0.0)
         
         # Extract numerical session ID for Perceiver IO
@@ -61,12 +71,14 @@ class KinematicsDataset(Dataset):
 
 def get_dataloaders(config, val_split=0.2, shuffle=True, num_workers=4, pin_memory=False):
     print("Loading full sessions into RAM...")
-    session_manager = SessionDataPhase2(config.data_path, is_train=True)
-    sessions = session_manager.generate_session_obj()
     
     all_sessions_data = []
     
-    for session in tqdm(sessions, desc="Processing Phase 2 sessions"):
+    # --- Load Phase 2 Sessions ---
+    session_manager_p2 = SessionDataPhase2(config.data_path, is_train=True)
+    sessions_p2 = session_manager_p2.generate_session_obj(source_name="phase2")
+    
+    for session in tqdm(sessions_p2, desc="Processing Phase 2 sessions"):
         sbp, kin = session.load_data()
         if sbp is None or sbp.shape[0] < config.window_size:
             continue
@@ -76,8 +88,28 @@ def get_dataloaders(config, val_split=0.2, shuffle=True, num_workers=4, pin_memo
             "kin": kin,
             "N": sbp.shape[0],
             "session_id": session.session_id,
+            "source_name": "phase2"
         }
         all_sessions_data.append(session_dict)
+
+    # --- Load Phase 1 Sessions ---
+    if hasattr(config, 'phase1_data_path') and os.path.exists(config.phase1_data_path):
+        session_manager_p1 = SessionDataPhase2(config.phase1_data_path, is_train=True)
+        sessions_p1 = session_manager_p1.generate_session_obj(source_name="phase1")
+        
+        for session in tqdm(sessions_p1, desc="Processing Phase 1 sessions"):
+            sbp, kin = session.load_data()
+            if sbp is None or sbp.shape[0] < config.window_size:
+                continue
+                
+            session_dict = {
+                "sbp": sbp,
+                "kin": kin,
+                "N": sbp.shape[0],
+                "session_id": session.session_id,
+                "source_name": "phase1"
+            }
+            all_sessions_data.append(session_dict)
         
     print(f"Loaded {len(all_sessions_data)} full sessions into RAM.")
     

@@ -12,6 +12,7 @@ class Config:
     
     # Data Paths
     data_path = os.path.join(ROOT_DIR, "kaggle_data_phase2")
+    phase1_data_path = os.path.join(ROOT_DIR, "kaggle_data")
     
     # SBP_TCN_Transformer Hyperparameters (must match the saved checkpoint)
     window_size = 200
@@ -26,21 +27,16 @@ class Config:
     # Pre-trained MAE Model for imputation
     mae_checkpoint_path = os.path.join(ROOT_DIR, f"checkpoints_{window_size}", "best_model_tcn_transformer.pt")
     use_mae_embeddings = True # Set to True to use MAE embeddings instead of raw SBP
-    mae_embedding_type = 'pooled' # 'pooled' or 'full'
+    mae_embedding_type = 'full' # 'full' is required for the new Transformer decoder
     
     # Seed
     seed = 42
     
-    # Perceiver IO Model Hyperparameters
-    perceiver_latent_dim = 128
-    perceiver_num_latents = 64
-    perceiver_d_model = 128
-    perceiver_cross_heads = 4
-    perceiver_latent_heads = 8
-    perceiver_latent_layers = 6
+    # Kinematic Decoder Transformer Hyperparameters
+    decoder_num_temporal_layers = 2
+    decoder_num_heads = 8
+    decoder_dropout = 0.1
     output_dim = 4 # Outputs 4 kinematics channels
-    perceiver_dropout = 0.1
-    max_session_num = 300 # Used for normalizing the continuous session feature
     
     # Training
     batch_size = 128

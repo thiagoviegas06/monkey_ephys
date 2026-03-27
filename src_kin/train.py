@@ -9,7 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src_kin.config import Config
 from src_kin.dataloader import get_dataloaders
-from src_kin.model import PerceiverIOKinematicDecoder
+from src_kin.model import KinematicDecoderTransformer
 from src_kin.losses import kinematic_perceiver_loss, get_r2_components, calculate_global_r2
 from src_mae.model import SBP_TCN_Transformer
 from src_kin.compute_kin_stats import compute_kin_stats, compute_sbp_stats
@@ -38,7 +38,15 @@ def build_mae_model(config):
     return model
 
 def build_kinematic_model(config):
-    model = PerceiverIOKinematicDecoder(config)
+    model = KinematicDecoderTransformer(
+        d_model=config.d_model,
+        window_size=config.window_size,
+        num_channels=config.sbp_channels,
+        num_temporal_layers=config.decoder_num_temporal_layers,
+        num_heads=config.decoder_num_heads,
+        output_dim=config.output_dim,
+        dropout=config.decoder_dropout
+    )
     return model.to(config.device)
 
 def train_one_epoch(mae_model, kinematic_model, dataloader, optimizer, config, epoch, step, kin_mean=None, kin_std=None, sbp_mean_global=None, sbp_std_global=None):
@@ -97,8 +105,8 @@ def train_one_epoch(mae_model, kinematic_model, dataloader, optimizer, config, e
             # The MAE output (SBP or embeddings) shouldn't have gradients flowing back
             mae_out = mae_out.detach()
             
-        # Phase 2: Perceiver IO Decoder
-        kin_pred, _, _, _ = kinematic_model(mae_out, mask=mask, session_num=session_num, macro_timestamp=macro_timestamp, sbp_mean=sbp_mean_global, sbp_std=sbp_std_global)
+        # Phase 2: Decoder Transformer
+        kin_pred = kinematic_model(mae_out)
         
         # Loss
         loss_dict = kinematic_perceiver_loss(
@@ -191,7 +199,8 @@ def validate_one_epoch(mae_model, kinematic_model, dataloader, config, epoch, st
                                    channel_mean=channel_mean,
                                    channel_var=channel_var)
             
-            kin_pred, _, _, _ = kinematic_model(mae_out, mask=mask, session_num=session_num, macro_timestamp=macro_timestamp, sbp_mean=sbp_mean_global, sbp_std=sbp_std_global)
+            # Phase 2: Decoder Transformer
+            kin_pred = kinematic_model(mae_out)
             
             loss_dict = kinematic_perceiver_loss(
                 kin_pred, kin_target, config
