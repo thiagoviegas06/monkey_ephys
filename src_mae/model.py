@@ -175,6 +175,13 @@ class SBP_TCN_Transformer(nn.Module):
         # PHASE 2: INTERLEAVED AXIAL ENCODER
         spat_pad_mask = mask.reshape(B * W, C).bool()
         
+        # Prevent NaNs if a time bin is fully masked by unmasking at least one channel
+        # We check this once as the mask is constant across axial layers
+        all_masked = spat_pad_mask.all(dim=1)
+        if all_masked.any():
+            spat_pad_mask = spat_pad_mask.clone()
+            spat_pad_mask[all_masked, 0] = False
+            
         for layer in self.axial_layers:
             # A. Temporal Attention (Across W)
             x = x.reshape(B * C, W, self.d_model)
@@ -182,22 +189,15 @@ class SBP_TCN_Transformer(nn.Module):
             x = layer['temp'](x)
             
             # B. Spatial Attention (Across C)
-            x = x.reshape(B, C, W, self.d_model).permute(0, 2, 1, 3).reshape(B * W, C, self.d_model)
+            x = x.reshape(B, C, W, self.d_model).permute(0, 2, 1, 3).contiguous().reshape(B * W, C, self.d_model)
             x = x + self.channel_embeddings
-            
-            # Prevent NaNs if a time bin is fully masked by unmasking at least one channel
-            safe_spat_mask = spat_pad_mask
-            all_masked = spat_pad_mask.all(dim=1)
-            if all_masked.any():
-                safe_spat_mask = spat_pad_mask.clone()
-                safe_spat_mask[all_masked, 0] = False
-                
-            x = layer['spat'](x, src_key_padding_mask=safe_spat_mask)
+            x = layer['spat'](x, src_key_padding_mask=spat_pad_mask)
             
             # Reshape back to (B, C, W, d_model) for next temporal pass
-            x = x.reshape(B, W, C, self.d_model).permute(0, 2, 1, 3)
+            x = x.reshape(B, W, C, self.d_model).permute(0, 2, 1, 3).contiguous()
             
-        enc_out = self.enc_norm(x.reshape(B, C, W, self.d_model).permute(0, 2, 1, 3).reshape(B * W, C, self.d_model))
+        # For the final output, we need (B * W, C, d_model)
+        enc_out = self.enc_norm(x.permute(0, 2, 1, 3).reshape(B * W, C, self.d_model))
         
         # PHASE 3: ASYMMETRIC DECODER
         mask_tokens = self.mask_token.expand(B * W, C, -1) + self.channel_embeddings
