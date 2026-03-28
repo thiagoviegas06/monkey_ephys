@@ -288,5 +288,22 @@ def main():
                 print(f"Early stopping triggered at epoch {epoch}.")
                 break
 
+        # Periodic checkpoint every 3 epochs
+        if epoch % 3 == 0:
+            periodic_path = os.path.join(config.checkpoint_dir, f"kin_decoder_epoch{epoch}.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': kinematic_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'val_recon': val_recon,
+                'val_r2': val_r2,
+                'kin_mean': kin_mean,
+                'kin_std': kin_std,
+                'sbp_mean': sbp_mean,
+                'sbp_std': sbp_std,
+            }, periodic_path)
+            print(f"  Checkpoint saved: {periodic_path}")
+
 if __name__ == "__main__":
     main()

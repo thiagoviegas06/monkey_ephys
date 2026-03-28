@@ -25,7 +25,7 @@ class Config:
     dropout = 0.15  
     
     # Pre-trained MAE Model for imputation
-    mae_checkpoint_path = os.path.join(ROOT_DIR, f"checkpoints_{window_size}", "best_model_tcn_transformer.pt")
+    mae_checkpoint_path = os.path.join(ROOT_DIR, f"checkpoints", "best_model_tcn_transformer.pt")
     use_mae_embeddings = True # Set to True to use MAE embeddings instead of raw SBP
     mae_embedding_type = 'full' # 'full' is required for the new Transformer decoder
     
