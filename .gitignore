@@ -13,6 +13,9 @@ submission.csv
 submission_*.csv
 *.csv
 *.zip
+*png
+*.jpg
+*.jpeg
 
 # Python & Development
 **/__pycache__/

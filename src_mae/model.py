@@ -184,7 +184,15 @@ class SBP_TCN_Transformer(nn.Module):
             # B. Spatial Attention (Across C)
             x = x.reshape(B, C, W, self.d_model).permute(0, 2, 1, 3).reshape(B * W, C, self.d_model)
             x = x + self.channel_embeddings
-            x = layer['spat'](x, src_key_padding_mask=spat_pad_mask)
+            
+            # Prevent NaNs if a time bin is fully masked by unmasking at least one channel
+            safe_spat_mask = spat_pad_mask
+            all_masked = spat_pad_mask.all(dim=1)
+            if all_masked.any():
+                safe_spat_mask = spat_pad_mask.clone()
+                safe_spat_mask[all_masked, 0] = False
+                
+            x = layer['spat'](x, src_key_padding_mask=safe_spat_mask)
             
             # Reshape back to (B, C, W, d_model) for next temporal pass
             x = x.reshape(B, W, C, self.d_model).permute(0, 2, 1, 3)

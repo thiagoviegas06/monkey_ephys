@@ -111,7 +111,11 @@ def predict_session(mae, kinematic_model, sbp, config, kin_mean, kin_std, sbp_me
         # Pad if necessary for the final window
         pad_len = W - (w1 - w0)
         if pad_len > 0:
-            sbp_w = torch.cat([sbp_w, torch.zeros(1, pad_len, config.sbp_channels)], dim=1)
+            # Use replicate padding instead of zero padding to avoid all-masked bins
+            # which cause NaNs in the transformer spatial attention.
+            last_bin = sbp_w[:, -1:, :]
+            padding = last_bin.repeat(1, pad_len, 1)
+            sbp_w = torch.cat([sbp_w, padding], dim=1)
             
         sbp_w = sbp_w.to(config.device)
         mask = (sbp_w == 0.0).float().to(config.device)
