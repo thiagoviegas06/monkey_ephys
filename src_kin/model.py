@@ -34,11 +34,11 @@ class ChannelAttention(nn.Module):
         x = x.contiguous()
         
         # Channel-wise attention: (B*W, C, d_model)
-        # We want to reduce across the d_model dimension to get a per-channel feature
-        # (B*W, C, d_model) -> (B*W, C)
+        # We want to reduce across the channel dimension to get a global feature descriptor
+        # (B*W, C, d_model) -> (B*W, d_model)
         
-        avg_pool = torch.mean(x, dim=-1) # (B*W, C)
-        max_pool = torch.amax(x, dim=-1) # (B*W, C)
+        avg_pool = torch.mean(x, dim=1) # (B*W, d_model)
+        max_pool = torch.amax(x, dim=1) # (B*W, d_model)
 
         # Apply FC layers to learn channel importance
         avg_attn = self.fc(avg_pool)  # (B*W, num_channels)
