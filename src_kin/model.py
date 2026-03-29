@@ -30,22 +30,25 @@ class ChannelAttention(nn.Module):
             x_weighted: (B*W, C, d_model) - channel-weighted features
             attn_weights: (B*W, C, 1) - learned channel importance
         """
+        # Ensure input is contiguous for reduction kernels
+        x = x.contiguous()
+        
         # Channel-wise attention: (B*W, C, d_model)
-        # Compute importance per channel
-        x_transpose = x.transpose(1, 2)  # (B*W, d_model, C)
-
-        avg_pool = self.avg_pool(x_transpose)  # (B*W, d_model, 1)
-        max_pool = self.max_pool(x_transpose)  # (B*W, d_model, 1)
+        # We want to reduce across the d_model dimension to get a per-channel feature
+        # (B*W, C, d_model) -> (B*W, C)
+        
+        avg_pool = torch.mean(x, dim=-1) # (B*W, C)
+        max_pool = torch.amax(x, dim=-1) # (B*W, C)
 
         # Apply FC layers to learn channel importance
-        avg_attn = self.fc(avg_pool.squeeze(-1))  # (B*W, d_model)
-        max_attn = self.fc(max_pool.squeeze(-1))  # (B*W, d_model)
+        avg_attn = self.fc(avg_pool)  # (B*W, num_channels)
+        max_attn = self.fc(max_pool)  # (B*W, num_channels)
 
-        attn = avg_attn + max_attn  # (B*W, d_model)
-        attn = self.sigmoid(attn).unsqueeze(-1)  # (B*W, d_model, 1)
+        attn = avg_attn + max_attn  # (B*W, num_channels)
+        attn = self.sigmoid(attn).unsqueeze(-1)  # (B*W, num_channels, 1)
 
         # Apply attention to features
-        x_weighted = x * attn  # (B*W, C, d_model) broadcast attention across channels
+        x_weighted = x * attn  # (B*W, C, d_model) broadcast attention across d_model
 
         return x_weighted, attn
 
