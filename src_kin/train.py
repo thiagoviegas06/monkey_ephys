@@ -242,7 +242,7 @@ def main():
     optimizer = torch.optim.AdamW(kinematic_model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     
     print("Loading data...")
-    train_loader, val_loader, _, _ = get_dataloaders(config, num_workers=4)
+    train_loader, val_loader, _, _ = get_dataloaders(config, num_workers=8)
     
     # Compute global statistics for kinematics
     print("Computing kinematics statistics...")
