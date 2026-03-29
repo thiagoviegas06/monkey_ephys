@@ -165,22 +165,25 @@ class SBP_TCN_Transformer(nn.Module):
         sbp_norm = ((sbp_masked - sbp_mean) / sbp_std) * visible_mask
         macro_time_norm = self.macro_bn(macro_time)
         
+        # Pre-compute time embeddings to avoid late-stage CUDA context errors
+        time_emb_single = self.macro_time_encoder(macro_time_norm)
+        
         # PHASE 1: LOCAL TCN (Temporal Feature Extraction per channel)
         sbp_exp = sbp_norm.transpose(1, 2).unsqueeze(-1) # (B, C, W, 1)
         mask_exp = mask.transpose(1, 2).unsqueeze(-1)       
         x_tcn = torch.cat([sbp_exp, mask_exp], dim=-1).reshape(B * C, W, 2).transpose(1, 2)
         
-        x = self.tcn(x_tcn).transpose(1, 2).reshape(B, C, W, self.d_model) # (B, C, W, d_model)
+        x = self.tcn(x_tcn).transpose(1, 2).contiguous().reshape(B, C, W, self.d_model) # (B, C, W, d_model)
         
         # PHASE 2: INTERLEAVED AXIAL ENCODER
         spat_pad_mask = mask.reshape(B * W, C).bool()
         
-        # Prevent NaNs if a time bin is fully masked by unmasking at least one channel
-        # We check this once as the mask is constant across axial layers
+        # For spatial attention, we need a 'safe' mask that never ignores an entire row
+        safe_spat_mask = spat_pad_mask
         all_masked = spat_pad_mask.all(dim=1)
         if all_masked.any():
-            spat_pad_mask = spat_pad_mask.clone()
-            spat_pad_mask[all_masked, 0] = False
+            safe_spat_mask = spat_pad_mask.clone()
+            safe_spat_mask[all_masked, 0] = False
             
         for layer in self.axial_layers:
             # A. Temporal Attention (Across W)
@@ -191,20 +194,27 @@ class SBP_TCN_Transformer(nn.Module):
             # B. Spatial Attention (Across C)
             x = x.reshape(B, C, W, self.d_model).permute(0, 2, 1, 3).contiguous().reshape(B * W, C, self.d_model)
             x = x + self.channel_embeddings
-            x = layer['spat'](x, src_key_padding_mask=spat_pad_mask)
+            x = layer['spat'](x, src_key_padding_mask=safe_spat_mask)
             
             # Reshape back to (B, C, W, d_model) for next temporal pass
             x = x.reshape(B, W, C, self.d_model).permute(0, 2, 1, 3).contiguous()
             
         # For the final output, we need (B * W, C, d_model)
-        enc_out = self.enc_norm(x.permute(0, 2, 1, 3).reshape(B * W, C, self.d_model))
+        enc_out = self.enc_norm(x.permute(0, 2, 1, 3).contiguous().view(B * W, C, self.d_model))
         
         # PHASE 3: ASYMMETRIC DECODER
-        mask_tokens = self.mask_token.expand(B * W, C, -1) + self.channel_embeddings
-        time_emb = self.macro_time_encoder(macro_time_norm).repeat_interleave(W, dim=0)
-        mask_tokens = mask_tokens + time_emb
+        # Use broadcasting for mask_tokens and time_emb to avoid large memory-copy ops like repeat_interleave
+        # mask_tokens: [1, 1, C, d_model]
+        mask_tokens = self.mask_token + self.channel_embeddings
         
-        dec_in = torch.where(spat_pad_mask.unsqueeze(-1), mask_tokens, enc_out)
+        # [B, 1, 1, d_model]
+        time_emb = time_emb_single.unsqueeze(1) 
+        
+        # Broadcasting [B, 1, 1, d_model] + [1, 1, C, d_model] -> [B, W, C, d_model]
+        # (W is handled by reshape later)
+        dec_mask_tokens = (mask_tokens.unsqueeze(0) + time_emb).expand(B, W, C, -1).contiguous().view(B * W, C, -1)
+        
+        dec_in = torch.where(spat_pad_mask.unsqueeze(-1), dec_mask_tokens, enc_out)
         dec_out = self.decoder(dec_in)
         
         if return_embeddings:
