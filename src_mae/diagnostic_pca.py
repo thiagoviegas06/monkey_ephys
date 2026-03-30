@@ -6,9 +6,9 @@ from tqdm import tqdm
 import argparse
 import os
 
-from src_mae.config import Config
-from src_mae.dataloader import get_dataloaders
-from src_mae.model import SBP_TCN_Transformer
+from config import Config
+from dataloader import get_dataloaders
+from model import SBP_TCN_Transformer
 
 def main():
     parser = argparse.ArgumentParser(description="Diagnostic PCA of SBP Embeddings")
@@ -99,7 +99,7 @@ def main():
     # PCA
     print("Running PCA...")
     all_embeddings = np.concatenate([masked_embeddings, unmasked_embeddings], axis=0)
-    pca = PCA(n_components=2)
+    pca = PCA(n_components=3)
     pca_result = pca.fit_transform(all_embeddings)
     
     pca_masked = pca_result[:len(masked_embeddings)]
@@ -113,17 +113,31 @@ def main():
     print(f"Unmasked Spread (Trace of Cov): {unmasked_spread:.4f}")
     
     # Visualization
-    plt.figure(figsize=(12, 10))
-    plt.scatter(pca_unmasked[:, 0], pca_unmasked[:, 1], alpha=0.2, label='Unmasked (Visible)', c='blue', s=2)
-    plt.scatter(pca_masked[:, 0], pca_masked[:, 1], alpha=0.2, label='Masked (Reconstructed)', c='red', s=2)
+    fig, axes = plt.subplots(1, 2, figsize=(20, 10))
     
-    plt.title(f"PCA of SBP Decoder Embeddings\nVariance Explained: PC1={pca.explained_variance_ratio_[0]:.2%}, PC2={pca.explained_variance_ratio_[1]:.2%}")
-    plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.2%})")
-    plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.2%})")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    # Plot 1: PC1 vs PC2
+    axes[0].scatter(pca_unmasked[:, 0], pca_unmasked[:, 1], alpha=0.2, label='Unmasked (Visible)', c='blue', s=2)
+    axes[0].scatter(pca_masked[:, 0], pca_masked[:, 1], alpha=0.2, label='Masked (Reconstructed)', c='red', s=2)
+    axes[0].set_title(f"PC1 vs PC2\nVar: PC1={pca.explained_variance_ratio_[0]:.2%}, PC2={pca.explained_variance_ratio_[1]:.2%}")
+    axes[0].set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.2%})")
+    axes[0].set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.2%})")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    # Plot 2: PC2 vs PC3
+    axes[1].scatter(pca_unmasked[:, 1], pca_unmasked[:, 2], alpha=0.2, label='Unmasked (Visible)', c='blue', s=2)
+    axes[1].scatter(pca_masked[:, 1], pca_masked[:, 2], alpha=0.2, label='Masked (Reconstructed)', c='red', s=2)
+    axes[1].set_title(f"PC2 vs PC3\nVar: PC2={pca.explained_variance_ratio_[1]:.2%}, PC3={pca.explained_variance_ratio_[2]:.2%}")
+    axes[1].set_xlabel(f"PC2 ({pca.explained_variance_ratio_[1]:.2%})")
+    axes[1].set_ylabel(f"PC3 ({pca.explained_variance_ratio_[2]:.2%})")
+    # Cap y axis at -20 to 15 for better visualization
+    axes[1].set_ylim(-15, 15)
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    plt.suptitle(f"PCA of SBP Decoder Embeddings (Total Var Explained: {sum(pca.explained_variance_ratio_):.2%})", fontsize=16)
     
-    # Add stats text box
+    # Add stats text box to the first plot
     stats_text = (f"Masked Points: {len(masked_embeddings)}\n"
                   f"Unmasked Points: {len(unmasked_embeddings)}\n"
                   f"Masked Spread: {masked_spread:.4f}\n"
@@ -131,9 +145,10 @@ def main():
                   f"Spread Ratio (M/U): {masked_spread/unmasked_spread:.4f}")
     
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-    plt.gca().text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, fontsize=10,
+    axes[0].text(0.05, 0.95, stats_text, transform=axes[0].transAxes, fontsize=10,
                    verticalalignment='top', bbox=props)
     
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(args.save_path, dpi=300, bbox_inches='tight')
     print(f"Visualization saved to {args.save_path}")
 
