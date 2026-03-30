@@ -33,7 +33,7 @@ class Config:
     seed = 42
     
     # Kinematic Decoder Transformer Hyperparameters
-    decoder_num_temporal_layers = 2
+    decoder_num_temporal_layers = 6
     decoder_num_heads = 8
     decoder_dropout = 0.1
     output_dim = 4 # Outputs 4 kinematics channels

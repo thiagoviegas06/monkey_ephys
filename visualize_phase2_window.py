@@ -38,6 +38,7 @@ def visualize_phase2_window(sample, save_path=None):
     
     # Let's mark inactive channels with NaN for imshow
     sbp_display[:, ~active_mask] = np.nan
+    sbp[:, ~active_mask] = np.nan
     
     fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
     
